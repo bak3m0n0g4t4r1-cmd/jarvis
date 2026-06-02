@@ -4,7 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-# Абсолютный путь до бинаря из venv. Поправь под свой путь установки.
+# ПРИМЕР. Реальные юниты с верными путями ставит `jarvis start` (в ~/.config/systemd/user/).
+# Здесь %h/jarvis/.venv — лишь образец, если проект лежит в ~/jarvis.
 ExecStart=%h/jarvis/.venv/bin/jarvis-os-agent
 Restart=always
 RestartSec=3
