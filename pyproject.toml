@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Локальный оффлайн голосовой ассистент «Джарвис» (Фаза 1: голосовое ядро)"
+requires-python = ">=3.11"
+dependencies = [
+    "paho-mqtt>=2.1,<3",
+    "pydantic>=2.5,<3",
+    "pyyaml>=6,<7",
+    "numpy>=1.26",
+    "sounddevice>=0.4.6",
+    "ollama>=0.3.0",
+    # --- engine-зависимости: версии СВЕРИТЬ на целевой машине ---
+    "sherpa-onnx>=1.10",
+    "piper-tts>=1.2",
+]
+
+# console entry points — systemd-юниты зовут эти команды (без плясок с PYTHONPATH)
+[project.scripts]
+jarvis-stt = "jarvis.services.stt:main"
+jarvis-core = "jarvis.services.core:main"
+jarvis-os-agent = "jarvis.services.os_agent:main"
+jarvis-tts = "jarvis.services.tts:main"
+
+[tool.setuptools.packages.find]
+include = ["jarvis*"]

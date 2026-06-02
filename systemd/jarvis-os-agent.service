@@ -1,0 +1,13 @@
+[Unit]
+Description=Джарвис — «Руки» (OS-агент)
+After=network.target
+
+[Service]
+Type=simple
+# Абсолютный путь до бинаря из venv. Поправь под свой путь установки.
+ExecStart=%h/jarvis/.venv/bin/jarvis-os-agent
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

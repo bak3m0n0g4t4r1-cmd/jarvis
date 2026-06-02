@@ -1,0 +1,15 @@
+[Unit]
+Description=Джарвис — «Голос» (TTS: Piper)
+# Аудио-сервис: нужен пользовательский PipeWire
+Wants=pipewire.service
+After=pipewire.service network.target
+
+[Service]
+Type=simple
+# Абсолютный путь до бинаря из venv. Поправь под свой путь установки.
+ExecStart=%h/jarvis/.venv/bin/jarvis-tts
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

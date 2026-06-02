@@ -1,0 +1,17 @@
+# Модели большие — в git не храним (откуда качать см. README)
+models/*
+!models/.gitkeep
+
+# Логи и отчёты команд
+logs/*
+!logs/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
