@@ -21,6 +21,7 @@ dependencies = [
 
 # console entry points — systemd-юниты зовут эти команды (без плясок с PYTHONPATH)
 [project.scripts]
+jarvis = "jarvis.cli:main"
 jarvis-stt = "jarvis.services.stt:main"
 jarvis-core = "jarvis.services.core:main"
 jarvis-os-agent = "jarvis.services.os_agent:main"

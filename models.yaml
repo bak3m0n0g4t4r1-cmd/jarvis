@@ -1,0 +1,48 @@
+# models.yaml — карта моделей «Джарвиса» для загрузчика (jarvis models --download).
+#
+# URL вынесены сюда специально: протухла ссылка — правишь ОДНУ строку здесь,
+# Python трогать не нужно.
+#
+# ВНИМАНИЕ: из контейнера разработки валидность ссылок не проверить.
+# Перед первой загрузкой СВЕРЬТЕ каждый url вручную (актуальные релизы
+# sherpa-onnx и голоса Piper).
+#
+# Формат одного блока:
+#   имя_модели:
+#     url:          "https://..."          # откуда качать
+#     назначение:   "путь/в/models"        # куда положить (относительно models/)
+#     размер:        12345678              # ОПЦИОНАЛЬНО: ожидаемый размер в байтах
+#     sha256:       "abc..."               # ОПЦИОНАЛЬНО: отсутствие НЕ блокирует загрузку
+#     распаковать:   true                  # ОПЦИОНАЛЬНО: распаковать архив (tar.*/zip)
+#     распаковать_в: "sense-voice"         # ОПЦИОНАЛЬНО: подкаталог распаковки в models/
+#
+# Пути назначения должны совпадать с config.py (или переопределите их env-переменными
+# JARVIS_VAD_MODEL / JARVIS_SENSEVOICE_MODEL / JARVIS_SENSEVOICE_TOKENS /
+# JARVIS_PIPER_MODEL / JARVIS_PIPER_CONFIG).
+
+модели:
+  silero_vad:
+    # ВНИМАНИЕ: сверить вручную (репозиторий моделей sherpa-onnx).
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
+    назначение: "silero_vad.onnx"
+    # sha256 не задана намеренно — добавьте после первой проверенной загрузки.
+
+  sense_voice:
+    # ВНИМАНИЕ: сверить вручную. Архив содержит model.onnx и tokens.txt.
+    # После распаковки убедитесь, что итоговые пути совпадают с config.py
+    # (models/sense-voice/model.onnx и models/sense-voice/tokens.txt) —
+    # при необходимости переименуйте каталог или задайте env-переменные.
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2"
+    назначение: "sense-voice.tar.bz2"
+    распаковать: true
+    распаковать_в: "sense-voice"
+
+  piper_voice:
+    # ВНИМАНИЕ: сверить вручную (rhasspy/piper-voices на Hugging Face).
+    url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/dmitri/medium/ru_RU-dmitri-medium.onnx"
+    назначение: "ru_RU-dmitri-medium.onnx"
+
+  piper_config:
+    # ВНИМАНИЕ: сверить вручную. Конфиг голоса (содержит audio.sample_rate).
+    url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/dmitri/medium/ru_RU-dmitri-medium.onnx.json"
+    назначение: "ru_RU-dmitri-medium.onnx.json"
