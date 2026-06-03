@@ -40,12 +40,19 @@ def _user_units_dir() -> Path:
 def _render_unit(svc, bin_dir: Path) -> str:
     """Текст юнита с ExecStart на реальный бинарь venv (без хардкода путей)."""
     exec_start = bin_dir / svc.command
+    # «Мозг» читает GEMINI_API_KEY (и прочие JARVIS_*) из .env проекта — прокидываем
+    # его в юнит. Дефис у пути: если .env ещё нет, юнит не падает (ключ опционален,
+    # есть офлайн-фоллбэк). config.py всё равно подхватит .env сам через load_dotenv.
+    env_line = ""
+    if svc.key == "core":
+        env_line = f"EnvironmentFile=-{config.BASE_DIR / '.env'}\n"
     return (
         "[Unit]\n"
         f"Description=Джарвис — {svc.description}\n"
         "After=network.target\n\n"
         "[Service]\n"
         "Type=simple\n"
+        f"{env_line}"
         f"ExecStart={exec_start}\n"
         "Restart=always\n"
         "RestartSec=3\n\n"

@@ -14,6 +14,9 @@ dependencies = [
     "numpy>=1.26",
     "sounddevice>=0.4.6",
     "ollama>=0.3.0",
+    # --- Casual-бэкенд (Фаза 2): беседа через Gemini + ключ из .env ---
+    "google-genai>=1.0",
+    "python-dotenv>=1.0",
     # --- engine-зависимости: версии СВЕРИТЬ на целевой машине ---
     "sherpa-onnx>=1.10",
     "piper-tts>=1.2",

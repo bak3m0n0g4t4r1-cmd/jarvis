@@ -51,7 +51,7 @@ def check_imports() -> list[CheckResult]:
     """Все зависимости реально импортируются (import, а не «пакет установлен»)."""
     modules = [
         "paho.mqtt.client", "pydantic", "yaml", "numpy",
-        "sounddevice", "ollama", "sherpa_onnx", "piper",
+        "sounddevice", "ollama", "sherpa_onnx", "piper", "dotenv",
     ]
     results = []
     for mod in modules:
@@ -250,6 +250,34 @@ def _ollama_model_names(data) -> list[str]:
         if name:
             models.append(name)
     return models
+
+
+def check_gemini() -> CheckResult:
+    """Casual-бэкенд: при gemini — есть ли пакет и ключ (без сетевого запроса).
+
+    Gemini опционален: при отсутствии пакета/ключа беседа уходит в офлайн-фоллбэк,
+    поэтому это WARN (не блокер) — doctor остаётся зелёным, но честно предупреждает.
+    """
+    if config.CASUAL_BACKEND != "gemini":
+        return CheckResult(OK, f"Casual-бэкенд: локальный режим ({config.CASUAL_BACKEND})")
+    try:
+        import google.genai  # noqa: F401
+    except Exception as exc:
+        return CheckResult(
+            WARN, "Gemini casual-бэкенд",
+            reason=f"пакет google-genai не импортируется ({exc}); беседа уйдёт в офлайн-фоллбэк.",
+            fix="pip install -e .  (или JARVIS_CASUAL_BACKEND=local)",
+        )
+    if not config.GEMINI_API_KEY:
+        return CheckResult(
+            WARN, "Gemini casual-бэкенд",
+            reason="GEMINI_API_KEY не задан — беседа будет уходить в офлайн-фоллбэк.",
+            fix="впишите ключ в .env (см. .env.example) или JARVIS_CASUAL_BACKEND=local",
+        )
+    grounding = "вкл" if config.GEMINI_GROUNDING else "выкл"
+    return CheckResult(
+        OK, f"Gemini casual-бэкенд: модель {config.GEMINI_MODEL}, grounding {grounding}"
+    )
 
 
 def check_audio() -> list[CheckResult]:
@@ -517,6 +545,42 @@ def check_piper_synthesis() -> CheckResult:
                            fix="jarvis models --download; сверьте API piper-tts")
 
 
+def check_gemini_live() -> CheckResult:
+    """Живой запрос к Gemini: реальный ответ в пределах таймаута (только --deep).
+
+    Гоняем через настоящий CasualBackend — заодно проверяем ключ, сеть, имя модели
+    и grounding-конфиг. Если вернулся офлайн-фоллбэк, значит облако не ответило.
+    """
+    if config.CASUAL_BACKEND != "gemini":
+        return CheckResult(OK, f"Gemini: живой тест пропущен (бэкенд {config.CASUAL_BACKEND})")
+    if not config.GEMINI_API_KEY:
+        return CheckResult(
+            WARN, "Gemini: живой ответ",
+            reason="GEMINI_API_KEY не задан — живой тест пропущен.",
+            fix="впишите ключ в .env (см. .env.example)",
+        )
+    try:
+        import logging
+
+        from jarvis import casual
+
+        backend = casual.CasualBackend(logging.getLogger("jarvis-doctor-gemini"))
+        answer = backend.reply("Ответь одним коротким словом для проверки связи.")
+    except Exception as exc:
+        return CheckResult(
+            FAIL, "Gemini: живой ответ",
+            reason=f"запрос упал: {exc}",
+            fix="проверьте GEMINI_API_KEY, сеть и имя модели JARVIS_GEMINI_MODEL",
+        )
+    if answer in (casual._FALLBACK_FIRST, casual._FALLBACK_AGAIN):
+        return CheckResult(
+            FAIL, "Gemini: живой ответ",
+            reason="вернулся офлайн-фоллбэк — облако недоступно, неверный ключ или имя модели.",
+            fix="проверьте GEMINI_API_KEY, сеть и JARVIS_GEMINI_MODEL; см. logs/jarvis-core.log",
+        )
+    return CheckResult(OK, "Gemini: живой ответ получен")
+
+
 def live_chain_test() -> bool:
     """Сквозной тест живой шины (для `jarvis test` и Слоя 5 --deep).
 
@@ -614,6 +678,7 @@ def run(deep: bool = False) -> bool:
     reporter.section("Слой 2. Системные службы")
     reporter.report(check_mosquitto())
     reporter.report(check_ollama())
+    reporter.report(check_gemini())
     for r in check_audio():
         reporter.report(r)
 
@@ -637,6 +702,8 @@ def run(deep: bool = False) -> bool:
         reporter.report(check_ollama_generation())
         reporter.note("синтез тестового сэмпла Piper…")
         reporter.report(check_piper_synthesis())
+        reporter.note("живой запрос к Gemini (casual-бэкенд)…")
+        reporter.report(check_gemini_live())
 
     ok = reporter.summary()
 

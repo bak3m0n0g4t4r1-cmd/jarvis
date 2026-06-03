@@ -6,6 +6,10 @@ models/*
 logs/*
 !logs/.gitkeep
 
+# Секреты: ключ Gemini и прочие локальные настройки (шаблон — .env.example)
+.env
+.env.local
+
 # Python
 __pycache__/
 *.py[cod]

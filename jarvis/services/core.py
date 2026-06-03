@@ -1,17 +1,30 @@
-"""«Мозг» Джарвиса: слушает jarvis/input, спрашивает Ollama и отвечает.
+"""«Мозг» Джарвиса: диспетчер интентов поверх локальной 1.5B (Ollama).
 
-Использует нативный structured output Ollama (format = JSON-схема pydantic),
-держит короткую историю диалога и публикует реплику в jarvis/say, а теги
-команд — в jarvis/execute.
+Локальная модель работает КЛАССИФИКАТОРОМ: по реплике из jarvis/input она через
+structured output выдаёт интент (os_command | casual_talk) и, для команды, тег из
+commands.yaml + короткое подтверждение в характере. Дальше:
+  os_command  → подтверждение в jarvis/say + тег в jarvis/execute (быстро, офлайн);
+  casual_talk → сперва локальные инструменты (время/заряд), иначе живой ответ от
+                casual-бэкенда (Gemini), и он же — в jarvis/say.
+Так команды звучат мгновенно и без сети, а беседу ведёт облако.
 """
 import threading
 from collections import deque
+from datetime import datetime
 
 import ollama
 import yaml
 
 from jarvis import config, contracts
 from jarvis.bus import JarvisModule
+from jarvis.casual import CasualBackend
+
+# Ключевые слова локальных инструментов (срабатывают на явный вопрос в беседе).
+_TIME_KEYS = (
+    "который час", "которой час", "которое время", "сколько времени",
+    "сколько время", "точное время", "время сейчас", "сколько на часах",
+)
+_BATTERY_KEYS = ("батаре", "аккумулят", "заряд", "сколько процент")
 
 
 def _build_system_prompt() -> str:
@@ -30,37 +43,26 @@ def _build_system_prompt() -> str:
     tag_list = ", ".join(tags) if tags else "(нет доступных команд)"
 
     return (
-        "Ты — Джарвис, локальный голосовой ассистент в стиле Тони Старка: "
-        "краткий, остроумный, обращаешься на «сэр». Отвечай строго на русском. "
-        "Определи намерение пользователя и верни ТОЛЬКО валидный JSON по схеме.\n\n"
-        "ПРАВИЛА intents:\n"
+        "Ты — Джарвис, голосовой ассистент-диспетчер в характере дворецкого ИИ "
+        "(в традиции J.A.R.V.I.S.): обращаешься на «сэр», по-русски, спокойно и "
+        "лаконично. Твоя задача — КЛАССИФИЦИРОВАТЬ реплику пользователя и вернуть "
+        "ТОЛЬКО валидный JSON по схеме. Развёрнутую беседу ведёт другой модуль — "
+        "ты её НЕ пишешь.\n\n"
+        "ИНТЕНТЫ (ровно два):\n"
         "1. os_command — пользователь явно просит выполнить ОДНУ из команд ниже. "
-        "Проверь, что запрос действительно совпадает с командой из списка. "
-        "ЕСЛИ В СПИСКЕ НЕТ подходящей команды — НЕ используй os_command, "
-        "переключись на casual_talk и честно скажи, что такой команды нет.\n"
-        f"Доступные команды: {tag_list}.\n"
-        "2. web_search — пользователь просит найти информацию в интернете "
-        "(например «сколько времени», «какая погода», «найди рецепт»). "
-        "НО ЕСЛИ ты можешь ответить сам (общие знания, дата, факты) — используй "
-        "casual_talk и ответь своими словами, без поиска.\n"
-        "3. casual_talk — всё остальное: приветствие, вопрос о тебе, беседа, "
-        "просьба рассказать что-то, шутка, вопрос «как дела». Здесь ты — живой "
-        "собеседник, отвечаешь осмысленно и по-русски, в характере Джарвиса.\n\n"
-        "ПРАВИЛА payload:\n"
-        "- Для os_command: РОВНО один тег из списка выше (например 'telegram'). "
-        "НЕ придумывай теги — только из списка. Если подходящего тега нет, "
-        "НЕ используй os_command.\n"
-        "- Для web_search: 'none'.\n"
-        "- Для casual_talk: 'none'.\n\n"
-        "ПРАВИЛА speech_response:\n"
-        "- Всегда на русском, от первого лица (Джарвис), кратко (1–3 предложения).\n"
-        "- Для os_command: подтверди выполнение (например «Запускаю Telegram, сэр»).\n"
-        "- Для web_search: скажи, что поиск пока в разработке, но предложи помощь.\n"
-        "- Для casual_talk: отвечай как живой собеседник — вежливо, с лёгкой иронией, "
-        "в духе дворецкого-ИИ. НИКОГДА не говори «запрос не может быть обработан», "
-        "«предоставьте запрос для поиска» и подобных канцелярских фраз. "
-        "НИКОГДА не давай ссылки на google или другие сайты — ты голосовой ассистент, "
-        "а не поисковик."
+        "Тег бери РОВНО из списка, ничего не выдумывай. Если подходящей команды в "
+        "списке нет — это НЕ os_command, ставь casual_talk.\n"
+        f"Доступные команды (теги): {tag_list}.\n"
+        "2. casual_talk — всё остальное: беседа, приветствие, вопрос о тебе или о "
+        "мире, просьба рассказать или найти что-то, шутка, «как дела», а также "
+        "вопрос о времени или заряде батареи.\n\n"
+        "ПОЛЯ JSON:\n"
+        "- intent: 'os_command' или 'casual_talk'.\n"
+        "- payload: для os_command — РОВНО один тег из списка выше; для casual_talk — 'none'.\n"
+        "- speech_response: ТОЛЬКО для os_command — короткое подтверждение в "
+        "характере, ОДНОЙ фразой, на русском, с обращением «сэр», без острот и "
+        "лишних слов (например «Выключаю Wi-Fi, сэр», «Сделано, сэр», "
+        "«Запускаю Telegram, сэр»). Для casual_talk оставь пустую строку.\n"
     )
 
 
@@ -69,9 +71,12 @@ class CoreModule(JarvisModule):
 
     def __init__(self):
         super().__init__("jarvis-core")
-        # История: до HISTORY_SIZE пар user/assistant -> 2 сообщения на пару
+        # История диспетчера: до HISTORY_SIZE пар user/assistant -> 2 сообщения на пару.
         self._history: deque = deque(maxlen=config.HISTORY_SIZE * 2)
+        # История команд (структурно) — последние 3, на будущее для commands.yaml-фич.
+        self._cmd_history: deque = deque(maxlen=3)
         self._client = ollama.Client(host=config.OLLAMA_HOST)
+        self._casual = CasualBackend(self.log)  # беседу ведёт Gemini (или фоллбэк)
         self._lock = threading.Lock()
         self._system_prompt = _build_system_prompt()
 
@@ -104,32 +109,92 @@ class CoreModule(JarvisModule):
                 content = response["message"]["content"]
                 result = contracts.JarvisResponse.model_validate_json(content)
             except Exception:
-                self.log.exception("Ошибка запроса к Ollama")
+                self.log.exception("Ошибка запроса к Ollama (диспетчер)")
                 self.say("Прошу прощения, сэр, у меня сбой в мыслительном модуле.")
                 self.set_state(contracts.STATE_IDLE)
                 return
 
-            # Обновляем историю (FIFO ограничен maxlen у deque)
-            self._history.append({"role": "user", "content": text})
-            self._history.append(
-                {"role": "assistant", "content": result.speech_response}
-            )
+            # Выполняем интент и получаем финальную реплику (она пойдёт в историю).
+            reply = self._dispatch(text, result)
 
-            # Публикуем реплику — TTS подхватит и сам выставит speaking/idle.
-            # НЕ ставим idle здесь: иначе на шине видна «вспышка» idle между
-            # thinking и speaking, а на двойной ответ (реплика + ошибка агента)
-            # получается два цикла speaking→idle.
-            self.say(result.speech_response)
-            if (
-                result.intent in ("os_command", "web_search")
-                and result.payload
-                and result.payload != "none"
-            ):
-                self.publish_json(
-                    contracts.TOPIC_EXECUTE,
-                    {"command_tag": result.payload},
-                    qos=contracts.QOS_EXECUTE,
-                )
+            # Обновляем историю диспетчера (FIFO ограничен maxlen у deque):
+            # пара user → финальная произнесённая реплика.
+            self._history.append({"role": "user", "content": text})
+            self._history.append({"role": "assistant", "content": reply})
+
+    def _dispatch(self, text: str, result: contracts.JarvisResponse) -> str:
+        """Выполнить намерение, озвучить реплику и вернуть её текст (для истории).
+
+        Реплику публикуем в jarvis/say — TTS подхватит и сам выставит speaking/idle.
+        idle здесь НЕ ставим: иначе на шине «вспышка» idle между thinking и speaking.
+        """
+        if (
+            result.intent == "os_command"
+            and result.payload
+            and result.payload != "none"
+        ):
+            # Подтверждение генерит локальная модель; подстраховка — на случай пустого.
+            speech = result.speech_response.strip() or "Сделано, сэр."
+            self.say(speech)
+            self.publish_json(
+                contracts.TOPIC_EXECUTE,
+                {"command_tag": result.payload},
+                qos=contracts.QOS_EXECUTE,
+            )
+            self._cmd_history.append({
+                "intent": result.intent,
+                "tag": result.payload,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            })
+            return speech
+
+        # casual_talk (и os_command без валидного тега тоже трактуем как беседу).
+        # Сначала локальные инструменты (офлайн), иначе — облачный casual-бэкенд.
+        local = self._local_tool_answer(text)
+        if local is not None:
+            self.say(local)
+            return local
+        answer = self._casual.reply(text)
+        self.say(answer)
+        return answer
+
+    def _local_tool_answer(self, text: str) -> str | None:
+        """Локальные инструменты (офлайн, без Gemini): время и заряд батареи.
+
+        Срабатывают только на явный вопрос — иначе None, и беседу ведёт casual-бэкенд.
+        """
+        low = text.lower()
+        if any(k in low for k in _TIME_KEYS):
+            return f"Сейчас {datetime.now():%H:%M}, сэр."
+        if any(k in low for k in _BATTERY_KEYS):
+            return self._battery_answer()
+        return None
+
+    def _battery_answer(self) -> str:
+        """Реальный заряд из /sys/class/power_supply/BAT* — в характере Джарвиса."""
+        import glob
+
+        paths = sorted(glob.glob("/sys/class/power_supply/BAT*"))
+        if not paths:
+            return "Батарея не обнаружена, сэр."
+        bat = paths[0]
+        try:
+            with open(f"{bat}/capacity", encoding="utf-8") as f:
+                capacity = int(f.read().strip())
+        except Exception:
+            self.log.exception("Не удалось снять показания батареи")
+            return "Не удалось снять показания батареи, сэр."
+        status = ""
+        try:
+            with open(f"{bat}/status", encoding="utf-8") as f:
+                status = f.read().strip()
+        except Exception:
+            pass
+        if status == "Charging":
+            return f"Батарея на {capacity} процентах, заряжается, сэр."
+        if status == "Full" or capacity >= 99:
+            return "Батарея заряжена полностью, сэр."
+        return f"Батарея на {capacity} процентах, сэр."
 
 
 def main():

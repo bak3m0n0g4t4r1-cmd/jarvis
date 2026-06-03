@@ -8,6 +8,17 @@ from pathlib import Path
 
 # Корень проекта (jarvis/config.py -> на уровень выше пакета)
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# .env в корне проекта подхватываем ДО чтения переменных — чтобы GEMINI_API_KEY и
+# прочие настройки держать в одном файле (шаблон — .env.example). Если python-dotenv
+# не установлен или файла нет — молча работаем на голом окружении/системных env.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(BASE_DIR / ".env")
+except Exception:
+    pass
+
 MODELS_DIR = Path(os.getenv("JARVIS_MODELS_DIR", str(BASE_DIR / "models")))
 LOGS_DIR = Path(os.getenv("JARVIS_LOGS_DIR", str(BASE_DIR / "logs")))
 
@@ -71,6 +82,23 @@ OLLAMA_HOST = os.getenv("JARVIS_OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("JARVIS_OLLAMA_MODEL", "qwen2.5:1.5b-instruct")
 OLLAMA_KEEP_ALIVE = os.getenv("JARVIS_OLLAMA_KEEP_ALIVE", "10m")
 HISTORY_SIZE = int(os.getenv("JARVIS_HISTORY_SIZE", "5"))  # пар user/assistant
+
+# --- Casual-бэкенд: беседу ведёт облачный Gemini, команды — локальная модель ---
+# Бэкенд бесед: gemini | local. local — только офлайн-фоллбэк, без обращения к облаку.
+CASUAL_BACKEND = os.getenv("JARVIS_CASUAL_BACKEND", "gemini").strip().lower()
+# Ключ Gemini — из .env (в git не попадает). Пустой → casual уходит в офлайн-фоллбэк.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# Имя модели вынесено в env: версии Gemini меняются ежемесячно — сверять при установке.
+GEMINI_MODEL = os.getenv("JARVIS_GEMINI_MODEL", "gemini-3.5-flash")
+# Grounding (модель сама ищет свежие факты): 1/true — вкл, 0/false/no/off — выкл.
+GEMINI_GROUNDING = os.getenv("JARVIS_GEMINI_GROUNDING", "1").strip().lower() not in (
+    "0", "false", "no", "off", "",
+)
+# Таймаут запроса к Gemini, секунды. Для grounding 5с маловато (поиск + генерация),
+# поэтому дефолт 8с; в casual.py переводится в миллисекунды для HttpOptions.
+GEMINI_TIMEOUT = float(os.getenv("JARVIS_GEMINI_TIMEOUT", "8"))
+# Сколько реплик беседы (сообщений user/assistant) помнить и слать в облако.
+GEMINI_HISTORY = int(os.getenv("JARVIS_GEMINI_HISTORY", "8"))
 
 # --- TTS: Piper ---
 PIPER_MODEL = os.getenv("JARVIS_PIPER_MODEL", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx"))

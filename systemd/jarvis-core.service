@@ -6,6 +6,8 @@ After=network.target
 Type=simple
 # ПРИМЕР. Реальные юниты с верными путями ставит `jarvis start` (в ~/.config/systemd/user/).
 # Здесь %h/jarvis/.venv — лишь образец, если проект лежит в ~/jarvis.
+# GEMINI_API_KEY для casual-бэкенда берётся из .env проекта (дефис — не падать, если файла нет).
+EnvironmentFile=-%h/jarvis/.env
 ExecStart=%h/jarvis/.venv/bin/jarvis-core
 Restart=always
 RestartSec=3

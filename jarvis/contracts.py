@@ -28,17 +28,22 @@ STATE_THINKING = "thinking"
 STATE_SPEAKING = "speaking"
 
 # --- Намерения «Мозга» ---
-Intent = Literal["os_command", "web_search", "casual_talk"]
+# Фаза 2: 1.5B работает диспетчером-классификатором. Всего два намерения —
+# либо это команда ОС (тег из commands.yaml), либо беседа (её ведёт casual-бэкенд,
+# по умолчанию Gemini). Бывший web_search убран: за свежими фактами в casual
+# ходит grounding самой облачной модели, отдельный интент не нужен.
+Intent = Literal["os_command", "casual_talk"]
 
 
 class JarvisResponse(BaseModel):
-    """Структурированный ответ «Мозга» (нативный structured output Ollama).
+    """Структурированный ответ «Мозга»-диспетчера (нативный structured output Ollama).
 
-    intent — тип намерения;
-    payload — тег команды/поиска ("telegram", "wifi_off", "network_scan", "none");
-    speech_response — реплика голосом в стиле Тони Старка, на русском.
+    intent — тип намерения (os_command | casual_talk);
+    payload — РОВНО один тег команды из commands.yaml ("telegram", ...) или "none";
+    speech_response — короткое подтверждение в характере Джарвиса для os_command;
+        для casual_talk остаётся пустым: реплику беседы генерит casual-бэкенд.
     """
 
     intent: Intent
     payload: str = Field(default="none")
-    speech_response: str
+    speech_response: str = Field(default="")

@@ -11,10 +11,59 @@
 # Безопасность: команда запускается через subprocess (shell=False) строго
 # списком аргументов. Пользовательский текст сюда НЕ подставляется — Мозг
 # присылает только ТЕГ, а агент ищет его в этой карте.
+#
+# Набор рассчитан на KDE Plasma (Wayland) + PipeWire на Kali. Только безопасные,
+# обратимые действия. ВНИМАНИЕ: точные бинарии/флаги сверь на целевой машине —
+# `jarvis doctor` подсветит теги, чьего бинаря нет в $PATH (wpctl, brightnessctl,
+# spectacle, firefox-esr и т.п. зависят от установленных пакетов).
 
-telegram:
-  описание: "Запуск Telegram"
-  команда: ["telegram-desktop"]
+# --- Звук (PipeWire: wpctl из wireplumber) ---
+volume_up:
+  описание: "Сделать громче на 5%"
+  команда: ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%+"]
+  ждать_вывод: false
+
+volume_down:
+  описание: "Сделать тише на 5%"
+  команда: ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"]
+  ждать_вывод: false
+
+volume_mute:
+  описание: "Выключить звук (mute)"
+  команда: ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1"]
+  ждать_вывод: false
+
+volume_unmute:
+  описание: "Включить звук (unmute)"
+  команда: ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"]
+  ждать_вывод: false
+
+# --- Яркость экрана (brightnessctl) ---
+brightness_up:
+  описание: "Поднять яркость экрана на 10%"
+  команда: ["brightnessctl", "set", "10%+"]
+  ждать_вывод: false
+
+brightness_down:
+  описание: "Понизить яркость экрана на 10%"
+  команда: ["brightnessctl", "set", "10%-"]
+  ждать_вывод: false
+
+# --- Экран и сессия ---
+lock_screen:
+  описание: "Заблокировать экран"
+  команда: ["loginctl", "lock-session"]
+  ждать_вывод: false
+
+screenshot:
+  описание: "Снимок всего экрана (KDE Spectacle, в фоне)"
+  команда: ["spectacle", "-b", "-f", "-n"]
+  ждать_вывод: false
+
+# --- Сеть и радио ---
+wifi_on:
+  описание: "Включить Wi-Fi"
+  команда: ["nmcli", "radio", "wifi", "on"]
   ждать_вывод: false
 
 wifi_off:
@@ -22,6 +71,38 @@ wifi_off:
   команда: ["nmcli", "radio", "wifi", "off"]
   ждать_вывод: false
 
+bluetooth_on:
+  описание: "Включить Bluetooth"
+  команда: ["bluetoothctl", "power", "on"]
+  ждать_вывод: false
+
+bluetooth_off:
+  описание: "Выключить Bluetooth"
+  команда: ["bluetoothctl", "power", "off"]
+  ждать_вывод: false
+
+# --- Запуск типовых приложений ---
+terminal:
+  описание: "Запуск терминала Konsole"
+  команда: ["konsole"]
+  ждать_вывод: false
+
+browser:
+  описание: "Запуск браузера Firefox"
+  команда: ["firefox-esr"]
+  ждать_вывод: false
+
+file_manager:
+  описание: "Запуск файлового менеджера Dolphin"
+  команда: ["dolphin"]
+  ждать_вывод: false
+
+telegram:
+  описание: "Запуск Telegram"
+  команда: ["telegram-desktop"]
+  ждать_вывод: false
+
+# --- Диагностика (вывод пишется в лог, озвучивается факт выполнения) ---
 network_scan:
   описание: "Быстрое сканирование портов шлюза"
   команда: ["nmap", "-F", "192.168.1.1"]
