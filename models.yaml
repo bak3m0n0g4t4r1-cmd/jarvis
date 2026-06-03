@@ -17,7 +17,8 @@
 #     распаковать_в: "sense-voice"         # ОПЦИОНАЛЬНО: подкаталог распаковки в models/
 #
 # Пути назначения должны совпадать с config.py (или переопределите их env-переменными
-# JARVIS_VAD_MODEL / JARVIS_SENSEVOICE_MODEL / JARVIS_SENSEVOICE_TOKENS /
+# JARVIS_VAD_MODEL / JARVIS_ZIPFORMER_ENCODER / JARVIS_ZIPFORMER_DECODER /
+# JARVIS_ZIPFORMER_JOINER / JARVIS_ZIPFORMER_TOKENS / JARVIS_ZIPFORMER_BPE /
 # JARVIS_PIPER_MODEL / JARVIS_PIPER_CONFIG).
 
 модели:
@@ -27,15 +28,15 @@
     назначение: "silero_vad.onnx"
     # sha256 не задана намеренно — добавьте после первой проверенной загрузки.
 
-  sense_voice:
-    # ВНИМАНИЕ: сверить вручную. Архив содержит model.onnx и tokens.txt.
-    # После распаковки убедитесь, что итоговые пути совпадают с config.py
-    # (models/sense-voice/model.onnx и models/sense-voice/tokens.txt) —
-    # при необходимости переименуйте каталог или задайте env-переменные.
-    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2"
-    назначение: "sense-voice.tar.bz2"
+  zipformer_ru:
+    # ВНИМАНИЕ: сверить вручную (страница релизов sherpa-onnx).
+    # Архив содержит encoder.int8.onnx, decoder.int8.onnx, joiner.int8.onnx,
+    # tokens.txt, bpe.model во вложенной папке sherpa-onnx-small-zipformer-ru-2024-09-18/.
+    # Поддерживает только русский язык (offline transducer, замена SenseVoice).
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-small-zipformer-ru-2024-09-18.tar.bz2"
+    назначение: "zipformer-ru.tar.bz2"
     распаковать: true
-    распаковать_в: "sense-voice"
+    распаковать_в: ""
 
   piper_voice:
     # ВНИМАНИЕ: сверить вручную (rhasspy/piper-voices на Hugging Face).

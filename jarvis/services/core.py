@@ -8,20 +8,60 @@ import threading
 from collections import deque
 
 import ollama
+import yaml
 
 from jarvis import config, contracts
 from jarvis.bus import JarvisModule
 
-SYSTEM_PROMPT = (
-    "Ты — Джарвис, локальный голосовой ассистент в стиле Тони Старка: "
-    "краткий, остроумный, обращаешься на «сэр». Отвечай на русском. "
-    "Определи намерение пользователя и верни строго JSON по схеме. "
-    "intent: 'os_command' — если нужно выполнить команду в системе; "
-    "'web_search' — если нужен поиск в интернете; "
-    "'casual_talk' — обычный разговор. "
-    "payload: тег команды ('telegram', 'wifi_off', 'network_scan') или 'none'. "
-    "speech_response: что сказать вслух."
-)
+
+def _build_system_prompt() -> str:
+    """Собирает системный промпт с актуальным списком команд из commands.yaml.
+
+    Теги загружаются динамически, чтобы Мозг видел только реально существующие
+    команды — никаких выдуманных тегов модель не сгенерирует, потому что
+    неоткуда их взять.
+    """
+    try:
+        with open(config.COMMANDS_FILE, encoding="utf-8") as f:
+            commands = yaml.safe_load(f) or {}
+    except Exception:
+        commands = {}
+    tags = sorted(commands.keys())  # алфавитный порядок для стабильности промпта
+    tag_list = ", ".join(tags) if tags else "(нет доступных команд)"
+
+    return (
+        "Ты — Джарвис, локальный голосовой ассистент в стиле Тони Старка: "
+        "краткий, остроумный, обращаешься на «сэр». Отвечай строго на русском. "
+        "Определи намерение пользователя и верни ТОЛЬКО валидный JSON по схеме.\n\n"
+        "ПРАВИЛА intents:\n"
+        "1. os_command — пользователь явно просит выполнить ОДНУ из команд ниже. "
+        "Проверь, что запрос действительно совпадает с командой из списка. "
+        "ЕСЛИ В СПИСКЕ НЕТ подходящей команды — НЕ используй os_command, "
+        "переключись на casual_talk и честно скажи, что такой команды нет.\n"
+        f"Доступные команды: {tag_list}.\n"
+        "2. web_search — пользователь просит найти информацию в интернете "
+        "(например «сколько времени», «какая погода», «найди рецепт»). "
+        "НО ЕСЛИ ты можешь ответить сам (общие знания, дата, факты) — используй "
+        "casual_talk и ответь своими словами, без поиска.\n"
+        "3. casual_talk — всё остальное: приветствие, вопрос о тебе, беседа, "
+        "просьба рассказать что-то, шутка, вопрос «как дела». Здесь ты — живой "
+        "собеседник, отвечаешь осмысленно и по-русски, в характере Джарвиса.\n\n"
+        "ПРАВИЛА payload:\n"
+        "- Для os_command: РОВНО один тег из списка выше (например 'telegram'). "
+        "НЕ придумывай теги — только из списка. Если подходящего тега нет, "
+        "НЕ используй os_command.\n"
+        "- Для web_search: 'none'.\n"
+        "- Для casual_talk: 'none'.\n\n"
+        "ПРАВИЛА speech_response:\n"
+        "- Всегда на русском, от первого лица (Джарвис), кратко (1–3 предложения).\n"
+        "- Для os_command: подтверди выполнение (например «Запускаю Telegram, сэр»).\n"
+        "- Для web_search: скажи, что поиск пока в разработке, но предложи помощь.\n"
+        "- Для casual_talk: отвечай как живой собеседник — вежливо, с лёгкой иронией, "
+        "в духе дворецкого-ИИ. НИКОГДА не говори «запрос не может быть обработан», "
+        "«предоставьте запрос для поиска» и подобных канцелярских фраз. "
+        "НИКОГДА не давай ссылки на google или другие сайты — ты голосовой ассистент, "
+        "а не поисковик."
+    )
 
 
 class CoreModule(JarvisModule):
@@ -33,6 +73,7 @@ class CoreModule(JarvisModule):
         self._history: deque = deque(maxlen=config.HISTORY_SIZE * 2)
         self._client = ollama.Client(host=config.OLLAMA_HOST)
         self._lock = threading.Lock()
+        self._system_prompt = _build_system_prompt()
 
     def on_start(self):
         self.subscribe(contracts.TOPIC_INPUT, self.on_input)
@@ -50,13 +91,10 @@ class CoreModule(JarvisModule):
             self.set_state(contracts.STATE_THINKING)
             try:
                 messages = (
-                    [{"role": "system", "content": SYSTEM_PROMPT}]
+                    [{"role": "system", "content": self._system_prompt}]
                     + list(self._history)
                     + [{"role": "user", "content": text}]
                 )
-                # ВНИМАНИЕ: сверить сигнатуру chat() с установленной версией ollama.
-                # В актуальных версиях format принимает JSON-схему (dict),
-                # keep_alive не даёт выгрузить модель между запросами.
                 response = self._client.chat(
                     model=config.OLLAMA_MODEL,
                     messages=messages,
@@ -77,6 +115,10 @@ class CoreModule(JarvisModule):
                 {"role": "assistant", "content": result.speech_response}
             )
 
+            # Публикуем реплику — TTS подхватит и сам выставит speaking/idle.
+            # НЕ ставим idle здесь: иначе на шине видна «вспышка» idle между
+            # thinking и speaking, а на двойной ответ (реплика + ошибка агента)
+            # получается два цикла speaking→idle.
             self.say(result.speech_response)
             if (
                 result.intent in ("os_command", "web_search")
@@ -88,7 +130,6 @@ class CoreModule(JarvisModule):
                     {"command_tag": result.payload},
                     qos=contracts.QOS_EXECUTE,
                 )
-            self.set_state(contracts.STATE_IDLE)
 
 
 def main():

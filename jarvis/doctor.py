@@ -74,8 +74,11 @@ def check_config_paths() -> list[CheckResult]:
         "logs/": config.LOGS_DIR,
         "commands.yaml": Path(config.COMMANDS_FILE),
         "VAD-модель": Path(config.VAD_MODEL),
-        "SenseVoice-модель": Path(config.SENSEVOICE_MODEL),
-        "SenseVoice-tokens": Path(config.SENSEVOICE_TOKENS),
+        "zipformer encoder": Path(config.ZIPFORMER_ENCODER),
+        "zipformer decoder": Path(config.ZIPFORMER_DECODER),
+        "zipformer joiner": Path(config.ZIPFORMER_JOINER),
+        "zipformer tokens": Path(config.ZIPFORMER_TOKENS),
+        "zipformer bpe": Path(config.ZIPFORMER_BPE),
         "Piper-голос": Path(config.PIPER_MODEL),
         "Piper-config": Path(config.PIPER_CONFIG),
     }
@@ -278,8 +281,7 @@ def check_audio() -> list[CheckResult]:
 # Слой 3. Модели (загружаемость движком — инициализация, не инференс)
 # --------------------------------------------------------------------------- #
 def check_sherpa_models() -> list[CheckResult]:
-    """VAD и SenseVoice реально загружаются движком, а не «файл на месте»."""
-    # ВНИМАНИЕ: API sherpa-onnx менялся между версиями — сверить на целевой машине.
+    """VAD и zipformer-ru реально загружаются движком, а не «файл на месте»."""
     results = []
     try:
         import sherpa_onnx
@@ -299,17 +301,21 @@ def check_sherpa_models() -> list[CheckResult]:
             fix="jarvis models --download  (или сверьте путь JARVIS_VAD_MODEL)",
         ))
     try:
-        sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=config.SENSEVOICE_MODEL,
-            tokens=config.SENSEVOICE_TOKENS,
-            use_itn=True,
+        # zipformer-ru — offline transducer с BPE-словарём.
+        sherpa_onnx.OfflineRecognizer.from_transducer(
+            encoder=config.ZIPFORMER_ENCODER,
+            decoder=config.ZIPFORMER_DECODER,
+            joiner=config.ZIPFORMER_JOINER,
+            tokens=config.ZIPFORMER_TOKENS,
+            modeling_unit="bpe",
+            bpe_vocab=config.ZIPFORMER_BPE,
         )
-        results.append(CheckResult(OK, "Модель SenseVoice загружается движком"))
+        results.append(CheckResult(OK, "Модель zipformer-ru загружается движком"))
     except Exception as exc:
         results.append(CheckResult(
-            FAIL, "Модель SenseVoice загружается движком",
-            reason=f"движок не смог загрузить SenseVoice: {exc}",
-            fix="jarvis models --download  (или сверьте JARVIS_SENSEVOICE_MODEL/_TOKENS)",
+            FAIL, "Модель zipformer-ru загружается движком",
+            reason=f"движок не смог загрузить zipformer-ru: {exc}",
+            fix="jarvis models --download  (или сверьте JARVIS_ZIPFORMER_*)",
         ))
     return results
 
@@ -489,19 +495,22 @@ def check_ollama_generation() -> CheckResult:
 
 
 def check_piper_synthesis() -> CheckResult:
-    """Голос Piper реально синтезирует тестовый сэмпл (не пустой звук)."""
+    """Голос Piper реально синтезирует тестовый сэмпл (не пустой звук).
+
+    piper-tts 1.4.x: synthesize(text) возвращает итератор AudioChunk.
+    У каждого чанка — audio_int16_bytes (bytes), sample_rate, sample_channels.
+    """
     try:
         from piper import PiperVoice
         voice = PiperVoice.load(config.PIPER_MODEL, config_path=config.PIPER_CONFIG)
         pcm = bytearray()
-        # ВНИМАНИЕ: имя метода синтеза сверить с установленной версией piper-tts.
-        for chunk in voice.synthesize_stream_raw("Проверка связи, сэр."):
-            pcm.extend(chunk)
+        for chunk in voice.synthesize("Проверка связи, сэр."):
+            pcm += chunk.audio_int16_bytes
         if len(pcm) > 0:
             return CheckResult(OK, f"Piper синтезирует звук ({len(pcm)} байт PCM)")
         return CheckResult(FAIL, "Piper синтезирует звук",
                            reason="синтез вернул пустой буфер.",
-                           fix="сверьте API синтеза piper-tts и корректность голоса")
+                           fix="сверьте корректность голоса и конфига Piper")
     except Exception as exc:
         return CheckResult(FAIL, "Piper синтезирует звук",
                            reason=f"сбой синтеза: {exc}",

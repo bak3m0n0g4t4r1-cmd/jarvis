@@ -103,7 +103,11 @@ def cmd_start(args) -> int:
     _systemctl("daemon-reload")
     rc = 0
     for svc in SERVICES:
-        rc |= _systemctl("enable", "--now", svc.unit)
+        # enable — автозапуск при логине (без --now, чтобы не было гонки со restart).
+        # restart — идемпотентно: не запущен → стартует, запущен → перезапускает
+        # с новым кодом (старый --now этого не делал — крутился старый процесс).
+        rc |= _systemctl("enable", svc.unit)
+        rc |= _systemctl("restart", svc.unit)
     return 0 if rc == 0 else 1
 
 

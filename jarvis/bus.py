@@ -9,6 +9,7 @@ JarvisModule, переопределить on_start() и вызвать run() в
 """
 import json
 import logging
+import os
 import signal
 import threading
 from logging.handlers import RotatingFileHandler
@@ -34,10 +35,13 @@ class JarvisModule:
         # Реестр хендлеров: топик -> функция(dict)
         self._handlers: dict[str, Callable[[dict], None]] = {}
 
-        # MQTT-клиент paho-mqtt 2.x (новый Callback API VERSION2)
+        # client_id = имя-сервиса + PID: каждый экземпляр уникален.
+        # Без PID два последовательных процесса (старый завис + новый systemd)
+        # имеют одинаковый id — брокер выбивает первый, возникает «Unspecified error».
+        self._client_id = f"{name}-{os.getpid()}"
         self.client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
-            client_id=name,
+            client_id=self._client_id,
         )
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
@@ -147,11 +151,18 @@ class JarvisModule:
 
     def _handle_signal(self, signum, frame):
         self.log.info("Получен сигнал %s, завершаюсь...", signum)
+        # Только взводим флаг. Закрытие MQTT и освобождение ресурсов наследника
+        # делаем в run() в правильном порядке (сначала on_stop, потом disconnect),
+        # чтобы аудио-потоки закрылись штатно до выхода интерпретатора.
         self._stop_event.set()
-        self.client.disconnect()
 
     def run(self) -> None:
-        """Основной цикл: подключение, подписки, обработка сообщений."""
+        """Основной цикл: подключение, подписки, обработка сообщений.
+
+        Сеть MQTT крутится в фоновом потоке (loop_start), главный поток ждёт
+        сигнала на _stop_event. При завершении сначала вызываем on_stop()
+        наследника (освобождение аудио/ресурсов), и только потом гасим MQTT.
+        """
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
 
@@ -161,26 +172,39 @@ class JarvisModule:
             self.log.exception("Ошибка в on_start()")
 
         # Подключаемся с ретраями — брокер мог ещё не подняться
+        connected = False
         while not self._stop_event.is_set():
             try:
                 self.client.connect(
                     config.MQTT_HOST, config.MQTT_PORT, config.MQTT_KEEPALIVE
                 )
+                connected = True
                 break
             except Exception as exc:
                 self.log.error("MQTT недоступен (%s), повтор через 5с", exc)
                 if self._stop_event.wait(5):
-                    return
+                    break
 
-        self.log.info("Модуль %s запущен", self.name)
-        try:
-            # loop_forever сам переподключается, пока не вызван disconnect()
-            self.client.loop_forever()
-        except Exception:
-            self.log.exception("Сбой основного цикла")
-        finally:
+        if connected:
+            # Сетевой цикл — в фоновом потоке (сам переподключается по backoff).
+            # Главный поток просто ждёт сигнала: так on_stop() гарантированно
+            # отработает ДО loop_stop/disconnect.
+            self.client.loop_start()
+            self.log.info("Модуль %s запущен", self.name)
             try:
-                self.on_stop()
+                while not self._stop_event.is_set():
+                    self._stop_event.wait(1.0)
             except Exception:
-                self.log.exception("Ошибка в on_stop()")
-            self.log.info("Модуль %s остановлен", self.name)
+                self.log.exception("Сбой основного цикла")
+
+        # Завершение: сперва ресурсы наследника (аудио), потом MQTT.
+        try:
+            self.on_stop()
+        except Exception:
+            self.log.exception("Ошибка в on_stop()")
+        try:
+            self.client.loop_stop()
+            self.client.disconnect()
+        except Exception:
+            self.log.exception("Ошибка при закрытии MQTT")
+        self.log.info("Модуль %s остановлен", self.name)

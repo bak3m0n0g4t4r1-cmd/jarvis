@@ -69,16 +69,34 @@ class TtsModule(JarvisModule):
         finally:
             self.set_state(contracts.STATE_IDLE)
 
+    def on_stop(self):
+        """Прерываем воспроизведение и ждём воркер ДО выхода интерпретатора.
+
+        Иначе резкое убийство потока с активным sd.play даёт assertion
+        PulseAudio и core dump при Ctrl+C / systemctl stop.
+        """
+        try:
+            sd.stop()  # прерываем текущее воспроизведение (разблокирует sd.wait)
+        except Exception:
+            self.log.exception("Ошибка остановки воспроизведения")
+        try:
+            if self._worker is not None:
+                self._worker.join(timeout=2.0)
+        except Exception:
+            self.log.exception("Ошибка ожидания воспроизводящего потока")
+
     def _synthesize(self, text: str):
         """Синтез фразы -> (numpy int16, sample_rate).
 
-        ВНИМАНИЕ: API Piper менялся между версиями — сверить с установленной.
-        Здесь читаем потоковый сырой PCM (int16, моно) и собираем в массив.
+        piper-tts 1.4.x: synthesize() возвращает итератор AudioChunk
+        (по одному на предложение). Собираем int16-PCM из всех чанков,
+        частоту берём из самого чанка — она достовернее, чем из конфига.
         """
-        sample_rate = self._voice.config.sample_rate
         pcm = bytearray()
-        for chunk in self._voice.synthesize_stream_raw(text):
-            pcm.extend(chunk)
+        sample_rate = self._voice.config.sample_rate  # запасное значение
+        for chunk in self._voice.synthesize(text):
+            pcm += chunk.audio_int16_bytes
+            sample_rate = chunk.sample_rate
         samples = np.frombuffer(bytes(pcm), dtype=np.int16)
         return samples, sample_rate
 

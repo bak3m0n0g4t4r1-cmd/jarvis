@@ -21,23 +21,54 @@ SAMPLE_RATE = int(os.getenv("JARVIS_SAMPLE_RATE", "16000"))
 CHANNELS = 1
 
 # --- Wake-word ---
-WAKE_WORD = os.getenv("JARVIS_WAKE_WORD", "джарвис")
+# Список вариантов: zipformer-ru стабильно искажает «джарвис» → добавляй
+# реально встреченные искажения сюда, без правки кода.
+WAKE_WORDS = os.getenv("JARVIS_WAKE_WORDS", "джарвис,джарвиз,жарвис,жарвиз,сервис,джарвес").split(",")
+# Порог нечёткого совпадения (difflib ratio, 0–1): ниже — больше ложных срабатываний.
+WAKE_WORD_FUZZY_THRESHOLD = float(os.getenv("JARVIS_WAKE_WORD_FUZZY_THRESHOLD", "0.7"))
 
-# --- STT: sherpa-onnx (silero-VAD + SenseVoice-Small) ---
+# Защита от эхо-петли: пока Джарвис говорит (state=speaking), STT глушит вход.
+# «Хвост» — пауза после окончания речи перед возобновлением, чтобы не словить
+# конец фразы из колонок (с). 1.0с покрывает «звон» колонок и реверберацию,
+# которые остаются уже после того, как PortAudio считает буфер опустошённым.
+SPEAKING_TAIL = float(os.getenv("JARVIS_SPEAKING_TAIL", "1.0"))
+# Контент-фильтр эха (страховка): сколько секунд после возобновления слушания
+# сверять распознанное с последней фразой Джарвиса (с).
+ECHO_CONTENT_WINDOW = float(os.getenv("JARVIS_ECHO_CONTENT_WINDOW", "2.0"))
+# Порог похожести (difflib ratio 0–1): выше — фраза считается эхом и отбрасывается.
+ECHO_SIMILARITY_THRESHOLD = float(os.getenv("JARVIS_ECHO_SIMILARITY_THRESHOLD", "0.6"))
+
+# Минимальная длина аудиосегмента в семплах для подачи в zipformer-распознаватель.
+# Короче этого — гарантированный RuntimeError Reshape, модель не может обработать.
+# 8000 семплов = 0.5 с при 16 кГц, минимально стабильная длина для transducer.
+MIN_SEGMENT_SAMPLES = int(os.getenv("JARVIS_MIN_SEGMENT_SAMPLES", "8000"))
+
+# --- STT: sherpa-onnx (silero-VAD + zipformer-ru offline transducer) ---
 VAD_MODEL = os.getenv("JARVIS_VAD_MODEL", str(MODELS_DIR / "silero_vad.onnx"))
-VAD_THRESHOLD = float(os.getenv("JARVIS_VAD_THRESHOLD", "0.5"))
-VAD_MIN_SILENCE = float(os.getenv("JARVIS_VAD_MIN_SILENCE", "0.5"))
+VAD_THRESHOLD = float(os.getenv("JARVIS_VAD_THRESHOLD", "0.3"))
+VAD_MIN_SILENCE = float(os.getenv("JARVIS_VAD_MIN_SILENCE", "0.8"))
 VAD_MIN_SPEECH = float(os.getenv("JARVIS_VAD_MIN_SPEECH", "0.25"))
-SENSEVOICE_MODEL = os.getenv(
-    "JARVIS_SENSEVOICE_MODEL", str(MODELS_DIR / "sense-voice" / "model.onnx")
+# Архив распаковывается во вложенную папку — учитываем в пути.
+_ZIPFORMER_DIR = MODELS_DIR / "sherpa-onnx-small-zipformer-ru-2024-09-18"
+ZIPFORMER_ENCODER = os.getenv(
+    "JARVIS_ZIPFORMER_ENCODER", str(_ZIPFORMER_DIR / "encoder.int8.onnx")
 )
-SENSEVOICE_TOKENS = os.getenv(
-    "JARVIS_SENSEVOICE_TOKENS", str(MODELS_DIR / "sense-voice" / "tokens.txt")
+ZIPFORMER_DECODER = os.getenv(
+    "JARVIS_ZIPFORMER_DECODER", str(_ZIPFORMER_DIR / "decoder.int8.onnx")
+)
+ZIPFORMER_JOINER = os.getenv(
+    "JARVIS_ZIPFORMER_JOINER", str(_ZIPFORMER_DIR / "joiner.int8.onnx")
+)
+ZIPFORMER_TOKENS = os.getenv(
+    "JARVIS_ZIPFORMER_TOKENS", str(_ZIPFORMER_DIR / "tokens.txt")
+)
+ZIPFORMER_BPE = os.getenv(
+    "JARVIS_ZIPFORMER_BPE", str(_ZIPFORMER_DIR / "bpe.model")
 )
 
 # --- LLM: Ollama ---
 OLLAMA_HOST = os.getenv("JARVIS_OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("JARVIS_OLLAMA_MODEL", "qwen2.5:0.5b-instruct")
+OLLAMA_MODEL = os.getenv("JARVIS_OLLAMA_MODEL", "qwen2.5:1.5b-instruct")
 OLLAMA_KEEP_ALIVE = os.getenv("JARVIS_OLLAMA_KEEP_ALIVE", "10m")
 HISTORY_SIZE = int(os.getenv("JARVIS_HISTORY_SIZE", "5"))  # пар user/assistant
 
