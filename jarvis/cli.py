@@ -1,7 +1,7 @@
 """CLI «Джарвиса»: установка-обёртка, глубокая диагностика и управление.
 
 Подкоманды:
-  jarvis doctor [--deep]   — проверка здоровья (см. jarvis/doctor.py)
+  jarvis doctor [--quick]  — полная проверка здоровья (см. jarvis/doctor.py)
   jarvis models --download — загрузка моделей по models.yaml
   jarvis test              — сквозной тест живой шины (say → execute → input)
   jarvis start|stop|status — обёртка над systemctl --user по юнитам Джарвиса
@@ -85,7 +85,7 @@ def _systemctl(*args: str) -> int:
 def cmd_doctor(args) -> int:
     from jarvis import doctor
 
-    ok = doctor.run(deep=args.deep)
+    ok = doctor.run(quick=args.quick)
     return 0 if ok else 1
 
 
@@ -136,10 +136,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_doctor = sub.add_parser("doctor", help="проверка здоровья системы")
+    p_doctor = sub.add_parser("doctor", help="полная проверка здоровья системы")
+    p_doctor.add_argument(
+        "--quick", action="store_true",
+        help="быстро: пропустить долгие/сетевые/платные тесты (Gemini, синтез, цепочка)",
+    )
     p_doctor.add_argument(
         "--deep", action="store_true",
-        help="добавить долгие живые тесты (генерация LLM, синтез звука, сквозная цепочка)",
+        help="устар.: дефолт уже полный (флаг ничего не меняет)",
     )
     p_doctor.set_defaults(func=cmd_doctor)
 

@@ -2,19 +2,21 @@
 
 Принцип: «файл существует» и «синтаксис валиден» запрещены как единственная
 проверка — они зелёные, когда всё сломано. Каждая проверка убеждается, что
-компонент реально работает, и при провале даёт человеческое решение:
-что произошло → почему → точная команда/правка для починки.
+компонент реально работает на ЭТОМ железе сейчас, и при провале даёт человеческое
+решение: что произошло → почему (по типу/коду ошибки) → точная команда/правка.
 
-Граница режимов — по стоимости:
-  быстрый  — всё, что отвечает за доли секунды (коннекты, импорты, загрузка);
-  --deep   — только реально долгое: генерация LLM, синтез звука, сквозная цепочка.
+Режим по умолчанию — ПОЛНАЯ глубокая проверка (живые тесты Ollama/Gemini/Piper,
+маршрут прокси, стабильность MQTT, здоровье юнитов, сквозная цепочка). Флаг
+`--quick` пропускает долгие/сетевые/платные тесты (живой Gemini тратит квоту).
+Флаг `--deep` оставлен как no-op алиас (дефолт и так полный).
 
-Сам doctor не падает: каждая проверка обёрнута в try-except, любой сбой —
-честный ✗ с диагнозом, а не краш CLI.
+Сам doctor не падает: каждая проверка обёрнута в try-except И прогоняется через
+_safe в оркестрации — сбой одной проверки помечается ✗ с причиной, остальные идут.
 """
 import importlib
 import shutil
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -22,6 +24,83 @@ from pathlib import Path
 from jarvis import config, contracts
 from jarvis.services_map import SERVICES
 from jarvis.ui import FAIL, OK, WARN, CheckResult, Reporter
+
+
+# --------------------------------------------------------------------------- #
+# Классификаторы ошибок и утилиты надёжности
+# --------------------------------------------------------------------------- #
+# Принцип тот же, что у casual.classify_gemini_error: свести сбой к короткому
+# человекочитаемому диагнозу по ТИПУ/КОДУ ошибки, а не печатать «сервер недоступен».
+# Импорты ленивые и в try-except — сам классификатор падать не должен.
+def classify_ollama_error(exc: Exception) -> str:
+    """Точный диагноз сбоя Ollama (сверено на ollama 0.6.2)."""
+    try:
+        import ollama
+
+        if isinstance(exc, ollama.ResponseError):
+            code = getattr(exc, "status_code", 0) or 0
+            if code == 404:
+                return "модель не найдена на сервере (404)"
+            if code == 400:
+                return "неверный запрос или имя модели (400)"
+            if code and code >= 500:
+                return f"внутренняя ошибка сервера Ollama ({code})"
+            return f"ошибка API Ollama ({code or '—'})"
+    except Exception:
+        pass
+    try:
+        import httpx
+
+        if isinstance(exc, httpx.TimeoutException):
+            return "превышено время ожидания Ollama (модель грузится или висит)"
+    except Exception:
+        pass
+    # ollama 0.6.x при недоступном сервере бросает builtins.ConnectionError.
+    if isinstance(exc, (ConnectionRefusedError, ConnectionError)):
+        return "сервер Ollama не запущен (нет соединения)"
+    if isinstance(exc, socket.gaierror):
+        return "не разрешается адрес Ollama (DNS) — проверьте JARVIS_OLLAMA_HOST"
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "Ollama не ответил вовремя (таймаут)"
+    return f"непредвиденная ошибка Ollama ({type(exc).__name__}: {exc})"
+
+
+def classify_mqtt_error(exc: Exception) -> str:
+    """Точный диагноз сбоя подключения к MQTT-брокеру (сверено на paho-mqtt 2.1.0)."""
+    if isinstance(exc, ConnectionRefusedError):
+        return "брокер не запущен (соединение отклонено)"
+    if isinstance(exc, socket.gaierror):
+        return "не разрешается адрес брокера (DNS) — проверьте JARVIS_MQTT_HOST"
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "брокер не ответил вовремя (таймаут)"
+    if isinstance(exc, OSError):
+        return f"сетевая ошибка соединения с брокером ({exc})"
+    return f"непредвиденная ошибка MQTT ({type(exc).__name__}: {exc})"
+
+
+def _safe(reporter: Reporter, func, *args) -> None:
+    """Выполнить проверку, изолировав её падение: исключение ВНУТРИ проверки не
+    должно ронять весь доктор. Проверка возвращает CheckResult или list[CheckResult];
+    на исключении — честный FAIL с типом ошибки, остальные проверки продолжаются.
+    """
+    try:
+        result = func(*args)
+    except Exception as exc:
+        import traceback
+
+        name = getattr(func, "__name__", "проверка")
+        reporter.report(CheckResult(
+            FAIL, f"{name}: внутренний сбой проверки",
+            reason=f"{type(exc).__name__}: {exc}",
+            fix="это баг самой проверки доктора; трейс — в logs/doctor.log",
+        ))
+        reporter.log.error("Сбой проверки %s:\n%s", name, traceback.format_exc())
+        return
+    if isinstance(result, list):
+        for r in result:
+            reporter.report(r)
+    elif result is not None:
+        reporter.report(result)
 
 
 # --------------------------------------------------------------------------- #
@@ -67,6 +146,102 @@ def check_imports() -> list[CheckResult]:
     return results
 
 
+def check_library_versions() -> list[CheckResult]:
+    """Версии ключевых библиотек удовлетворяют спецификаторам pyproject (источник истины).
+
+    Расхождение (установленная версия вне диапазона из pyproject) → WARN: API мог
+    измениться, а код «сверен по памяти». Не блокер, но частая причина неуловимых сбоев.
+    """
+    try:
+        import tomllib
+        from importlib.metadata import PackageNotFoundError, version
+
+        from packaging.requirements import Requirement
+    except Exception as exc:
+        return [CheckResult(WARN, "Версии библиотек",
+                            reason=f"нет инструментов сверки версий: {exc}.",
+                            fix="pip install -e .  (нужен packaging)")]
+    try:
+        with open(config.BASE_DIR / "pyproject.toml", "rb") as f:
+            deps = tomllib.load(f).get("project", {}).get("dependencies", [])
+    except Exception as exc:
+        return [CheckResult(WARN, "Версии библиотек",
+                            reason=f"не удалось прочитать pyproject.toml: {exc}.",
+                            fix="проверьте pyproject.toml")]
+    # Либы, чьи версии реально влияют на поведение (имя пакета как в pyproject).
+    watched = {"google-genai", "paho-mqtt", "sherpa-onnx", "piper-tts",
+               "pydantic", "ollama", "numpy", "httpx"}
+    results = []
+    for raw in deps:
+        try:
+            req = Requirement(raw)
+        except Exception:
+            continue
+        if req.name.lower() not in watched:
+            continue
+        try:
+            inst = version(req.name)
+        except PackageNotFoundError:
+            results.append(CheckResult(FAIL, f"версия {req.name}",
+                                       reason="пакет не установлен.", fix="pip install -e ."))
+            continue
+        if req.specifier and inst not in req.specifier:
+            results.append(CheckResult(
+                WARN, f"версия {req.name}",
+                reason=f"установлена {inst}, pyproject ожидает {req.specifier} "
+                       "(API мог измениться).",
+                fix=f"pip install -e .  (или сверьте код под {req.name} {inst})",
+            ))
+        else:
+            results.append(CheckResult(OK, f"версия {req.name}: {inst}"))
+    return results
+
+
+def check_env_file() -> list[CheckResult]:
+    """Разбор .env: дубли переменных и подозрительные значения ключей — с номерами строк.
+
+    Подозрительное значение ключа (пробел/перенос внутри, имя GEMINI_API_KEY/KEY= внутри
+    значения) приводило к Illegal header value. Дубль переменной незаметно «перетирает»
+    значение. Значения секретов НЕ печатаем — только имя и номер строки.
+    """
+    env_path = config.BASE_DIR / ".env"
+    if not env_path.exists():
+        return [CheckResult(OK, ".env: файл отсутствует (работаем на окружении/дефолтах)")]
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except Exception as exc:
+        return [CheckResult(WARN, ".env читается",
+                            reason=f"не удалось прочитать .env: {exc}.", fix="проверьте .env")]
+    results = []
+    seen: dict[str, int] = {}
+    secret_markers = ("KEY", "TOKEN", "SECRET", "PASS")
+    for i, line in enumerate(lines, start=1):
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        name, _, value = s.partition("=")
+        name, value = name.strip(), value.strip()
+        if name in seen:
+            results.append(CheckResult(
+                WARN, f".env: дубль переменной {name}",
+                reason=f"{name} задан повторно (строки {seen[name]} и {i}); возьмётся последний.",
+                fix=f"оставьте одну строку {name} в .env",
+            ))
+        else:
+            seen[name] = i
+        if any(m in name.upper() for m in secret_markers) and value:
+            if any(ch.isspace() for ch in value) or "GEMINI_API_KEY" in value or "KEY=" in value:
+                results.append(CheckResult(
+                    WARN, f".env: подозрительное значение {name}",
+                    reason=f"строка {i}: пробел/перенос или имя переменной внутри значения "
+                           "(признак слипшихся строк; был Illegal header value).",
+                    fix=f"проверьте строку {i} в .env: значение без пробелов/переносов, один ключ",
+                ))
+    if not results:
+        return [CheckResult(OK, f".env: {len(seen)} переменных, дублей и битых значений нет")]
+    return results
+
+
 def check_config_paths() -> list[CheckResult]:
     """Все пути из config.py резолвятся в существующие места."""
     paths = {
@@ -96,8 +271,22 @@ def check_config_paths() -> list[CheckResult]:
     return results
 
 
+# Безопасные read-only version-пробы: бинарь в $PATH ≠ рабочая утилита. Для этих
+# утилит лёгкий `--version` подтверждает работоспособность, ничего не меняя в системе.
+# GUI и разрушительные (spectacle/konsole/firefox/dolphin/telegram/nmap, переключатели
+# Wi-Fi/BT) НЕ запускаем — только наличие бинаря.
+_SAFE_VERSION_PROBE = {
+    "wpctl": ["--help"],          # wpctl не знает --version; --help безвреден и даёт код 0
+    "brightnessctl": ["--version"],
+    "nmcli": ["--version"],
+    "bluetoothctl": ["--version"],
+    "loginctl": ["--version"],
+}
+
+
 def check_commands_yaml() -> list[CheckResult]:
-    """commands.yaml семантически: команда — список, бинарь есть в $PATH."""
+    """commands.yaml: структура (команда — список), бинарь в $PATH, для read-only
+    утилит — живая version-проба (бинарь есть ≠ команда реально работает)."""
     import yaml
 
     try:
@@ -123,13 +312,41 @@ def check_commands_yaml() -> list[CheckResult]:
             ))
             continue
         binary = str(args[0])
-        if shutil.which(binary):
-            results.append(CheckResult(OK, f"команда «{tag}» → {binary}"))
-        else:
+        if not shutil.which(binary):
             results.append(CheckResult(
                 WARN, f"команда «{tag}» → {binary}",
                 reason=f"бинарь {binary!r} не найден в $PATH.",
                 fix=f"установите {binary} или поправьте путь в commands.yaml",
+            ))
+            continue
+        probe = _SAFE_VERSION_PROBE.get(binary)
+        if not probe:
+            # GUI/разрушительные — не запускаем, ограничиваемся наличием бинаря.
+            results.append(CheckResult(OK, f"команда «{tag}» → {binary}"))
+            continue
+        try:
+            proc = subprocess.run([binary, *probe], capture_output=True, text=True,
+                                  timeout=3, check=False)
+            if proc.returncode == 0:
+                results.append(CheckResult(OK, f"команда «{tag}» → {binary} (отвечает)"))
+            else:
+                results.append(CheckResult(
+                    WARN, f"команда «{tag}» → {binary}",
+                    reason=f"{binary} есть, но вернул код {proc.returncode} на "
+                           f"{' '.join(probe)}.",
+                    fix=f"проверьте вручную: {binary} {' '.join(probe)}",
+                ))
+        except subprocess.TimeoutExpired:
+            results.append(CheckResult(
+                WARN, f"команда «{tag}» → {binary}",
+                reason=f"{binary} не ответил на {' '.join(probe)} за 3с.",
+                fix=f"проверьте работоспособность {binary} вручную",
+            ))
+        except Exception as exc:
+            results.append(CheckResult(
+                WARN, f"команда «{tag}» → {binary}",
+                reason=f"не удалось проверить {binary}: {exc}.",
+                fix=f"проверьте {binary} вручную",
             ))
     return results
 
@@ -167,6 +384,90 @@ def check_entry_points() -> list[CheckResult]:
 
 
 # --------------------------------------------------------------------------- #
+# Слой «Железо» (N100, 8 ГБ — впритык: ловим нехватку RAM/swap/диска)
+# --------------------------------------------------------------------------- #
+def check_hardware() -> list[CheckResult]:
+    """Реальные ресурсы железа с числами: память+swap, загрузка CPU, место на диске.
+
+    На N100/8 ГБ Джарвис с моделями и облаком идёт впритык: нехватка памяти/свопинг и
+    забитый диск реально тормозят работу. Это WARN с цифрами, не блокеры.
+    """
+    results = []
+    # --- Память и swap из /proc/meminfo ---
+    try:
+        mem: dict = {}
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                key, _, value = line.partition(":")
+                mem[key.strip()] = int(value.split()[0])  # значения в kB
+        total_gb = mem.get("MemTotal", 0) / 1024 / 1024
+        avail_gb = mem.get("MemAvailable", 0) / 1024 / 1024
+        swap_total = mem.get("SwapTotal", 0)
+        swap_used = swap_total - mem.get("SwapFree", 0)
+        detail = f"доступно {avail_gb:.1f} ГБ из {total_gb:.1f} ГБ"
+        swap_pct = round(swap_used / swap_total * 100) if swap_total else 0
+        if swap_total:
+            detail += f", swap занят {swap_used/1024/1024:.1f} ГБ ({swap_pct}%)"
+        if avail_gb < 0.5:
+            results.append(CheckResult(
+                WARN, "Память",
+                reason=f"мало свободной RAM: {detail}.",
+                fix="закройте лишнее; модели и Gemini требуют памяти — возможны своп и тормоза",
+            ))
+        elif swap_total and swap_pct >= 50:
+            results.append(CheckResult(
+                WARN, "Память",
+                reason=f"активный свопинг: {detail}.",
+                fix="память под нагрузкой; закройте лишнее, иначе возможны подтормаживания",
+            ))
+        else:
+            results.append(CheckResult(OK, f"Память: {detail}"))
+    except Exception as exc:
+        results.append(CheckResult(WARN, "Память",
+                                   reason=f"не удалось прочитать /proc/meminfo: {exc}."))
+    # --- Загрузка CPU (переиспользуем read-only функцию мозга) ---
+    try:
+        from jarvis.brain import read_system_load
+
+        load = read_system_load()
+        pct, l1, cores = (load.get("загрузка_cpu_процент"),
+                          load.get("загрузка_cpu_1мин"), load.get("ядер"))
+        if pct is None:
+            results.append(CheckResult(WARN, "Загрузка CPU", reason=f"нет данных: {load}."))
+        elif pct >= 90:
+            results.append(CheckResult(
+                WARN, "Загрузка CPU",
+                reason=f"высокая загрузка: {pct}% (loadavg {l1} на {cores} ядра).",
+                fix="что-то нагружает процессор — проверьте top/htop",
+            ))
+        else:
+            results.append(CheckResult(
+                OK, f"Загрузка CPU: {pct}% (loadavg {l1} на {cores} ядра)"))
+    except Exception as exc:
+        results.append(CheckResult(WARN, "Загрузка CPU",
+                                   reason=f"не удалось снять загрузку: {exc}."))
+    # --- Место на диске (корень проекта) ---
+    try:
+        usage = shutil.disk_usage(config.BASE_DIR)
+        free_gb = usage.free / 1024**3
+        total_gb = usage.total / 1024**3
+        used_pct = round(usage.used / usage.total * 100)
+        detail = f"свободно {free_gb:.0f} ГБ из {total_gb:.0f} ГБ ({used_pct}% занято)"
+        if used_pct >= 90 or free_gb < 5:
+            results.append(CheckResult(
+                WARN, "Диск",
+                reason=f"мало места: {detail}.",
+                fix="освободите место — модели большие, логи растут",
+            ))
+        else:
+            results.append(CheckResult(OK, f"Диск: {detail}"))
+    except Exception as exc:
+        results.append(CheckResult(WARN, "Диск",
+                                   reason=f"не удалось определить место: {exc}."))
+    return results
+
+
+# --------------------------------------------------------------------------- #
 # Слой 2. Системные службы (живые проверки, доли секунды)
 # --------------------------------------------------------------------------- #
 def check_mosquitto() -> CheckResult:
@@ -186,7 +487,7 @@ def check_mosquitto() -> CheckResult:
     except Exception as exc:
         return CheckResult(
             FAIL, "Mosquitto round-trip",
-            reason=f"брокер {config.MQTT_HOST}:{config.MQTT_PORT} не отвечает ({exc}).",
+            reason=f"брокер {config.MQTT_HOST}:{config.MQTT_PORT}: {classify_mqtt_error(exc)}.",
             fix="sudo systemctl enable --now mosquitto   (или: mosquitto -d)",
         )
     try:
@@ -222,7 +523,7 @@ def check_ollama() -> CheckResult:
     except Exception as exc:
         return CheckResult(
             FAIL, "Ollama отвечает",
-            reason=f"сервер {config.OLLAMA_HOST} недоступен ({exc}).",
+            reason=f"сервер {config.OLLAMA_HOST}: {classify_ollama_error(exc)}.",
             fix="ollama serve   (и проверьте JARVIS_OLLAMA_HOST)",
         )
     names = _ollama_model_names(data)
@@ -360,6 +661,107 @@ def check_audio() -> list[CheckResult]:
                                reason="не найдено ни одного устройства воспроизведения.",
                                fix="проверьте вывод звука: wpctl status"))
     return results
+
+
+def check_proxy_route() -> CheckResult:
+    """Реальный маршрут прокси Gemini: внешний IP и страна ЧЕРЕЗ тот же прокси-клиент.
+
+    «Прокси задан» ≠ «трафик идёт через него». Делаем запрос к сервису определения IP с
+    тем же proxy, что у Gemini-клиента, и показываем внешний IP/страну. Российский IP или
+    молчащий прокси → WARN (Gemini упрётся в геоблок). Без прокси — инфо «напрямую».
+    Системный/пентест-трафик это не затрагивает — разовый запрос только этого клиента.
+    """
+    if not config.GEMINI_PROXY:
+        return CheckResult(OK, "Прокси Gemini не задан (облако — напрямую)")
+    try:
+        import httpx
+    except Exception as exc:
+        return CheckResult(WARN, "Маршрут прокси Gemini",
+                           reason=f"httpx недоступен: {exc}.", fix="pip install -e .")
+    try:
+        with httpx.Client(proxy=config.GEMINI_PROXY, timeout=8) as client:
+            data = client.get("https://ipinfo.io/json").json()
+        ip = data.get("ip") or "?"
+        country = (data.get("country") or "").upper()
+    except Exception as exc:
+        from jarvis.casual import classify_gemini_error
+
+        return CheckResult(
+            WARN, "Маршрут прокси Gemini",
+            reason=f"прокси не отвечает: {classify_gemini_error(exc)}.",
+            fix="проверьте JARVIS_GEMINI_PROXY (адрес/логин/пароль) и доступность прокси",
+        )
+    if not country or country == "RU":
+        return CheckResult(
+            WARN, "Маршрут прокси Gemini",
+            reason=f"внешний IP {ip}, страна {country or '?'} — не зарубежная; "
+                   "Gemini упрётся в геоблок.",
+            fix="нужен прокси с зарубежным IP (см. CLAUDE.md, раздел «Прокси»)",
+        )
+    return CheckResult(OK, f"Маршрут прокси Gemini: внешний IP {ip}, страна {country}")
+
+
+def check_mqtt_stability(quick: bool = False) -> CheckResult:
+    """Стабильность MQTT: частые разрывы видны в логах и/или живым наблюдением.
+
+    В логах сервисов реально мелькает «Отключён от MQTT» — признак флапающего соединения
+    (keepalive/конфликт client_id/сеть). Считаем недавние разрывы по logs/*.log; в полном
+    режиме дополнительно держим подписчика ~5 c и ловим неожиданные разрывы.
+    """
+    import glob as _glob
+
+    total_disc, worst = 0, ("", 0)
+    try:
+        for path in _glob.glob(str(config.LOGS_DIR / "jarvis-*.log")):
+            try:
+                n = Path(path).read_text(encoding="utf-8", errors="replace").count(
+                    "Отключён от MQTT")
+            except Exception:
+                continue
+            total_disc += n
+            if n > worst[1]:
+                worst = (Path(path).name, n)
+    except Exception:
+        pass
+
+    live_disc = 0
+    if not quick:
+        try:
+            import paho.mqtt.client as mqtt
+
+            state = {"n": 0, "closing": False}
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                                 client_id="jarvis-doctor-stab")
+            client.on_disconnect = lambda *a, **k: (
+                None if state["closing"] else state.__setitem__("n", state["n"] + 1))
+            client.connect(config.MQTT_HOST, config.MQTT_PORT, 5)
+            client.loop_start()
+            time.sleep(5.0)
+            state["closing"] = True  # наш штатный disconnect разрывом не считаем
+            client.loop_stop()
+            client.disconnect()
+            live_disc = state["n"]
+        except Exception as exc:
+            return CheckResult(WARN, "MQTT-стабильность",
+                               reason=f"не удалось проверить вживую: {classify_mqtt_error(exc)}.",
+                               fix="убедитесь, что брокер запущен")
+
+    if live_disc > 0:
+        return CheckResult(
+            WARN, "MQTT-стабильность",
+            reason=f"за 5 c соединение рвалось {live_disc} раз; в логах суммарно "
+                   f"{total_disc} (худший: {worst[0]} — {worst[1]}).",
+            fix="проверьте уникальность client_id, keepalive и стабильность сети/брокера",
+        )
+    if total_disc >= 10:
+        return CheckResult(
+            WARN, "MQTT-стабильность",
+            reason=f"в логах много разрывов: суммарно {total_disc} "
+                   f"(худший: {worst[0]} — {worst[1]}). Соединение периодически флапает.",
+            fix="вероятно keepalive/конфликт client_id/сеть; см. реконнекты в логах сервисов",
+        )
+    detail = "вживую разрывов нет" if not quick else "по логам"
+    return CheckResult(OK, f"MQTT-стабильность: {detail}, разрывов в логах {total_disc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -505,41 +907,120 @@ def check_subscription_restore() -> CheckResult:
                            reason=f"сбой проверки: {exc}", fix="см. jarvis/bus.py")
 
 
-def check_systemd_units() -> list[CheckResult]:
-    """systemd --user-юниты найдены, ExecStart указывает на существующий бинарь."""
-    import os
+def _systemctl_show(unit: str) -> dict:
+    """Свойства юнита через `systemctl --user show` → dict. Пустой dict при сбое."""
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "show", unit,
+             "-p", "ActiveState", "-p", "SubState", "-p", "NRestarts"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        props = {}
+        for line in proc.stdout.splitlines():
+            key, _, value = line.partition("=")
+            props[key.strip()] = value.strip()
+        return props
+    except Exception:
+        return {}
 
-    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+
+def _log_freshness(svc) -> str:
+    """Справочная пометка о свежести лога сервиса (не влияет на статус: молчащий
+    сервис может законно долго не писать)."""
+    try:
+        log_path = config.LOGS_DIR / f"{svc.command}.log"
+        if not log_path.exists():
+            return ", лог не найден"
+        age = time.time() - log_path.stat().st_mtime
+        if age < 120:
+            return f", лог свежий ({int(age)} c назад)"
+        if age < 3600:
+            return f", лог {int(age / 60)} мин назад"
+        return f", лог {int(age / 3600)} ч назад"
+    except Exception:
+        return ""
+
+
+def check_service_health() -> list[CheckResult]:
+    """Здоровье юнитов: установлен, ExecStart-бинарь есть и (если запущен) реально жив.
+
+    Не «класс инстанцируется», а живой статус systemd: failed/флапающий процесс виден по
+    ActiveState/SubState/NRestarts. Юнит не установлен → WARN (jarvis start). systemctl
+    недоступен (не systemd-сессия) → ограничиваемся проверкой файла юнита и бинаря.
+    """
+    import os as _os
+
+    base = _os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     units_dir = Path(base) / "systemd" / "user"
+    have_systemctl = shutil.which("systemctl") is not None
     results = []
     for svc in SERVICES:
-        unit = units_dir / svc.unit
-        if not unit.exists():
+        unit_path = units_dir / svc.unit
+        if not unit_path.exists():
             results.append(CheckResult(
                 WARN, f"юнит {svc.unit}",
                 reason="юнит ещё не установлен в ~/.config/systemd/user/.",
                 fix="jarvis start  (сгенерирует юниты с верными путями)",
             ))
             continue
+        # ExecStart-бинарь существует.
         try:
             exec_start = ""
-            for line in unit.read_text(encoding="utf-8").splitlines():
+            for line in unit_path.read_text(encoding="utf-8").splitlines():
                 if line.startswith("ExecStart="):
                     exec_start = line.split("=", 1)[1].strip()
                     break
             binary = exec_start.split()[0] if exec_start else ""
-            if binary and Path(binary).exists():
-                results.append(CheckResult(OK, f"юнит {svc.unit} → {binary}"))
-            else:
-                results.append(CheckResult(
-                    FAIL, f"юнит {svc.unit}",
-                    reason=f"ExecStart указывает на несуществующий бинарь: {binary!r}.",
-                    fix="jarvis start  (перегенерирует юниты от текущего venv)",
-                ))
         except Exception as exc:
             results.append(CheckResult(FAIL, f"юнит {svc.unit}",
                                        reason=f"не удалось прочитать юнит: {exc}",
                                        fix="jarvis start"))
+            continue
+        if not (binary and Path(binary).exists()):
+            results.append(CheckResult(
+                FAIL, f"юнит {svc.unit}",
+                reason=f"ExecStart указывает на несуществующий бинарь: {binary!r}.",
+                fix="jarvis start  (перегенерирует юниты от текущего venv)",
+            ))
+            continue
+        if not have_systemctl:
+            results.append(CheckResult(
+                OK, f"юнит {svc.unit} → {binary} (systemctl недоступен, статус не снят)"))
+            continue
+        # Живое состояние.
+        props = _systemctl_show(svc.unit)
+        active = props.get("ActiveState", "")
+        sub = props.get("SubState", "")
+        nrestarts = props.get("NRestarts", "0")
+        if active == "active":
+            fresh = _log_freshness(svc)
+            if nrestarts.isdigit() and int(nrestarts) >= 5:
+                results.append(CheckResult(
+                    WARN, f"юнит {svc.unit}",
+                    reason=f"active/{sub}, но рестартовал {nrestarts} раз — вероятно флапает{fresh}.",
+                    fix=f"журнал: journalctl --user -u {svc.unit} -n 50",
+                ))
+            else:
+                results.append(CheckResult(
+                    OK, f"юнит {svc.unit}: active/{sub}, рестартов {nrestarts}{fresh}"))
+        elif active == "failed" or sub == "failed":
+            results.append(CheckResult(
+                FAIL, f"юнит {svc.unit}",
+                reason=f"юнит в состоянии failed ({active}/{sub}).",
+                fix=f"journalctl --user -u {svc.unit} -n 50; затем jarvis start",
+            ))
+        elif active in ("inactive", "deactivating", ""):
+            results.append(CheckResult(
+                WARN, f"юнит {svc.unit}",
+                reason=f"не запущен ({active or '?'}/{sub or '?'}).",
+                fix=f"jarvis start  (или systemctl --user start {svc.unit})",
+            ))
+        else:
+            results.append(CheckResult(
+                WARN, f"юнит {svc.unit}",
+                reason=f"состояние {active}/{sub} (не active).",
+                fix=f"jarvis status; journalctl --user -u {svc.unit} -n 50",
+            ))
     return results
 
 
@@ -553,7 +1034,8 @@ def check_ollama_generation() -> CheckResult:
         client = ollama.Client(host=config.OLLAMA_HOST)
     except Exception as exc:
         return CheckResult(FAIL, "Ollama: генерация + схема",
-                           reason=f"клиент недоступен: {exc}", fix="ollama serve")
+                           reason=f"клиент недоступен: {classify_ollama_error(exc)}",
+                           fix="ollama serve")
     try:
         response = client.chat(
             model=config.OLLAMA_MODEL,
@@ -565,7 +1047,7 @@ def check_ollama_generation() -> CheckResult:
     except Exception as exc:
         return CheckResult(
             FAIL, "Ollama: генерация + схема",
-            reason=f"модель {config.OLLAMA_MODEL} не ответила: {exc}.",
+            reason=f"модель {config.OLLAMA_MODEL}: {classify_ollama_error(exc)}.",
             fix=f"ollama run {config.OLLAMA_MODEL}  — проверьте, что модель рабочая",
         )
     try:
@@ -624,8 +1106,9 @@ def check_gemini_live() -> CheckResult:
         backend = casual.CasualBackend(logging.getLogger("jarvis-doctor-gemini"))
         answer = backend.reply("Ответь одним коротким словом для проверки связи.")
     except Exception as exc:
+        # Gemini опционален (есть офлайн-фоллбэк), поэтому недоступность — WARN, не блокер.
         return CheckResult(
-            FAIL, "Gemini: живой ответ",
+            WARN, "Gemini: живой ответ",
             reason=f"запрос упал: {exc}",
             fix="проверьте GEMINI_API_KEY, сеть и имя модели JARVIS_GEMINI_MODEL",
         )
@@ -634,7 +1117,7 @@ def check_gemini_live() -> CheckResult:
         # из last_error точный: гео-блок/квота/ключ/сеть, а не общая «облако недоступно».
         diag = backend.last_error or "облако недоступно, неверный ключ или имя модели"
         return CheckResult(
-            FAIL, "Gemini: живой ответ",
+            WARN, "Gemini: живой ответ",
             reason=f"вернулся офлайн-фоллбэк: {diag}.",
             fix="проверьте GEMINI_API_KEY, JARVIS_GEMINI_PROXY, сеть и "
                 "JARVIS_GEMINI_MODEL; см. logs/jarvis-core.log",
@@ -782,57 +1265,64 @@ def live_chain_test() -> bool:
 # --------------------------------------------------------------------------- #
 # Оркестрация
 # --------------------------------------------------------------------------- #
-def run(deep: bool = False) -> bool:
-    """Запустить диагностику. deep=True добавляет долгие живые тесты."""
+def run(quick: bool = False) -> bool:
+    """Полная глубокая диагностика (дефолт). quick=True пропускает долгие/сетевые/платные
+    тесты (живой Gemini тратит квоту, синтез/цепочка — секунды). Каждая проверка идёт
+    через _safe: её падение не роняет весь доктор.
+    """
     reporter = Reporter()
 
     reporter.section("Слой 1. Окружение и пакет")
-    reporter.report(check_venv())
-    for r in check_imports():
-        reporter.report(r)
-    for r in check_config_paths():
-        reporter.report(r)
-    for r in check_commands_yaml():
-        reporter.report(r)
-    for r in check_entry_points():
-        reporter.report(r)
+    _safe(reporter, check_venv)
+    _safe(reporter, check_imports)
+    _safe(reporter, check_library_versions)
+    _safe(reporter, check_config_paths)
+    _safe(reporter, check_env_file)
+    _safe(reporter, check_commands_yaml)
+    _safe(reporter, check_entry_points)
 
-    reporter.section("Слой 2. Системные службы")
-    reporter.report(check_mosquitto())
-    reporter.report(check_ollama())
-    reporter.report(check_gemini())
-    reporter.report(check_brain_tools())
-    for r in check_audio():
-        reporter.report(r)
+    reporter.section("Слой 2. Железо (N100, 8 ГБ)")
+    _safe(reporter, check_hardware)
 
-    reporter.section("Слой 3. Модели")
+    reporter.section("Слой 3. Системные службы")
+    _safe(reporter, check_mosquitto)
+    if not quick:
+        reporter.note("проверяю стабильность MQTT (≈5 c)…")
+    _safe(reporter, check_mqtt_stability, quick)
+    _safe(reporter, check_ollama)
+    _safe(reporter, check_gemini)
+    _safe(reporter, check_brain_tools)
+    if not quick:
+        reporter.note("проверяю маршрут прокси Gemini (внешний IP)…")
+        _safe(reporter, check_proxy_route)
+    _safe(reporter, check_audio)
+
+    reporter.section("Слой 4. Модели")
     reporter.note("загружаю модели движком…")
-    for r in check_sherpa_models():
-        reporter.report(r)
-    reporter.report(check_piper_voice())
-    reporter.report(check_sample_rate())
-
-    reporter.section("Слой 4. Сервисы Джарвиса")
-    for r in check_services():
-        reporter.report(r)
-    reporter.report(check_subscription_restore())
-    for r in check_systemd_units():
-        reporter.report(r)
-
-    if deep:
-        reporter.section("Слой 5 (--deep). Живые долгие тесты")
-        reporter.note("пробная генерация Ollama (может занять время)…")
-        reporter.report(check_ollama_generation())
+    _safe(reporter, check_sherpa_models)
+    _safe(reporter, check_piper_voice)
+    _safe(reporter, check_sample_rate)
+    if not quick:
+        reporter.note("пробная генерация Ollama…")
+        _safe(reporter, check_ollama_generation)
         reporter.note("синтез тестового сэмпла Piper…")
-        reporter.report(check_piper_synthesis())
-        reporter.note("живой запрос к Gemini (casual-бэкенд)…")
-        reporter.report(check_gemini_live())
+        _safe(reporter, check_piper_synthesis)
+
+    reporter.section("Слой 5. Сервисы Джарвиса")
+    _safe(reporter, check_services)
+    _safe(reporter, check_subscription_restore)
+    _safe(reporter, check_service_health)
+
+    if not quick:
+        reporter.section("Слой 6. Облако и функции (живые)")
+        reporter.note("живой запрос к Gemini (ротация ключей/прокси)…")
+        _safe(reporter, check_gemini_live)
         reporter.note("живой function-calling прогон мозга…")
-        reporter.report(check_brain_live())
+        _safe(reporter, check_brain_live)
 
     ok = reporter.summary()
 
-    if deep:
-        # Сквозную цепочку печатаем отдельной секцией со своим итогом
+    if not quick:
+        # Сквозную цепочку печатаем отдельной секцией со своим итогом.
         live_chain_test()
     return ok
