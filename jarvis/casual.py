@@ -160,8 +160,13 @@ class CasualBackend:
         # Память беседы: последние GEMINI_HISTORY реплик (сообщений) user/assistant.
         # Живёт в RAM, рестарт не переживает — для собеседника этого достаточно.
         self._history: deque = deque(maxlen=config.GEMINI_HISTORY)
-        self._client = None          # ленивое создание: нужен ключ и тяжёлый импорт
-        self._client_failed = False  # не пересоздавать клиент на каждый запрос
+        # Ключи Gemini (порядок: первый = основной) и индекс текущего активного.
+        # При исчерпании квоты (429) переключаемся на следующий; индекс не сбрасываем
+        # на 0 после успеха — чтобы не долбить исчерпанный ключ каждым запросом.
+        self._keys: list[str] = list(config.GEMINI_API_KEYS)
+        self._key_index = 0
+        self._client = None          # клиент текущего ключа (ленивое создание)
+        self._client_failed = False  # фатальный сбой SDK/прокси — не пересоздавать
         self._offline_streak = 0     # выбор текста фоллбэка (первый/повторный)
         # Диагноз последнего сбоя (для doctor): None — последний запрос удался.
         self.last_error: str | None = None
@@ -174,17 +179,18 @@ class CasualBackend:
         with self._lock:
             if config.CASUAL_BACKEND != "gemini":
                 return self._fallback()
-            client = self._ensure_client()
-            if client is None:
+            if not self._keys:
+                # Ни одного валидного ключа — офлайн. Предупреждаем один раз.
+                if not self._client_failed:
+                    self.log.warning("GEMINI_API_KEY не задан — casual работает в офлайн-режиме")
+                    self._client_failed = True
                 return self._fallback()
-            try:
-                answer = self._ask_gemini(client, text)
-            except Exception as exc:
-                self.last_error = classify_gemini_error(exc)
-                # Внятный диагноз в лог + полная трасса отдельно (debug).
-                self.log.warning("Gemini недоступен: %s — ухожу в офлайн-фоллбэк",
-                                 self.last_error)
-                self.log.debug("Трасса ошибки Gemini", exc_info=True)
+            if self._client_failed:
+                # Фатальный сбой SDK/прокси зафиксирован ранее — не дёргаем облако.
+                return self._fallback()
+
+            answer = self._reply_with_rotation(text)
+            if answer is None:
                 return self._fallback()
             # Успех: сбрасываем счётчик офлайна и пополняем память беседы.
             self.last_error = None
@@ -196,14 +202,65 @@ class CasualBackend:
     # ------------------------------------------------------------------ #
     # Внутреннее
     # ------------------------------------------------------------------ #
+    def _reply_with_rotation(self, text: str) -> str | None:
+        """Один проход по ключам: на 429 переключиться на следующий и повторить запрос.
+
+        Возвращает ответ при успехе либо None (вызывающий уйдёт в фоллбэк). Переключение
+        ключа — ТОЛЬКО на исчерпании квоты (429 RESOURCE_EXHAUSTED). Прочие ошибки сменой
+        ключа не лечатся (гео-блок, битый ключ, прокси, таймаут, сеть) — на них сразу
+        диагноз и None, без перебора. Не больше len(self._keys) попыток (один проход,
+        без бесконечного цикла); индекс двигаем по модулю — стартуем с текущего ключа.
+        """
+        n = len(self._keys)
+        for attempt in range(n):
+            client = self._ensure_client()
+            if client is None:
+                # Фатальный сбой создания клиента (SDK/прокси) — сменой ключа не лечится.
+                return None
+            try:
+                return self._ask_gemini(client, text)
+            except Exception as exc:
+                self.last_error = classify_gemini_error(exc)
+                if not self._is_quota_error(exc):
+                    # Не лечится сменой ключа — внятный диагноз и фоллбэк.
+                    self.log.warning("Gemini недоступен: %s — ухожу в офлайн-фоллбэк",
+                                     self.last_error)
+                    self.log.debug("Трасса ошибки Gemini", exc_info=True)
+                    return None
+                current = self._key_index + 1  # 1-based для логов
+                if attempt + 1 < n:
+                    # Есть ещё непробованные ключи — переключаемся и повторяем.
+                    self._key_index = (self._key_index + 1) % n
+                    self._client = None  # пересоздать клиент под новый ключ
+                    self.log.warning("ключ Gemini #%d исчерпан (429), переключаюсь на #%d",
+                                     current, self._key_index + 1)
+                    continue
+                # Это была последняя попытка — все ключи дали 429.
+                self.log.warning("ключ Gemini #%d исчерпан (429); все %d ключей исчерпаны "
+                                 "— офлайн-фоллбэк", current, n)
+                return None
+        return None
+
+    @staticmethod
+    def _is_quota_error(exc: Exception) -> bool:
+        """True только для 429 RESOURCE_EXHAUSTED — единственной ошибки, которую лечит
+        смена ключа. Логика та же, что в classify_gemini_error, но явным предикатом.
+        Импорт ленивый и в try-except — предикат не должен падать сам."""
+        try:
+            from google.genai import errors as genai_errors
+
+            if isinstance(exc, genai_errors.APIError):
+                code = getattr(exc, "code", 0) or 0
+                status = (getattr(exc, "status", "") or "").upper()
+                return code == 429 or status == "RESOURCE_EXHAUSTED"
+        except Exception:
+            pass
+        return False
+
     def _ensure_client(self):
-        """Лениво создать genai.Client. None — если пакета/ключа нет (→ фоллбэк)."""
+        """Лениво создать genai.Client под текущий ключ. None — фатальный сбой SDK/прокси."""
         if self._client is not None or self._client_failed:
             return self._client
-        if not config.GEMINI_API_KEY:
-            self.log.warning("GEMINI_API_KEY не задан — casual работает в офлайн-режиме")
-            self._client_failed = True
-            return None
         try:
             from google import genai
             from google.genai import types
@@ -219,11 +276,12 @@ class CasualBackend:
                 http_opts["async_client_args"] = {"proxy": config.GEMINI_PROXY}
 
             self._client = genai.Client(
-                api_key=config.GEMINI_API_KEY,
+                api_key=self._keys[self._key_index],
                 http_options=types.HttpOptions(**http_opts),
             )
             self.log.info(
-                "Gemini-клиент готов: модель %s, grounding=%s, таймаут=%.1fс, %s",
+                "Gemini-клиент готов: ключ #%d из %d, модель %s, grounding=%s, таймаут=%.1fс, %s",
+                self._key_index + 1, len(self._keys),
                 config.GEMINI_MODEL, config.GEMINI_GROUNDING, config.GEMINI_TIMEOUT,
                 "через прокси" if config.GEMINI_PROXY else "напрямую",
             )

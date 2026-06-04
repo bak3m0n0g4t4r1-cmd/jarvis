@@ -268,17 +268,18 @@ def check_gemini() -> CheckResult:
             reason=f"пакет google-genai не импортируется ({exc}); беседа уйдёт в офлайн-фоллбэк.",
             fix="pip install -e .  (или JARVIS_CASUAL_BACKEND=local)",
         )
-    if not config.GEMINI_API_KEY:
+    if not config.GEMINI_API_KEYS:
         return CheckResult(
             WARN, "Gemini casual-бэкенд",
-            reason="GEMINI_API_KEY не задан — беседа будет уходить в офлайн-фоллбэк.",
-            fix="впишите ключ в .env (см. .env.example) или JARVIS_CASUAL_BACKEND=local",
+            reason="ключи Gemini не заданы — беседа будет уходить в офлайн-фоллбэк.",
+            fix="впишите GEMINI_API_KEY в .env (см. .env.example) или JARVIS_CASUAL_BACKEND=local",
         )
     grounding = "вкл" if config.GEMINI_GROUNDING else "выкл"
     proxy = ", через прокси" if config.GEMINI_PROXY else ""
     return CheckResult(
         OK,
-        f"Gemini casual-бэкенд: модель {config.GEMINI_MODEL}, grounding {grounding}{proxy}",
+        f"Gemini casual-бэкенд: модель {config.GEMINI_MODEL}, grounding {grounding}{proxy}, "
+        f"ключей: {len(config.GEMINI_API_KEYS)}",
     )
 
 
@@ -555,11 +556,11 @@ def check_gemini_live() -> CheckResult:
     """
     if config.CASUAL_BACKEND != "gemini":
         return CheckResult(OK, f"Gemini: живой тест пропущен (бэкенд {config.CASUAL_BACKEND})")
-    if not config.GEMINI_API_KEY:
+    if not config.GEMINI_API_KEYS:
         return CheckResult(
             WARN, "Gemini: живой ответ",
-            reason="GEMINI_API_KEY не задан — живой тест пропущен.",
-            fix="впишите ключ в .env (см. .env.example)",
+            reason="ключи Gemini не заданы — живой тест пропущен.",
+            fix="впишите GEMINI_API_KEY в .env (см. .env.example)",
         )
     try:
         import logging
@@ -585,7 +586,10 @@ def check_gemini_live() -> CheckResult:
                 "JARVIS_GEMINI_MODEL; см. logs/jarvis-core.log",
         )
     proxy = " (через прокси)" if config.GEMINI_PROXY else ""
-    return CheckResult(OK, f"Gemini: живой ответ получен{proxy}")
+    # На каком по счёту ключе прошёл запрос — видно, сработала ли ротация.
+    total = len(config.GEMINI_API_KEYS)
+    on_key = f", на ключе #{backend._key_index + 1} из {total}" if total > 1 else ""
+    return CheckResult(OK, f"Gemini: живой ответ получен{on_key}{proxy}")
 
 
 def live_chain_test() -> bool:
