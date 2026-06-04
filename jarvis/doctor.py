@@ -275,8 +275,10 @@ def check_gemini() -> CheckResult:
             fix="впишите ключ в .env (см. .env.example) или JARVIS_CASUAL_BACKEND=local",
         )
     grounding = "вкл" if config.GEMINI_GROUNDING else "выкл"
+    proxy = ", через прокси" if config.GEMINI_PROXY else ""
     return CheckResult(
-        OK, f"Gemini casual-бэкенд: модель {config.GEMINI_MODEL}, grounding {grounding}"
+        OK,
+        f"Gemini casual-бэкенд: модель {config.GEMINI_MODEL}, grounding {grounding}{proxy}",
     )
 
 
@@ -573,12 +575,17 @@ def check_gemini_live() -> CheckResult:
             fix="проверьте GEMINI_API_KEY, сеть и имя модели JARVIS_GEMINI_MODEL",
         )
     if answer in (casual._FALLBACK_FIRST, casual._FALLBACK_AGAIN):
+        # backend прогнан тем же путём, что casual (включая прокси), поэтому диагноз
+        # из last_error точный: гео-блок/квота/ключ/сеть, а не общая «облако недоступно».
+        diag = backend.last_error or "облако недоступно, неверный ключ или имя модели"
         return CheckResult(
             FAIL, "Gemini: живой ответ",
-            reason="вернулся офлайн-фоллбэк — облако недоступно, неверный ключ или имя модели.",
-            fix="проверьте GEMINI_API_KEY, сеть и JARVIS_GEMINI_MODEL; см. logs/jarvis-core.log",
+            reason=f"вернулся офлайн-фоллбэк: {diag}.",
+            fix="проверьте GEMINI_API_KEY, JARVIS_GEMINI_PROXY, сеть и "
+                "JARVIS_GEMINI_MODEL; см. logs/jarvis-core.log",
         )
-    return CheckResult(OK, "Gemini: живой ответ получен")
+    proxy = " (через прокси)" if config.GEMINI_PROXY else ""
+    return CheckResult(OK, f"Gemini: живой ответ получен{proxy}")
 
 
 def live_chain_test() -> bool:

@@ -101,6 +101,52 @@ _FALLBACK_FIRST = (
 _FALLBACK_AGAIN = "Всё ещё без связи, сэр."
 
 
+def classify_gemini_error(exc: Exception) -> str:
+    """Свести любую ошибку Gemini к короткому человекочитаемому диагнозу.
+
+    Раньше на любой сбой в логах и doctor была одна фраза «облако недоступно» —
+    это путало: гео-блок, исчерпанная квота, битый ключ и обрыв сети лечатся
+    по-разному. Здесь разбираем по коду/типу: ошибки API google-genai несут
+    .code/.status, сетевые сбои и таймауты приходят исключениями httpx.
+    Импорты ленивые и в try-except — классификатор не должен сам падать.
+    """
+    # 1) Ошибки самого API Gemini (есть HTTP-код и статус).
+    try:
+        from google.genai import errors as genai_errors
+
+        if isinstance(exc, genai_errors.APIError):
+            code = getattr(exc, "code", 0) or 0
+            status = (getattr(exc, "status", "") or "").upper()
+            message = (getattr(exc, "message", "") or "").lower()
+            if code == 400 and ("location" in message or status == "FAILED_PRECONDITION"):
+                return "регион не поддерживается (проверьте JARVIS_GEMINI_PROXY)"
+            if code == 429 or status == "RESOURCE_EXHAUSTED":
+                return "исчерпана квота ключа (429)"
+            if code in (401, 403):
+                return "неверный или недействительный API-ключ"
+            return f"ошибка API Gemini ({code} {status or '—'})"
+    except Exception:
+        pass
+
+    # 2) Сетевые сбои / прокси / таймаут — исключения httpx.
+    try:
+        import httpx
+
+        # ProxyError — отдельная ветка transport-ошибок; ConnectTimeout —
+        # подкласс TimeoutException, поэтому таймаут проверяем ДО ConnectError.
+        if isinstance(exc, httpx.ProxyError):
+            return "ошибка прокси (проверьте JARVIS_GEMINI_PROXY)"
+        if isinstance(exc, httpx.TimeoutException):
+            return "превышено время ожидания"
+        if isinstance(exc, (httpx.ConnectError, httpx.TransportError)):
+            return "нет связи с облаком (проверьте сеть/прокси)"
+    except Exception:
+        pass
+
+    # 3) Всё прочее — хотя бы тип и текст, чтобы не терять причину.
+    return f"непредвиденная ошибка ({type(exc).__name__}: {exc})"
+
+
 class CasualBackend:
     """Беседа через Gemini с памятью и grounding; офлайн-фоллбэк в характере.
 
@@ -117,6 +163,8 @@ class CasualBackend:
         self._client = None          # ленивое создание: нужен ключ и тяжёлый импорт
         self._client_failed = False  # не пересоздавать клиент на каждый запрос
         self._offline_streak = 0     # выбор текста фоллбэка (первый/повторный)
+        # Диагноз последнего сбоя (для doctor): None — последний запрос удался.
+        self.last_error: str | None = None
 
     # ------------------------------------------------------------------ #
     # Публичный API
@@ -131,10 +179,15 @@ class CasualBackend:
                 return self._fallback()
             try:
                 answer = self._ask_gemini(client, text)
-            except Exception:
-                self.log.exception("Gemini недоступен — ухожу в офлайн-фоллбэк")
+            except Exception as exc:
+                self.last_error = classify_gemini_error(exc)
+                # Внятный диагноз в лог + полная трасса отдельно (debug).
+                self.log.warning("Gemini недоступен: %s — ухожу в офлайн-фоллбэк",
+                                 self.last_error)
+                self.log.debug("Трасса ошибки Gemini", exc_info=True)
                 return self._fallback()
             # Успех: сбрасываем счётчик офлайна и пополняем память беседы.
+            self.last_error = None
             self._offline_streak = 0
             self._history.append({"role": "user", "text": text})
             self._history.append({"role": "model", "text": answer})
@@ -155,19 +208,30 @@ class CasualBackend:
             from google import genai
             from google.genai import types
 
+            # SDK ждёт таймаут в МИЛЛИСЕКУНДАХ (сверено на google-genai 2.7.0).
+            http_opts = {"timeout": int(config.GEMINI_TIMEOUT * 1000)}
+            if config.GEMINI_PROXY:
+                # Прокси ТОЛЬКО для этого клиента (обход геоблока). client_args идут
+                # прямиком в httpx.Client(**client_args); httpx принимает proxy=
+                # и для http://, и для socks5:// (сверено на google-genai 2.7.0).
+                # Системный/пентест-трафик через прокси НЕ идёт — только Gemini.
+                http_opts["client_args"] = {"proxy": config.GEMINI_PROXY}
+                http_opts["async_client_args"] = {"proxy": config.GEMINI_PROXY}
+
             self._client = genai.Client(
                 api_key=config.GEMINI_API_KEY,
-                # SDK ждёт таймаут в МИЛЛИСЕКУНДАХ (сверено на google-genai 2.7.0).
-                http_options=types.HttpOptions(
-                    timeout=int(config.GEMINI_TIMEOUT * 1000)
-                ),
+                http_options=types.HttpOptions(**http_opts),
             )
             self.log.info(
-                "Gemini-клиент готов: модель %s, grounding=%s, таймаут=%.1fс",
+                "Gemini-клиент готов: модель %s, grounding=%s, таймаут=%.1fс, %s",
                 config.GEMINI_MODEL, config.GEMINI_GROUNDING, config.GEMINI_TIMEOUT,
+                "через прокси" if config.GEMINI_PROXY else "напрямую",
             )
-        except Exception:
-            self.log.exception("Не удалось создать Gemini-клиент — офлайн-режим")
+        except Exception as exc:
+            self.last_error = classify_gemini_error(exc)
+            self.log.warning("Не удалось создать Gemini-клиент (%s) — офлайн-режим",
+                             self.last_error)
+            self.log.debug("Трасса создания Gemini-клиента", exc_info=True)
             self._client_failed = True
             self._client = None
         return self._client

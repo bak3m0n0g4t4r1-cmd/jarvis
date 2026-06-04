@@ -16,6 +16,8 @@ dependencies = [
     "ollama>=0.3.0",
     # --- Casual-бэкенд (Фаза 2): беседа через Gemini + ключ из .env ---
     "google-genai>=1.0",
+    # httpx тянет google-genai; extra [socks] нужен для прокси socks5:// (socksio).
+    "httpx[socks]>=0.25",
     "python-dotenv>=1.0",
     # --- engine-зависимости: версии СВЕРИТЬ на целевой машине ---
     "sherpa-onnx>=1.10",

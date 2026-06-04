@@ -10,6 +10,7 @@ numpy>=1.26
 sounddevice>=0.4.6
 ollama>=0.3.0
 google-genai>=1.0
+httpx[socks]>=0.25
 python-dotenv>=1.0
 sherpa-onnx>=1.10
 piper-tts>=1.2

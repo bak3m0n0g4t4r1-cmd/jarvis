@@ -99,6 +99,10 @@ GEMINI_GROUNDING = os.getenv("JARVIS_GEMINI_GROUNDING", "1").strip().lower() not
 GEMINI_TIMEOUT = float(os.getenv("JARVIS_GEMINI_TIMEOUT", "8"))
 # Сколько реплик беседы (сообщений user/assistant) помнить и слать в облако.
 GEMINI_HISTORY = int(os.getenv("JARVIS_GEMINI_HISTORY", "8"))
+# Прокси ТОЛЬКО для google-genai клиента (обход геоблока РФ). Пусто = напрямую.
+# Поддержка http://… и socks5://… (для socks нужен httpx[socks]).
+# КРИТИЧНО: затрагивает лишь Gemini; Ollama/MQTT/STT всегда идут напрямую.
+GEMINI_PROXY = os.getenv("JARVIS_GEMINI_PROXY", "").strip()
 
 # --- TTS: Piper ---
 PIPER_MODEL = os.getenv("JARVIS_PIPER_MODEL", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx"))
