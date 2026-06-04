@@ -283,6 +283,60 @@ def check_gemini() -> CheckResult:
     )
 
 
+def check_brain_tools() -> CheckResult:
+    """Инструменты Gemini-мозга собираются: команды commands.yaml + read-only (без сети).
+
+    Только сборка function declarations и валидность имён — живого вызова нет. При
+    бэкенде не-gemini инструменты не используются, но сборка всё равно валидна.
+    Опционально (google-genai/ключи) → WARN, не FAIL.
+    """
+    if config.CASUAL_BACKEND != "gemini":
+        return CheckResult(OK, f"Инструменты мозга: пропущено (бэкенд {config.CASUAL_BACKEND})")
+    try:
+        import yaml
+
+        with open(config.COMMANDS_FILE, encoding="utf-8") as f:
+            commands = yaml.safe_load(f) or {}
+    except Exception as exc:
+        return CheckResult(
+            WARN, "Инструменты мозга (function calling)",
+            reason=f"не удалось прочитать {config.COMMANDS_FILE}: {exc}.",
+            fix="проверьте синтаксис commands.yaml",
+        )
+    try:
+        import re
+
+        from jarvis import brain
+
+        tools = brain.build_function_tools(commands)
+        decls = (tools[0].function_declarations if tools else []) or []
+        names = [d.name for d in decls]
+        if not names:
+            return CheckResult(
+                WARN, "Инструменты мозга (function calling)",
+                reason="не собрано ни одной функции (пустая карта команд?).",
+                fix="добавьте команды в commands.yaml",
+            )
+        bad = [n for n in names if not n or not re.fullmatch(r"[A-Za-z0-9_]+", n)]
+        if bad:
+            return CheckResult(
+                WARN, "Инструменты мозга (function calling)",
+                reason=f"имена функций невалидны для Gemini: {bad}.",
+                fix="теги commands.yaml — латиница/цифры/подчёркивание (как имена функций)",
+            )
+        return CheckResult(
+            OK,
+            f"Инструменты мозга: {len(commands)} команд + {len(brain.READONLY_TOOLS)} "
+            f"состояния (function calling)",
+        )
+    except Exception as exc:
+        return CheckResult(
+            WARN, "Инструменты мозга (function calling)",
+            reason=f"сборка инструментов упала: {exc}.",
+            fix="pip install -e .  (нужен google-genai) или JARVIS_CASUAL_BACKEND=local",
+        )
+
+
 def check_audio() -> list[CheckResult]:
     """PipeWire живой: есть устройство вывода И устройство ввода (микрофон)."""
     try:
@@ -592,6 +646,63 @@ def check_gemini_live() -> CheckResult:
     return CheckResult(OK, f"Gemini: живой ответ получен{on_key}{proxy}")
 
 
+def check_brain_live() -> CheckResult:
+    """Живой прогон function calling (--deep): Gemini вызывает read-only функцию.
+
+    Вопрос про загрузку системы минует локальный перехват времени/заряда и должен
+    спровоцировать вызов get_system_load. Успех — был хотя бы один вызов инструмента и
+    ответ не офлайн-фоллбэк. Облако опционально → WARN при недоступности, не FAIL.
+    Команды управления в тесте не исполняются: execute-колбэк лишь копит теги.
+    """
+    if config.CASUAL_BACKEND != "gemini":
+        return CheckResult(OK, f"Мозг: тест function calling пропущен (бэкенд {config.CASUAL_BACKEND})")
+    if not config.GEMINI_API_KEYS:
+        return CheckResult(
+            WARN, "Мозг: function calling",
+            reason="ключи Gemini не заданы — живой тест пропущен.",
+            fix="впишите GEMINI_API_KEY в .env (см. .env.example)",
+        )
+    try:
+        import logging
+
+        import yaml
+
+        from jarvis import brain, casual
+
+        with open(config.COMMANDS_FILE, encoding="utf-8") as f:
+            commands = yaml.safe_load(f) or {}
+        executed: list[str] = []
+        backend = brain.Brain(
+            logging.getLogger("jarvis-doctor-brain"),
+            lambda tag: executed.append(tag),  # в тесте команды не исполняем
+            commands,
+        )
+        answer = backend.think("Какая сейчас загрузка системы?")
+    except Exception as exc:
+        return CheckResult(
+            WARN, "Мозг: function calling",
+            reason=f"прогон упал: {exc}.",
+            fix="проверьте google-genai, GEMINI_API_KEY и сеть",
+        )
+    if answer in (casual._FALLBACK_FIRST, casual._FALLBACK_AGAIN):
+        diag = backend.last_error or "облако недоступно"
+        return CheckResult(
+            WARN, "Мозг: function calling",
+            reason=f"вернулся офлайн-фоллбэк: {diag}.",
+            fix="проверьте GEMINI_API_KEY, JARVIS_GEMINI_PROXY, сеть; logs/jarvis-core.log",
+        )
+    if not backend.last_tool_calls:
+        return CheckResult(
+            WARN, "Мозг: function calling",
+            reason="ответ получен, но Gemini не вызвал ни одной функции.",
+            fix="сверьте описания инструментов; возможно, модель ответила без вызова",
+        )
+    proxy = " (через прокси)" if config.GEMINI_PROXY else ""
+    return CheckResult(
+        OK, f"Мозг: function calling работает — вызвано {backend.last_tool_calls}{proxy}"
+    )
+
+
 def live_chain_test() -> bool:
     """Сквозной тест живой шины (для `jarvis test` и Слоя 5 --deep).
 
@@ -690,6 +801,7 @@ def run(deep: bool = False) -> bool:
     reporter.report(check_mosquitto())
     reporter.report(check_ollama())
     reporter.report(check_gemini())
+    reporter.report(check_brain_tools())
     for r in check_audio():
         reporter.report(r)
 
@@ -715,6 +827,8 @@ def run(deep: bool = False) -> bool:
         reporter.report(check_piper_synthesis())
         reporter.note("живой запрос к Gemini (casual-бэкенд)…")
         reporter.report(check_gemini_live())
+        reporter.note("живой function-calling прогон мозга…")
+        reporter.report(check_brain_live())
 
     ok = reporter.summary()
 

@@ -16,8 +16,8 @@ import ollama
 import yaml
 
 from jarvis import config, contracts
+from jarvis.brain import Brain, read_battery
 from jarvis.bus import JarvisModule
-from jarvis.casual import CasualBackend
 
 # Ключевые слова локальных инструментов (срабатывают на явный вопрос в беседе).
 _TIME_KEYS = (
@@ -27,18 +27,26 @@ _TIME_KEYS = (
 _BATTERY_KEYS = ("батаре", "аккумулят", "заряд", "сколько процент")
 
 
-def _build_system_prompt() -> str:
-    """Собирает системный промпт с актуальным списком команд из commands.yaml.
+def _load_commands() -> dict:
+    """Карта команд из commands.yaml (теги → спецификации). При сбое — пустой dict.
 
-    Теги загружаются динамически, чтобы Мозг видел только реально существующие
-    команды — никаких выдуманных тегов модель не сгенерирует, потому что
-    неоткуда их взять.
+    Один источник для системного промпта диспетчера И для инструментов Gemini-мозга,
+    чтобы и привратник, и облако видели ровно существующие теги — без выдуманных.
     """
     try:
         with open(config.COMMANDS_FILE, encoding="utf-8") as f:
-            commands = yaml.safe_load(f) or {}
+            return yaml.safe_load(f) or {}
     except Exception:
-        commands = {}
+        return {}
+
+
+def _build_system_prompt(commands: dict) -> str:
+    """Собирает системный промпт с актуальным списком команд из commands.yaml.
+
+    Теги передаются готовой картой, чтобы Мозг видел только реально существующие
+    команды — никаких выдуманных тегов модель не сгенерирует, потому что
+    неоткуда их взять.
+    """
     tags = sorted(commands.keys())  # алфавитный порядок для стабильности промпта
     tag_list = ", ".join(tags) if tags else "(нет доступных команд)"
 
@@ -76,9 +84,13 @@ class CoreModule(JarvisModule):
         # История команд (структурно) — последние 3, на будущее для commands.yaml-фич.
         self._cmd_history: deque = deque(maxlen=3)
         self._client = ollama.Client(host=config.OLLAMA_HOST)
-        self._casual = CasualBackend(self.log)  # беседу ведёт Gemini (или фоллбэк)
+        # Карта команд — общий источник для промпта диспетчера и инструментов мозга.
+        commands = _load_commands()
+        # Мозг-агент: беседу и сложные/составные запросы ведёт Gemini с function calling
+        # (или офлайн-фоллбэк). Команды управления он выполняет через jarvis/execute.
+        self._brain = Brain(self.log, self._execute_command, commands)
         self._lock = threading.Lock()
-        self._system_prompt = _build_system_prompt()
+        self._system_prompt = _build_system_prompt(commands)
 
     def on_start(self):
         self.subscribe(contracts.TOPIC_INPUT, self.on_input)
@@ -136,11 +148,7 @@ class CoreModule(JarvisModule):
             # Подтверждение генерит локальная модель; подстраховка — на случай пустого.
             speech = result.speech_response.strip() or "Сделано, сэр."
             self.say(speech)
-            self.publish_json(
-                contracts.TOPIC_EXECUTE,
-                {"command_tag": result.payload},
-                qos=contracts.QOS_EXECUTE,
-            )
+            self._execute_command(result.payload)
             self._cmd_history.append({
                 "intent": result.intent,
                 "tag": result.payload,
@@ -149,14 +157,27 @@ class CoreModule(JarvisModule):
             return speech
 
         # casual_talk (и os_command без валидного тега тоже трактуем как беседу).
-        # Сначала локальные инструменты (офлайн), иначе — облачный casual-бэкенд.
+        # Сначала быстрые локальные инструменты (время/заряд — мгновенно, офлайн),
+        # иначе — Gemini-мозг с function calling (сложное/составное/беседа/состояние).
         local = self._local_tool_answer(text)
         if local is not None:
             self.say(local)
             return local
-        answer = self._casual.reply(text)
+        answer = self._brain.think(text)
         self.say(answer)
         return answer
+
+    def _execute_command(self, tag: str) -> None:
+        """Опубликовать команду на выполнение «Руками» (OS-агент) через jarvis/execute.
+
+        Единая точка запуска команд: и привратник (os_command), и Gemini-мозг
+        (function calling) идут сюда, а не дёргают shell. Само исполнение — у OS-агента.
+        """
+        self.publish_json(
+            contracts.TOPIC_EXECUTE,
+            {"command_tag": tag},
+            qos=contracts.QOS_EXECUTE,
+        )
 
     def _local_tool_answer(self, text: str) -> str | None:
         """Локальные инструменты (офлайн, без Gemini): время и заряд батареи.
@@ -171,28 +192,18 @@ class CoreModule(JarvisModule):
         return None
 
     def _battery_answer(self) -> str:
-        """Реальный заряд из /sys/class/power_supply/BAT* — в характере Джарвиса."""
-        import glob
-
-        paths = sorted(glob.glob("/sys/class/power_supply/BAT*"))
-        if not paths:
+        """Реальный заряд в характере Джарвиса (read-only-функция из brain — без дублей)."""
+        data = read_battery()
+        if data.get("батарея") == "не обнаружена":
             return "Батарея не обнаружена, сэр."
-        bat = paths[0]
-        try:
-            with open(f"{bat}/capacity", encoding="utf-8") as f:
-                capacity = int(f.read().strip())
-        except Exception:
-            self.log.exception("Не удалось снять показания батареи")
+        if "ошибка" in data:
+            self.log.warning("Не удалось снять показания батареи: %s", data["ошибка"])
             return "Не удалось снять показания батареи, сэр."
-        status = ""
-        try:
-            with open(f"{bat}/status", encoding="utf-8") as f:
-                status = f.read().strip()
-        except Exception:
-            pass
-        if status == "Charging":
+        capacity = data.get("процент")
+        status = data.get("статус", "")
+        if status == "заряжается":
             return f"Батарея на {capacity} процентах, заряжается, сэр."
-        if status == "Full" or capacity >= 99:
+        if status == "заряжена полностью" or (isinstance(capacity, int) and capacity >= 99):
             return "Батарея заряжена полностью, сэр."
         return f"Батарея на {capacity} процентах, сэр."
 

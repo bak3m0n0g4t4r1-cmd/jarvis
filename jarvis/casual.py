@@ -294,11 +294,14 @@ class CasualBackend:
             self._client = None
         return self._client
 
-    def _ask_gemini(self, client, text: str) -> str:
-        """Один запрос к Gemini: память + текущая реплика, характер, grounding."""
+    def _history_contents(self, text: str) -> list:
+        """Собрать contents для Gemini: память беседы + текущая реплика пользователя.
+
+        Вынесено отдельно, чтобы наследник (brain.Brain) переиспользовал ту же память
+        беседы и достраивал к ней function_call/function_response в цикле инструментов.
+        """
         from google.genai import types
 
-        # contents = история беседы (роли user/model) + текущая реплика пользователя.
         contents = []
         for msg in self._history:
             part = types.Part.from_text(text=msg["text"])
@@ -307,6 +310,14 @@ class CasualBackend:
         contents.append(
             types.Content(role="user", parts=[types.Part.from_text(text=text)])
         )
+        return contents
+
+    def _ask_gemini(self, client, text: str) -> str:
+        """Один запрос к Gemini: память + текущая реплика, характер, grounding."""
+        from google.genai import types
+
+        # contents = история беседы (роли user/model) + текущая реплика пользователя.
+        contents = self._history_contents(text)
 
         tools = None
         if config.GEMINI_GROUNDING:

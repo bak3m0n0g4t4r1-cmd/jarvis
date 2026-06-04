@@ -146,6 +146,11 @@ GEMINI_HISTORY = int(os.getenv("JARVIS_GEMINI_HISTORY", "8"))
 # КРИТИЧНО: затрагивает лишь Gemini; Ollama/MQTT/STT всегда идут напрямую.
 GEMINI_PROXY = os.getenv("JARVIS_GEMINI_PROXY", "").strip()
 
+# --- Мозг с function calling (brain.py) ---
+# Максимум итераций цикла «вызов функции → результат → продолжение» на один запрос.
+# Защита от зацикливания: составная задача = несколько вызовов подряд, но не бесконечно.
+BRAIN_MAX_STEPS = int(os.getenv("JARVIS_BRAIN_MAX_STEPS", "5"))
+
 # --- TTS: Piper ---
 PIPER_MODEL = os.getenv("JARVIS_PIPER_MODEL", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx"))
 PIPER_CONFIG = os.getenv(
