@@ -34,6 +34,12 @@ LOGS_DIR = Path(os.getenv("JARVIS_LOGS_DIR", str(BASE_DIR / "logs")))
 MQTT_HOST = os.getenv("JARVIS_MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("JARVIS_MQTT_PORT", "1883"))
 MQTT_KEEPALIVE = int(os.getenv("JARVIS_MQTT_KEEPALIVE", "60"))
+# Автопереподключение (экспоненциальный backoff между попытками, секунды).
+# Брокер локальный и поднимается быстро; на этой машине разрывы — это перезапуск
+# mosquitto и спящий режим (диагностировано по journalctl). Поэтому потолок мал (15с),
+# иначе после suspend Джарвис «глохнет» до ~2 мин, пока backoff дорастёт до старого max=60.
+MQTT_RECONNECT_MIN = float(os.getenv("JARVIS_MQTT_RECONNECT_MIN", "1"))
+MQTT_RECONNECT_MAX = float(os.getenv("JARVIS_MQTT_RECONNECT_MAX", "15"))
 
 # --- Аудио (захват/воспроизведение) ---
 SAMPLE_RATE = int(os.getenv("JARVIS_SAMPLE_RATE", "16000"))
@@ -90,6 +96,11 @@ OLLAMA_HOST = os.getenv("JARVIS_OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("JARVIS_OLLAMA_MODEL", "qwen2.5:1.5b-instruct")
 OLLAMA_KEEP_ALIVE = os.getenv("JARVIS_OLLAMA_KEEP_ALIVE", "10m")
 HISTORY_SIZE = int(os.getenv("JARVIS_HISTORY_SIZE", "5"))  # пар user/assistant
+# Отказоустойчивость локальной модели: сколько ВСЕГО попыток запроса (1 = без ретрая)
+# и базовая пауза между ними (секунды, удваивается). При исчерпании — деградация в
+# характере, без падения сервиса. Ollama на N100 может «подвиснуть» на загрузке модели.
+OLLAMA_RETRIES = int(os.getenv("JARVIS_OLLAMA_RETRIES", "2"))
+OLLAMA_RETRY_DELAY = float(os.getenv("JARVIS_OLLAMA_RETRY_DELAY", "1.0"))
 
 # --- Casual-бэкенд: беседу ведёт облачный Gemini, команды — локальная модель ---
 # Бэкенд бесед: gemini | local. local — только офлайн-фоллбэк, без обращения к облаку.
@@ -163,3 +174,11 @@ COMMANDS_FILE = os.getenv("JARVIS_COMMANDS_FILE", str(BASE_DIR / "commands.yaml"
 # --- Логирование ---
 LOG_MAX_BYTES = int(os.getenv("JARVIS_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
 LOG_BACKUP_COUNT = int(os.getenv("JARVIS_LOG_BACKUP_COUNT", "3"))
+# Порог логирования. По умолчанию INFO: человеческие строки видны, лог чистый. Поставь
+# DEBUG, чтобы увидеть стек-трассы ожидаемых сбоёв (их пишем на DEBUG, чтобы не засорять).
+LOG_LEVEL = os.getenv("JARVIS_LOG_LEVEL", "INFO").strip().upper()
+
+# --- Heartbeat (видимость «сервис жив») ---
+# Раз в столько секунд каждый сервис пишет в лог, что он жив (INFO). 0 — выключить.
+# По логам видно, что сервис работает, а не висит молча. На шину ничего не публикуем.
+HEARTBEAT_INTERVAL = float(os.getenv("JARVIS_HEARTBEAT_INTERVAL", "300"))

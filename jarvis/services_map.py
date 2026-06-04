@@ -17,12 +17,14 @@ class ServiceDef:
     module: str       # путь модуля для импорта: jarvis.services.stt
     cls: str          # имя класса-наследника JarvisModule: SttModule
     description: str  # человеческое описание
+    needs_audio: bool = False  # нужен ли пользовательский PipeWire (STT/TTS) для зависимостей юнита
 
 
 SERVICES = [
     ServiceDef(
         "stt", "jarvis-stt.service", "jarvis-stt",
         "jarvis.services.stt", "SttModule", "«Уши» — STT и wake-word",
+        needs_audio=True,
     ),
     ServiceDef(
         "core", "jarvis-core.service", "jarvis-core",
@@ -35,5 +37,6 @@ SERVICES = [
     ServiceDef(
         "tts", "jarvis-tts.service", "jarvis-tts",
         "jarvis.services.tts", "TtsModule", "«Голос» — Piper TTS",
+        needs_audio=True,
     ),
 ]

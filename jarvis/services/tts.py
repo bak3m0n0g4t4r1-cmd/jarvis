@@ -4,6 +4,7 @@
 (worker-поток), чтобы реплики не накладывались. На время воспроизведения
 публикует state=speaking.
 """
+import logging
 import queue
 import threading
 
@@ -12,6 +13,11 @@ import sounddevice as sd
 
 from jarvis import config, contracts
 from jarvis.bus import JarvisModule
+
+# Сколько фраз подряд должны не озвучиться, чтобы признать сбой стойким и крикнуть в
+# лог CRITICAL (синтез/вывод звука недоступен). Воркер при этом продолжает пытаться —
+# когда устройство вернётся, озвучка восстановится сама (без рестарта сервиса).
+_TTS_FAILS_CRITICAL = 3
 
 
 class TtsModule(JarvisModule):
@@ -39,7 +45,8 @@ class TtsModule(JarvisModule):
             )
             self.log.info("Голос Piper загружен: %s", config.PIPER_MODEL)
         except Exception:
-            self.log.exception("Не удалось загрузить голос Piper")
+            self.log_exc(logging.ERROR,
+                         "Не удалось загрузить голос Piper — озвучка будет недоступна")
             self._voice = None
 
     def on_say(self, payload: dict):
@@ -48,24 +55,56 @@ class TtsModule(JarvisModule):
             self._queue.put(text)
 
     def _run_worker(self):
+        """Очередь озвучки: фразы по одной (не наложатся). Воркер НЕ должен умереть от
+        единичного сбоя — иначе Джарвис онемеет молча. Любое исключение тела цикла
+        ловим и продолжаем. Стойкий сбой (3+ фразы подряд) — CRITICAL в лог, но
+        продолжаем пытаться: вернётся устройство — озвучка восстановится сама.
+        """
+        fails = 0
+        announced_critical = False
         while not self._stop_event.is_set():
             try:
-                text = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            self._speak(text)
+                try:
+                    text = self._queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if self._speak(text):
+                    if announced_critical:
+                        self.log.info("Озвучка восстановлена — звук снова работает")
+                    fails = 0
+                    announced_critical = False
+                else:
+                    fails += 1
+                    if fails >= _TTS_FAILS_CRITICAL and not announced_critical:
+                        self.log.critical(
+                            "Озвучка не работает уже %d фраз подряд (синтез или вывод "
+                            "звука) — продолжаю пытаться, но голос сейчас недоступен", fails,
+                        )
+                        announced_critical = True
+            except Exception:
+                self.log_exc(logging.WARNING, "Сбой в цикле озвучки — продолжаю работу")
 
-    def _speak(self, text: str):
+    def _speak(self, text: str) -> bool:
+        """Озвучить фразу. True — успех; False — пропустили (нет голоса/сбой синтеза/вывода).
+
+        Один плохой кусок не валит сервис: ошибку ловим, логируем по-человечески и
+        возвращаем False (воркер сам решит, стойкий ли это сбой). «Один speaking на
+        ответ» сохранён: speaking на входе, idle в finally.
+        """
         if self._voice is None:
-            self.log.error("Голос не загружен, пропускаю фразу: %s", text)
-            return
+            self.log.warning("Голос Piper не загружен — не могу озвучить фразу: %r", text[:60])
+            return False
         try:
             self.set_state(contracts.STATE_SPEAKING)
             samples, sample_rate = self._synthesize(text)
             sd.play(samples, samplerate=sample_rate)
             sd.wait()
+            return True
         except Exception:
-            self.log.exception("Ошибка синтеза/воспроизведения")
+            self.log_exc(logging.WARNING,
+                         "Не удалось синтезировать/воспроизвести фразу — пропускаю: %r",
+                         text[:60])
+            return False
         finally:
             self.set_state(contracts.STATE_IDLE)
 
@@ -78,12 +117,12 @@ class TtsModule(JarvisModule):
         try:
             sd.stop()  # прерываем текущее воспроизведение (разблокирует sd.wait)
         except Exception:
-            self.log.exception("Ошибка остановки воспроизведения")
+            self.log_exc(logging.ERROR, "Ошибка остановки воспроизведения")
         try:
             if self._worker is not None:
                 self._worker.join(timeout=2.0)
         except Exception:
-            self.log.exception("Ошибка ожидания воспроизводящего потока")
+            self.log_exc(logging.ERROR, "Ошибка ожидания воспроизводящего потока")
 
     def _synthesize(self, text: str):
         """Синтез фразы -> (numpy int16, sample_rate).

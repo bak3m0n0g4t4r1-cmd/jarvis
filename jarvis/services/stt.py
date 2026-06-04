@@ -7,6 +7,7 @@ wake-word «джарвис», остаток публикуется в jarvis/in
 Детекция wake-word вынесена в _match_wake_word() — заменяема на openWakeWord.
 """
 import difflib
+import logging
 import re
 import threading
 import time
@@ -16,6 +17,13 @@ import sounddevice as sd
 
 from jarvis import config, contracts
 from jarvis.bus import JarvisModule
+
+# Самовосстановление аудио-входа: сколько раз подряд пытаться переоткрыть микрофон,
+# прежде чем признать сбой фатальным и сигналить systemd о рестарте. Между попытками —
+# линейный backoff (база × номер попытки, но не выше потолка).
+_AUDIO_MAX_RETRIES = 5
+_AUDIO_RETRY_BASE = 1.0   # секунды
+_AUDIO_RETRY_MAX = 10.0   # секунды
 
 
 class SttModule(JarvisModule):
@@ -75,45 +83,92 @@ class SttModule(JarvisModule):
             self._recognizer = None
 
     def _listen_loop(self):
+        """Внешний цикл захвата с САМОВОССТАНОВЛЕНИЕМ микрофона.
+
+        Если устройство ввода пропало/дало ошибку (sounddevice) — не молчим и не умираем:
+        закрываем поток, ждём (backoff) и переоткрываем. После _AUDIO_MAX_RETRIES неудач
+        подряд признаём сбой фатальным и сигналим systemd о рестарте (request_restart),
+        а не оставляем STT тихо оглохшим.
+        """
         if self._vad is None or self._recognizer is None:
-            self.log.error("STT не инициализирован, прослушивание невозможно")
+            self.request_restart("модели STT не инициализированы — слушать нечем")
             return
         window = int(0.1 * config.SAMPLE_RATE)  # блоки по 100 мс
-        try:
-            # Поток держим как атрибут, чтобы on_stop() закрыл его штатно
-            # (контекст-менеджер не использует, чтобы избежать гонки при shutdown).
-            self._stream = sd.InputStream(
-                channels=config.CHANNELS,
-                samplerate=config.SAMPLE_RATE,
-                dtype="float32",
-            )
-            self._stream.start()
-            self.set_state(contracts.STATE_LISTENING)
-            self.log.info("Слушаю микрофон...")
-            while not self._stop_event.is_set():
-                # Вход читаем всегда (чтобы не переполнить буфер устройства),
-                # но пока Джарвис говорит/идёт хвост — VAD не кормим, иначе
-                # словим эхо из колонок и зациклимся.
-                data, _ = self._stream.read(window)
-                if self._is_muted():
-                    # Помечаем, что при возобновлении нужен чистый сброс — чтобы
-                    # частичный сегмент, накопленный на границе, не склеился
-                    # со следующей фразой пользователя.
-                    self._need_vad_reset = True
-                    continue
-                # Возобновились — сбрасываем VAD ОДИН раз на границе muted→активен.
-                if self._need_vad_reset:
-                    self._vad.reset()
-                    self._need_vad_reset = False
-                    self.log.debug("VAD сброшен при возобновлении слушания")
-                samples = np.asarray(data, dtype=np.float32).reshape(-1)
-                self._vad.accept_waveform(samples)
-                while not self._vad.empty():
-                    segment = np.asarray(self._vad.front.samples, dtype=np.float32)
-                    self._vad.pop()
-                    self._transcribe(segment)
-        except Exception:
-            self.log.exception("Сбой аудио-потока")
+        fails = 0
+        while not self._stop_event.is_set():
+            try:
+                self._open_input_stream()
+                fails = 0  # успешное открытие сбрасывает счётчик неудач
+                self.set_state(contracts.STATE_LISTENING)
+                self.log.info("Слушаю микрофон...")
+                self._capture_until_stop(window)
+                return  # вышли штатно по stop_event — поток закроет on_stop()
+            except Exception:
+                fails += 1
+                self._close_input_stream()
+                if fails >= _AUDIO_MAX_RETRIES:
+                    self.request_restart(
+                        f"аудио-вход недоступен после {fails} попыток переоткрыть микрофон"
+                    )
+                    return
+                delay = min(_AUDIO_RETRY_BASE * fails, _AUDIO_RETRY_MAX)
+                self.log_exc(
+                    logging.WARNING,
+                    "Аудио-вход отвалился (попытка %d из %d) — переоткрою поток через %.1fс",
+                    fails, _AUDIO_MAX_RETRIES, delay,
+                )
+                if self._stop_event.wait(delay):
+                    return
+
+    def _open_input_stream(self):
+        """Открыть поток ввода. Держим как атрибут, чтобы on_stop() закрыл его штатно
+        (контекст-менеджер не используем, чтобы избежать гонки при shutdown)."""
+        self._stream = sd.InputStream(
+            channels=config.CHANNELS,
+            samplerate=config.SAMPLE_RATE,
+            dtype="float32",
+        )
+        self._stream.start()
+
+    def _close_input_stream(self):
+        """Тихо закрыть поток ввода перед переоткрытием (ошибки закрытия — на DEBUG)."""
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                self.log.debug("Ошибка закрытия аудио-потока при переоткрытии", exc_info=True)
+            finally:
+                self._stream = None
+
+    def _capture_until_stop(self, window: int):
+        """Чтение микрофона и подача в VAD/распознаватель — до сигнала остановки.
+
+        ВНИМАНИЕ: логика VAD/анти-эхо ниже не меняется (пороги закреплены в CLAUDE.md).
+        Исключения устройства пробрасываются наружу — их ловит _listen_loop и переоткрывает.
+        """
+        while not self._stop_event.is_set():
+            # Вход читаем всегда (чтобы не переполнить буфер устройства),
+            # но пока Джарвис говорит/идёт хвост — VAD не кормим, иначе
+            # словим эхо из колонок и зациклимся.
+            data, _ = self._stream.read(window)
+            if self._is_muted():
+                # Помечаем, что при возобновлении нужен чистый сброс — чтобы
+                # частичный сегмент, накопленный на границе, не склеился
+                # со следующей фразой пользователя.
+                self._need_vad_reset = True
+                continue
+            # Возобновились — сбрасываем VAD ОДИН раз на границе muted→активен.
+            if self._need_vad_reset:
+                self._vad.reset()
+                self._need_vad_reset = False
+                self.log.debug("VAD сброшен при возобновлении слушания")
+            samples = np.asarray(data, dtype=np.float32).reshape(-1)
+            self._vad.accept_waveform(samples)
+            while not self._vad.empty():
+                segment = np.asarray(self._vad.front.samples, dtype=np.float32)
+                self._vad.pop()
+                self._transcribe(segment)
 
     def _is_muted(self) -> bool:
         """True, пока Джарвис говорит или ещё не истёк «хвост» после речи."""
@@ -157,12 +212,21 @@ class SttModule(JarvisModule):
             # входа. Ловим отдельно, чтобы единичный сбой не сломал конвейер.
             try:
                 self._recognizer.decode_stream(stream)
-            except RuntimeError:
-                self.log.exception("Сбой декодирования (некорректный сегмент)")
+            except RuntimeError as exc:
+                # zipformer не переваривает короткий/вырожденный сегмент (ошибка Reshape) —
+                # это ЧАСТЫЙ ОЖИДАЕМЫЙ случай (тишина, шум, обрывок речи), а не сбой сервиса.
+                # Пропускаем фрагмент тихо: причина — на DEBUG, без стек-трасс в обычном
+                # логе (иначе сотни трасс на ровном месте, как было раньше).
+                self.log.debug(
+                    "Фрагмент пропущен: модель отвергла короткий/искажённый сегмент (%s)",
+                    exc.__class__.__name__,
+                )
                 return
             text = stream.result.text.strip()
         except Exception:
-            self.log.exception("Ошибка распознавания")
+            # Непредвиденный сбой на одном фрагменте — не валим конвейер, слушаем дальше.
+            self.log_exc(logging.WARNING,
+                         "Не удалось распознать фрагмент — пропускаю, продолжаю слушать")
             return
         if not text:
             return
@@ -243,14 +307,14 @@ class SttModule(JarvisModule):
             if self._audio_thread is not None:
                 self._audio_thread.join(timeout=2.0)
         except Exception:
-            self.log.exception("Ошибка ожидания аудио-потока ввода")
+            self.log_exc(logging.ERROR, "Ошибка ожидания аудио-потока ввода")
         try:
             if self._stream is not None:
                 self._stream.stop()
                 self._stream.close()
                 self.log.info("Аудио-поток ввода закрыт")
         except Exception:
-            self.log.exception("Ошибка закрытия аудио-потока ввода")
+            self.log_exc(logging.ERROR, "Ошибка закрытия аудио-потока ввода")
 
 
 def main():

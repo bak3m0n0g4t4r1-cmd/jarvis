@@ -46,10 +46,21 @@ def _render_unit(svc, bin_dir: Path) -> str:
     env_line = ""
     if svc.key == "core":
         env_line = f"EnvironmentFile=-{config.BASE_DIR / '.env'}\n"
+    # Аудио-сервисам (STT/TTS) нужен пользовательский PipeWire: без этой зависимости
+    # они стартуют до сессии звука, падают на устройстве и крутятся на рестартах.
+    if svc.needs_audio:
+        deps = "Wants=pipewire.service\nAfter=pipewire.service network.target\n"
+    else:
+        deps = "After=network.target\n"
     return (
         "[Unit]\n"
         f"Description=Джарвис — {svc.description}\n"
-        "After=network.target\n\n"
+        f"{deps}"
+        # Крэш-бурст переживаем и поднимаемся заново; но жёсткий цикл падений
+        # ограничиваем окном, чтобы он был ВИДЕН (а не маскировался бесконечными
+        # рестартами) — doctor отдельно WARN'ит при NRestarts≥5.
+        "StartLimitIntervalSec=300\n"
+        "StartLimitBurst=10\n\n"
         "[Service]\n"
         "Type=simple\n"
         f"{env_line}"

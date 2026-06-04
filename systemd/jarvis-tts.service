@@ -3,6 +3,9 @@ Description=Джарвис — «Голос» (TTS: Piper)
 # Аудио-сервис: нужен пользовательский PipeWire
 Wants=pipewire.service
 After=pipewire.service network.target
+# Переживаем крэш-бурст, но жёсткий цикл падений ограничиваем (виден, не маскируется).
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
