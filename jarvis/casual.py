@@ -17,7 +17,9 @@ google-genai (модель по умолчанию gemini-3.5-flash) с groundin
 """
 import logging
 import threading
+import time
 from collections import deque
+from typing import NamedTuple
 
 from jarvis import config
 
@@ -101,14 +103,33 @@ _FALLBACK_FIRST = (
 _FALLBACK_AGAIN = "Всё ещё без связи, сэр."
 
 
-def classify_gemini_error(exc: Exception) -> str:
-    """Свести любую ошибку Gemini к короткому человекочитаемому диагнозу.
+class GeminiDiag(NamedTuple):
+    """Разобранный диагноз сбоя Gemini: что писать человеку и как лечить.
 
-    Раньше на любой сбой в логах и doctor была одна фраза «облако недоступно» —
-    это путало: гео-блок, исчерпанная квота, битый ключ и обрыв сети лечатся
-    по-разному. Здесь разбираем по коду/типу: ошибки API google-genai несут
-    .code/.status, сетевые сбои и таймауты приходят исключениями httpx.
-    Импорты ленивые и в try-except — классификатор не должен сам падать.
+    text       — короткая человекочитаемая причина (в лог и для doctor);
+    retryable  — лечится ПОВТОРОМ того же запроса (503/504/500/таймаут/обрыв);
+    is_quota   — это 429: лечится не повтором, а ПЕРЕКЛЮЧЕНИЕМ ключа.
+    Взаимоисключающи по смыслу: 429 не retryable (там смена ключа), а retryable
+    не quota (там повтор тем же ключом).
+    """
+
+    text: str
+    retryable: bool
+    is_quota: bool
+
+
+def classify_gemini(exc: Exception) -> GeminiDiag:
+    """Разобрать ЛЮБУЮ ошибку Gemini в точный диагноз + стратегию (повтор/смена ключа).
+
+    Раньше на любой сбой в логах и doctor была одна фраза «облако недоступно» — это
+    путало: гео-блок, исчерпанная квота, временная перегрузка (503), таймаут (504),
+    битый ключ и обрыв сети лечатся ПО-РАЗНОМУ. КРИТИЧНО: 503/504/500 — это ВРЕМЕННЫЕ
+    сбои на стороне Google (проходят повтором), а НЕ исчерпание квоты — нельзя вешать
+    на них «429». Разбираем по коду/статусу: ошибки API google-genai несут .code/.status
+    (сверено на 2.7.0: ServerError/ClientError — подклассы APIError, .status — строка
+    вроде UNAVAILABLE/DEADLINE_EXCEEDED/RESOURCE_EXHAUSTED). Сетевые сбои и таймауты
+    приходят исключениями httpx. Импорты ленивые и в try-except — сам классификатор
+    не должен падать.
     """
     # 1) Ошибки самого API Gemini (есть HTTP-код и статус).
     try:
@@ -118,33 +139,63 @@ def classify_gemini_error(exc: Exception) -> str:
             code = getattr(exc, "code", 0) or 0
             status = (getattr(exc, "status", "") or "").upper()
             message = (getattr(exc, "message", "") or "").lower()
+            # --- Не лечатся повтором/сменой ключа: проблема в конфигурации ---
             if code == 400 and ("location" in message or status == "FAILED_PRECONDITION"):
-                return "регион не поддерживается (проверьте JARVIS_GEMINI_PROXY)"
-            if code == 429 or status == "RESOURCE_EXHAUSTED":
-                return "исчерпана квота ключа (429)"
+                return GeminiDiag(
+                    "регион не поддерживается (проверьте JARVIS_GEMINI_PROXY)", False, False)
             if code in (401, 403):
-                return "неверный или недействительный API-ключ"
-            return f"ошибка API Gemini ({code} {status or '—'})"
+                return GeminiDiag("неверный или недействительный API-ключ", False, False)
+            # --- Квота: лечится сменой ключа, НЕ повтором ---
+            if code == 429 or status == "RESOURCE_EXHAUSTED":
+                return GeminiDiag("исчерпана квота ключа (429)", False, True)
+            # --- Временные сбои Google: лечатся повтором (флаг retryable; про повтор
+            # пишет сам цикл, поэтому в текст «повторяю» НЕ зашиваем — иначе в фоллбэке
+            # после исчерпания попыток диагноз врал бы «повторяю», уже не повторяя) ---
+            if code == 503 or status == "UNAVAILABLE":
+                return GeminiDiag(
+                    "модель временно перегружена (503 high demand)", True, False)
+            if code == 504 or status == "DEADLINE_EXCEEDED":
+                return GeminiDiag(
+                    "превышено время ожидания ответа (504 таймаут/медленный прокси)",
+                    True, False)
+            if code == 500 or status == "INTERNAL":
+                return GeminiDiag("внутренняя ошибка Gemini (500)", True, False)
+            if code and code >= 500:
+                # Прочие 5xx — тоже временные.
+                return GeminiDiag(
+                    f"временная ошибка сервера Gemini ({code} {status or '—'})",
+                    True, False)
+            # Прочие 4xx — конфигурация/запрос, повтором не лечатся.
+            return GeminiDiag(f"ошибка API Gemini ({code} {status or '—'})", False, False)
     except Exception:
         pass
 
-    # 2) Сетевые сбои / прокси / таймаут — исключения httpx.
+    # 2) Сетевые сбои / прокси / таймаут — исключения httpx (ограниченно повторяемые).
     try:
         import httpx
 
         # ProxyError — отдельная ветка transport-ошибок; ConnectTimeout —
         # подкласс TimeoutException, поэтому таймаут проверяем ДО ConnectError.
         if isinstance(exc, httpx.ProxyError):
-            return "ошибка прокси (проверьте JARVIS_GEMINI_PROXY)"
+            return GeminiDiag("ошибка прокси (проверьте JARVIS_GEMINI_PROXY)", True, False)
         if isinstance(exc, httpx.TimeoutException):
-            return "превышено время ожидания"
+            return GeminiDiag(
+                "превышено время ожидания (таймаут запроса)", True, False)
         if isinstance(exc, (httpx.ConnectError, httpx.TransportError)):
-            return "нет связи с облаком (проверьте сеть/прокси)"
+            return GeminiDiag(
+                "нет связи с облаком (проверьте сеть/прокси)", True, False)
     except Exception:
         pass
 
-    # 3) Всё прочее — хотя бы тип и текст, чтобы не терять причину.
-    return f"непредвиденная ошибка ({type(exc).__name__}: {exc})"
+    # 3) Всё прочее — хотя бы тип и текст, чтобы не терять причину. Повтором не лечим
+    # (неизвестная природа — лучше уйти в фоллбэк, чем зациклиться).
+    return GeminiDiag(f"непредвиденная ошибка ({type(exc).__name__}: {exc})", False, False)
+
+
+def classify_gemini_error(exc: Exception) -> str:
+    """Короткий человекочитаемый диагноз сбоя Gemini (совместимая обёртка над
+    classify_gemini — её имя используют логи и doctor.check_proxy_route)."""
+    return classify_gemini(exc).text
 
 
 class CasualBackend:
@@ -170,6 +221,9 @@ class CasualBackend:
         self._offline_streak = 0     # выбор текста фоллбэка (первый/повторный)
         # Диагноз последнего сбоя (для doctor): None — последний запрос удался.
         self.last_error: str | None = None
+        # Номер попытки запроса, на которой прошёл последний УСПЕХ (сквозной счётчик
+        # ретраев+ротации). Для doctor: видно, прошло ли сразу или со 2-3-й попытки.
+        self.last_attempt: int = 0
 
     # ------------------------------------------------------------------ #
     # Публичный API
@@ -203,59 +257,70 @@ class CasualBackend:
     # Внутреннее
     # ------------------------------------------------------------------ #
     def _reply_with_rotation(self, text: str) -> str | None:
-        """Один проход по ключам: на 429 переключиться на следующий и повторить запрос.
+        """Запрос к Gemini с двумя независимыми механизмами восстановления:
 
-        Возвращает ответ при успехе либо None (вызывающий уйдёт в фоллбэк). Переключение
-        ключа — ТОЛЬКО на исчерпании квоты (429 RESOURCE_EXHAUSTED). Прочие ошибки сменой
-        ключа не лечатся (гео-блок, битый ключ, прокси, таймаут, сеть) — на них сразу
-        диагноз и None, без перебора. Не больше len(self._keys) попыток (один проход,
-        без бесконечного цикла); индекс двигаем по модулю — стартуем с текущего ключа.
+        1) RETRY на ВРЕМЕННЫХ сбоях (503 перегрузка, 504/таймаут, 500, обрыв прокси/сети):
+           до config.GEMINI_RETRIES попыток ТЕМ ЖЕ ключом с экспоненциальным backoff —
+           такие сбои типично проходят со 2-3-й попытки.
+        2) РОТАЦИЯ ключей на 429 (исчерпана квота): смена ключа лечит только её, повтор
+           тем же ключом бессмыслен. Один проход по ключам, старт с текущего.
+
+        Возвращает ответ при успехе либо None (вызывающий уйдёт в офлайн-фоллбэк). На
+        НЕ-retryable и НЕ-quota ошибках (гео-блок, битый ключ) — сразу диагноз и None,
+        без повторов и без перебора ключей. Каждый сбой пишем в self.last_error (для
+        doctor), на успехе — номер удавшейся попытки в self.last_attempt.
         """
         n = len(self._keys)
-        for attempt in range(n):
+        retries = max(1, config.GEMINI_RETRIES)
+        attempt_no = 0  # сквозной счётчик попыток (ретраи + ротация), для doctor
+        for key_pass in range(n):
             client = self._ensure_client()
             if client is None:
-                # Фатальный сбой создания клиента (SDK/прокси) — сменой ключа не лечится.
+                # Фатальный сбой создания клиента (SDK/прокси) — ни повтором, ни ключом.
                 return None
-            try:
-                return self._ask_gemini(client, text)
-            except Exception as exc:
-                self.last_error = classify_gemini_error(exc)
-                if not self._is_quota_error(exc):
-                    # Не лечится сменой ключа — внятный диагноз и фоллбэк.
+            # --- Ретраи на временные сбои В ПРЕДЕЛАХ ОДНОГО ключа ---
+            for retry in range(retries):
+                attempt_no += 1
+                try:
+                    answer = self._ask_gemini(client, text)
+                    self.last_attempt = attempt_no
+                    return answer
+                except Exception as exc:
+                    diag = classify_gemini(exc)
+                    self.last_error = diag.text
+                    if diag.is_quota:
+                        break  # квота — выходим к ротации ключа (ниже)
+                    if diag.retryable and retry + 1 < retries:
+                        wait = config.GEMINI_RETRY_DELAY * (2 ** retry)
+                        self.log.warning("Gemini: %s — повтор %d из %d через %.1fс",
+                                         diag.text, retry + 2, retries, wait)
+                        self.log.debug("Трасса временного сбоя Gemini", exc_info=True)
+                        time.sleep(wait)
+                        continue
+                    if diag.retryable:
+                        # Временный сбой, но попытки кончились — в фоллбэк с точной причиной.
+                        self.log.warning("Gemini: %s — все %d попытки исчерпаны, "
+                                         "офлайн-фоллбэк", diag.text, retries)
+                        self.log.debug("Трасса ошибки Gemini", exc_info=True)
+                        return None
+                    # Не лечится ни повтором, ни сменой ключа (гео/ключ/прочее).
                     self.log.warning("Gemini недоступен: %s — ухожу в офлайн-фоллбэк",
-                                     self.last_error)
+                                     diag.text)
                     self.log.debug("Трасса ошибки Gemini", exc_info=True)
                     return None
-                current = self._key_index + 1  # 1-based для логов
-                if attempt + 1 < n:
-                    # Есть ещё непробованные ключи — переключаемся и повторяем.
-                    self._key_index = (self._key_index + 1) % n
-                    self._client = None  # пересоздать клиент под новый ключ
-                    self.log.warning("ключ Gemini #%d исчерпан (429), переключаюсь на #%d",
-                                     current, self._key_index + 1)
-                    continue
-                # Это была последняя попытка — все ключи дали 429.
-                self.log.warning("ключ Gemini #%d исчерпан (429); все %d ключей исчерпаны "
-                                 "— офлайн-фоллбэк", current, n)
-                return None
+            # --- Сюда доходим только по break из-за 429: ротация ключа ---
+            current = self._key_index + 1  # 1-based для логов
+            if key_pass + 1 < n:
+                self._key_index = (self._key_index + 1) % n
+                self._client = None  # пересоздать клиент под новый ключ
+                self.log.warning("ключ Gemini #%d исчерпан (429), переключаюсь на #%d",
+                                 current, self._key_index + 1)
+                continue
+            # Это был последний ключ — все дали 429.
+            self.log.warning("ключ Gemini #%d исчерпан (429); все %d ключей исчерпаны "
+                             "— офлайн-фоллбэк", current, n)
+            return None
         return None
-
-    @staticmethod
-    def _is_quota_error(exc: Exception) -> bool:
-        """True только для 429 RESOURCE_EXHAUSTED — единственной ошибки, которую лечит
-        смена ключа. Логика та же, что в classify_gemini_error, но явным предикатом.
-        Импорт ленивый и в try-except — предикат не должен падать сам."""
-        try:
-            from google.genai import errors as genai_errors
-
-            if isinstance(exc, genai_errors.APIError):
-                code = getattr(exc, "code", 0) or 0
-                status = (getattr(exc, "status", "") or "").upper()
-                return code == 429 or status == "RESOURCE_EXHAUSTED"
-        except Exception:
-            pass
-        return False
 
     def _ensure_client(self):
         """Лениво создать genai.Client под текущий ключ. None — фатальный сбой SDK/прокси."""

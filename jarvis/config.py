@@ -147,9 +147,17 @@ GEMINI_MODEL = os.getenv("JARVIS_GEMINI_MODEL", "gemini-3.5-flash")
 GEMINI_GROUNDING = os.getenv("JARVIS_GEMINI_GROUNDING", "1").strip().lower() not in (
     "0", "false", "no", "off", "",
 )
-# Таймаут запроса к Gemini, секунды. Для grounding 5с маловато (поиск + генерация),
-# поэтому дефолт 8с; в casual.py переводится в миллисекунды для HttpOptions.
-GEMINI_TIMEOUT = float(os.getenv("JARVIS_GEMINI_TIMEOUT", "8"))
+# Таймаут запроса к Gemini, секунды. Запрос идёт через зарубежный прокси (лишний хоп),
+# плюс grounding (поиск + генерация) — 8с было мало, ловили 504/таймаут. Дефолт 30с с
+# запасом; в casual.py переводится в миллисекунды для HttpOptions. Минимум API — 10с.
+GEMINI_TIMEOUT = float(os.getenv("JARVIS_GEMINI_TIMEOUT", "30"))
+# Ретраи запроса к Gemini на ВРЕМЕННЫЕ сбои (503 перегрузка, 504/таймаут, 500, обрыв
+# прокси/сети): сколько ВСЕГО попыток на ОДИН ключ (1 = без ретрая) и базовая пауза между
+# ними (с, удваивается). 429 (квота) ретраем НЕ лечится — это переключение ключа (см.
+# casual.py). Бюджет времени ≈ GEMINI_TIMEOUT × GEMINI_RETRIES — держим разумным
+# (30с × 3 = ~90с худший случай перед фоллбэком; обычно 503/504 проходят со 2-3-й попытки).
+GEMINI_RETRIES = int(os.getenv("JARVIS_GEMINI_RETRIES", "3"))
+GEMINI_RETRY_DELAY = float(os.getenv("JARVIS_GEMINI_RETRY_DELAY", "1.0"))
 # Сколько реплик беседы (сообщений user/assistant) помнить и слать в облако.
 GEMINI_HISTORY = int(os.getenv("JARVIS_GEMINI_HISTORY", "8"))
 # Прокси ТОЛЬКО для google-genai клиента (обход геоблока РФ). Пусто = напрямую.

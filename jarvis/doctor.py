@@ -617,6 +617,20 @@ def check_audio() -> list[CheckResult]:
     return results
 
 
+def _proxy_external_ip(timeout: float = 8.0) -> tuple[str, str]:
+    """Внешний IP и страна (ISO) ЧЕРЕЗ прокси Gemini. Бросает при сбое/отсутствии httpx.
+
+    Тот же proxy, что у Gemini-клиента — подтверждает, что облачный трафик реально идёт
+    через прокси. Системный/пентест-трафик это не затрагивает (разовый запрос только
+    этого клиента). Используется и в маршруте прокси, и в живом тесте Gemini.
+    """
+    import httpx
+
+    with httpx.Client(proxy=config.GEMINI_PROXY, timeout=timeout) as client:
+        data = client.get("https://ipinfo.io/json").json()
+    return (data.get("ip") or "?", (data.get("country") or "").upper())
+
+
 def check_proxy_route() -> CheckResult:
     """Реальный маршрут прокси Gemini: внешний IP и страна ЧЕРЕЗ тот же прокси-клиент.
 
@@ -628,15 +642,12 @@ def check_proxy_route() -> CheckResult:
     if not config.GEMINI_PROXY:
         return CheckResult(OK, "Прокси Gemini не задан (облако — напрямую)")
     try:
-        import httpx
+        import httpx  # noqa: F401
     except Exception as exc:
         return CheckResult(WARN, "Маршрут прокси Gemini",
                            reason=f"httpx недоступен: {exc}.", fix="pip install -e .")
     try:
-        with httpx.Client(proxy=config.GEMINI_PROXY, timeout=8) as client:
-            data = client.get("https://ipinfo.io/json").json()
-        ip = data.get("ip") or "?"
-        country = (data.get("country") or "").upper()
+        ip, country = _proxy_external_ip()
     except Exception as exc:
         from jarvis.casual import classify_gemini_error
 
@@ -1141,13 +1152,23 @@ def check_gemini_live() -> CheckResult:
             reason=f"запрос упал: {exc}",
             fix="проверьте GEMINI_API_KEY, сеть и имя модели JARVIS_GEMINI_MODEL",
         )
+    # Внешний IP через прокси — подтверждение, что облачный трафик реально идёт через
+    # прокси (и подсказка при гео-блоке). Best-effort: короткий таймаут, на сбое пропускаем.
+    ip_info = ""
+    if config.GEMINI_PROXY:
+        try:
+            ip, country = _proxy_external_ip(timeout=6.0)
+            ip_info = f", внешний IP {ip} ({country or '?'})"
+        except Exception:
+            pass
+
     if answer in (casual._FALLBACK_FIRST, casual._FALLBACK_AGAIN):
         # backend прогнан тем же путём, что casual (включая прокси), поэтому диагноз
-        # из last_error точный: гео-блок/квота/ключ/сеть, а не общая «облако недоступно».
+        # из last_error точный: гео-блок/квота/ключ/503/504/сеть, а не ложное «429».
         diag = backend.last_error or "облако недоступно, неверный ключ или имя модели"
         return CheckResult(
             WARN, "Gemini: живой ответ",
-            reason=f"вернулся офлайн-фоллбэк: {diag}.",
+            reason=f"вернулся офлайн-фоллбэк: {diag}{ip_info}.",
             fix="проверьте GEMINI_API_KEY, JARVIS_GEMINI_PROXY, сеть и "
                 "JARVIS_GEMINI_MODEL; см. logs/jarvis-core.log",
         )
@@ -1155,7 +1176,10 @@ def check_gemini_live() -> CheckResult:
     # На каком по счёту ключе прошёл запрос — видно, сработала ли ротация.
     total = len(config.GEMINI_API_KEYS)
     on_key = f", на ключе #{backend._key_index + 1} из {total}" if total > 1 else ""
-    return CheckResult(OK, f"Gemini: живой ответ получен{on_key}{proxy}")
+    # С какой попытки прошло (ретраи на 503/504 + ротация) — видно, что retry сработал.
+    on_attempt = f", с попытки {backend.last_attempt}" if backend.last_attempt > 1 else ""
+    return CheckResult(OK,
+                       f"Gemini: живой ответ получен{on_key}{on_attempt}{proxy}{ip_info}")
 
 
 def check_brain_live() -> CheckResult:
