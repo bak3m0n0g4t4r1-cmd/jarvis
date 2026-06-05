@@ -82,8 +82,8 @@ def check_venv() -> CheckResult:
 def check_imports() -> list[CheckResult]:
     """Все зависимости реально импортируются (import, а не «пакет установлен»)."""
     modules = [
-        "paho.mqtt.client", "pydantic", "yaml", "numpy",
-        "sounddevice", "sherpa_onnx", "piper", "onnxruntime", "tokenizers",
+        "paho.mqtt.client", "yaml", "numpy", "sounddevice",
+        "sherpa_onnx", "piper", "onnxruntime", "tokenizers",
     ]
     results = []
     for mod in modules:
@@ -123,7 +123,7 @@ def check_library_versions() -> list[CheckResult]:
                             fix="проверьте pyproject.toml")]
     # Либы, чьи версии реально влияют на поведение (имя пакета как в pyproject).
     watched = {"onnxruntime", "tokenizers", "paho-mqtt", "sherpa-onnx",
-               "piper-tts", "pydantic", "numpy"}
+               "piper-tts", "numpy"}
     results = []
     for raw in deps:
         try:

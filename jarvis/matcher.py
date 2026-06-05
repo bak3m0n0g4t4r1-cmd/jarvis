@@ -249,17 +249,73 @@ class Matcher:
     # Слой 2: эмбеддинги
     # ------------------------------------------------------------------ #
     def _ensure_embeddings(self) -> bool:
-        """Лениво посчитать эмбеддинги фраз команд один раз. True — готовы."""
+        """Лениво подготовить эмбеддинги фраз команд один раз. True — готовы.
+
+        Сначала пробуем диск-кеш (по хешу набора фраз + версии модели) — тогда при
+        старте ничего не пересчитываем. Промах кеша → считаем и сохраняем.
+        """
         if self._emb_ready:
             return self._emb_matrix is not None
         self._emb_ready = True
         if not self._emb_phrases:
             return False
+        cached = self._load_cache()
+        if cached is not None:
+            self._emb_matrix = cached
+            return True
         self._emb_matrix = self._embedder.encode(self._emb_phrases)
         if self._emb_matrix is None:
             _log.warning("Эмбеддинги команд не посчитаны — остаётся только слой правил")
             return False
+        self._save_cache(self._emb_matrix)
         return True
+
+    def _cache_key(self) -> str:
+        """Ключ кеша: хеш набора фраз + размер/mtime файла модели (инвалидация)."""
+        import hashlib
+        import os
+
+        h = hashlib.sha256("\n".join(self._emb_phrases).encode("utf-8"))
+        try:
+            st = os.stat(config.EMBEDDER_MODEL)
+            h.update(f"{st.st_size}:{int(st.st_mtime)}".encode())
+        except OSError:
+            pass
+        return h.hexdigest()
+
+    def _load_cache(self):
+        """Загрузить матрицу эмбеддингов из npz, если ключ совпал. Иначе None."""
+        try:
+            import os
+
+            if not os.path.exists(config.MATCHER_CACHE):
+                return None
+            import numpy as np
+
+            data = np.load(config.MATCHER_CACHE, allow_pickle=False)
+            if str(data.get("key")) != self._cache_key():
+                return None
+            matrix = data.get("matrix")
+            if matrix is None or matrix.shape[0] != len(self._emb_phrases):
+                return None
+            _log.info("Эмбеддинги команд взяты из кеша (%d фраз)", matrix.shape[0])
+            return matrix.astype("float32")
+        except Exception as exc:
+            _log.debug("Кеш эмбеддингов не прочитан (%s) — пересчитаю", exc)
+            return None
+
+    def _save_cache(self, matrix) -> None:
+        """Сохранить матрицу эмбеддингов в npz рядом с моделью (best-effort)."""
+        try:
+            import os
+
+            import numpy as np
+
+            os.makedirs(os.path.dirname(config.MATCHER_CACHE) or ".", exist_ok=True)
+            np.savez(config.MATCHER_CACHE, matrix=matrix, key=self._cache_key())
+            _log.debug("Эмбеддинги команд сохранены в кеш: %s", config.MATCHER_CACHE)
+        except Exception as exc:
+            _log.debug("Не удалось сохранить кеш эмбеддингов (%s) — не критично", exc)
 
     def _match_embeddings(self, query: str) -> Optional[Match]:
         """Семантический поиск с порогом и защитой по отрыву (margin)."""

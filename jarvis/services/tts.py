@@ -27,10 +27,12 @@ class TtsModule(JarvisModule):
         super().__init__("jarvis-tts")
         self._queue: "queue.Queue[str]" = queue.Queue()
         self._voice = None
+        self._voice_tried = False  # ленивую загрузку пробуем один раз
         self._worker = None
 
     def on_start(self):
-        self._load_voice()
+        # Голос Piper грузим ЛЕНИВО (при первой фразе), а не на старте — пока Джарвис
+        # молчит, ~120 МБ модели не висят в RAM. Загрузка происходит в _speak.
         self.subscribe(contracts.TOPIC_SAY, self.on_say)
         self._worker = threading.Thread(target=self._run_worker, daemon=True)
         self._worker.start()
@@ -91,6 +93,11 @@ class TtsModule(JarvisModule):
         возвращаем False (воркер сам решит, стойкий ли это сбой). «Один speaking на
         ответ» сохранён: speaking на входе, idle в finally.
         """
+        # Ленивая загрузка голоса при первой фразе (одна попытка). Если не вышло —
+        # дальше просто пропускаем озвучку, не пытаясь грузить каждый раз.
+        if self._voice is None and not self._voice_tried:
+            self._voice_tried = True
+            self._load_voice()
         if self._voice is None:
             self.log.warning("Голос Piper не загружен — не могу озвучить фразу: %r", text[:60])
             return False

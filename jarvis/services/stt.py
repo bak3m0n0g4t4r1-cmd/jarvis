@@ -63,11 +63,15 @@ class SttModule(JarvisModule):
             vad_config.silero_vad.min_silence_duration = config.VAD_MIN_SILENCE
             vad_config.silero_vad.min_speech_duration = config.VAD_MIN_SPEECH
             vad_config.sample_rate = config.SAMPLE_RATE
+            # Один поток на N100 (сверено: VadModelConfig.num_threads поддержан).
+            vad_config.num_threads = config.STT_NUM_THREADS
+            # Буфер VAD короче (команды короткие) — меньше RAM, чем прежние 30с.
             self._vad = sherpa_onnx.VoiceActivityDetector(
-                vad_config, buffer_size_in_seconds=30
+                vad_config, buffer_size_in_seconds=config.VAD_BUFFER_SECONDS
             )
 
-            # zipformer-ru — offline transducer с BPE-словарём.
+            # zipformer-ru — offline transducer с BPE-словарём. num_threads=1 — меньше
+            # потоковой возни на крошечной модели (сверено: параметр поддержан).
             self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
                 encoder=config.ZIPFORMER_ENCODER,
                 decoder=config.ZIPFORMER_DECODER,
@@ -75,6 +79,7 @@ class SttModule(JarvisModule):
                 tokens=config.ZIPFORMER_TOKENS,
                 modeling_unit="bpe",
                 bpe_vocab=config.ZIPFORMER_BPE,
+                num_threads=config.STT_NUM_THREADS,
             )
             self.log.info("Модели STT инициализированы (zipformer-ru)")
         except Exception:
