@@ -1178,6 +1178,17 @@ def check_gemini_live() -> CheckResult:
     on_key = f", на ключе #{backend._key_index + 1} из {total}" if total > 1 else ""
     # С какой попытки прошло (ретраи на 503/504 + ротация) — видно, что retry сработал.
     on_attempt = f", с попытки {backend.last_attempt}" if backend.last_attempt > 1 else ""
+    # grounding мог отвалиться (квота веб-поиска/таймаут), но обычная генерация работает —
+    # это НЕ исчерпание ключа: честно отделяем «ключ жив, свежих фактов нет».
+    if config.GEMINI_GROUNDING and not backend._grounding:
+        diag = backend.last_grounding_error or "квота веб-поиска исчерпана"
+        return CheckResult(
+            WARN, "Gemini: живой ответ",
+            reason=f"ответ получен{on_key}{on_attempt}{proxy}, но grounding (веб-поиск) "
+                   f"недоступен: {diag}{ip_info}.",
+            fix="не критично — ключ работает; свежие факты (погода/курсы/новости) недоступны: "
+                "добавьте ключи GEMINI_API_KEY_2..5 или примите работу без веб-поиска",
+        )
     return CheckResult(OK,
                        f"Gemini: живой ответ получен{on_key}{on_attempt}{proxy}{ip_info}")
 
@@ -1234,6 +1245,16 @@ def check_brain_live() -> CheckResult:
             fix="сверьте описания инструментов; возможно, модель ответила без вызова",
         )
     proxy = " (через прокси)" if config.GEMINI_PROXY else ""
+    # Функции отработали; отдельно отметим, если grounding отвалился по своей квоте.
+    if config.GEMINI_GROUNDING and not backend._grounding:
+        diag = backend.last_grounding_error or "квота веб-поиска исчерпана"
+        return CheckResult(
+            WARN, "Мозг: function calling",
+            reason=f"функции работают (вызвано {backend.last_tool_calls}){proxy}, но "
+                   f"grounding (веб-поиск) недоступен: {diag}.",
+            fix="не критично — мозг и команды работают; свежие факты недоступны: "
+                "добавьте ключи GEMINI_API_KEY_2..5 или примите работу без веб-поиска",
+        )
     return CheckResult(
         OK, f"Мозг: function calling работает — вызвано {backend.last_tool_calls}{proxy}"
     )

@@ -30,7 +30,7 @@ import subprocess
 from datetime import datetime
 
 from jarvis import config
-from jarvis.casual import JARVIS_PERSONA, CasualBackend
+from jarvis.casual import CasualBackend
 
 
 # --------------------------------------------------------------------------- #
@@ -194,9 +194,9 @@ class Brain(CasualBackend):
         except Exception:
             self.log.exception("Не удалось собрать инструменты Gemini — мозг без функций")
             self._function_tools = []
-        # Совмещать ли grounding с функциями. Если Gemini отвергнет совмещение —
-        # один раз отступим к функциям без grounding и больше не будем совмещать.
-        self._grounding_with_tools = config.GEMINI_GROUNDING
+        # Деградация grounding (квота веб-поиска 429 / таймаут / конфликт с функциями 400)
+        # унаследована из CasualBackend: общий self._grounding + self._generate_content сами
+        # один раз отступают к функциям без grounding и гасят его на сессию — без дублей здесь.
         # Наблюдаемость для doctor: какие инструменты вызывались в последнем запросе.
         self.last_tool_calls: list[str] = []
 
@@ -228,7 +228,15 @@ class Brain(CasualBackend):
         contents = self._history_contents(text)
 
         for _ in range(max(1, config.BRAIN_MAX_STEPS)):
-            response = self._generate(client, contents)
+            # generate с инструментами; grounding и его самоисцеление — в базовом
+            # _generate_content. Ручной function calling: SDK сам вызовы НЕ исполняет.
+            response = self._generate_content(
+                client, contents,
+                tools=self._function_tools,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
+                ),
+            )
             calls = list(getattr(response, "function_calls", None) or [])
             if not calls:
                 # Финальный текстовый ответ в характере.
@@ -259,61 +267,6 @@ class Brain(CasualBackend):
             contents.append(types.Content(role="user", parts=resp_parts))
 
         raise RuntimeError("превышен лимит шагов function calling")
-
-    def _generate(self, client, contents):
-        """Один generate_content с инструментами; деградация grounding при конфликте.
-
-        Структурно grounding (google_search) и function_declarations можно передать
-        вместе, но модель может отвергнуть совмещение (400 INVALID_ARGUMENT). Тогда один
-        раз отступаем к функциям без grounding и впредь не совмещаем (мозг важнее свежих
-        фактов в этом пути; беседа без действий всё равно сможет к ним обратиться).
-        """
-        from google.genai import types
-
-        def _config(with_grounding: bool):
-            tools = list(self._function_tools)
-            if with_grounding:
-                tools = tools + [types.Tool(google_search=types.GoogleSearch())]
-            return types.GenerateContentConfig(
-                system_instruction=JARVIS_PERSONA,
-                tools=tools,
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                    disable=True
-                ),
-            )
-
-        try:
-            return client.models.generate_content(
-                model=config.GEMINI_MODEL, contents=contents,
-                config=_config(self._grounding_with_tools),
-            )
-        except Exception as exc:
-            if self._grounding_with_tools and self._is_tool_conflict(exc):
-                self.log.warning("Gemini отверг grounding вместе с функциями — "
-                                 "отключаю совмещение, работаю на функциях")
-                self._grounding_with_tools = False
-                return client.models.generate_content(
-                    model=config.GEMINI_MODEL, contents=contents,
-                    config=_config(False),
-                )
-            raise
-
-    @staticmethod
-    def _is_tool_conflict(exc) -> bool:
-        """Похоже ли исключение на конфликт инструментов (grounding + функции): 400."""
-        try:
-            from google.genai import errors as genai_errors
-
-            if isinstance(exc, genai_errors.APIError):
-                code = getattr(exc, "code", 0) or 0
-                message = (getattr(exc, "message", "") or "").lower()
-                if code == 400 and any(
-                    w in message for w in ("tool", "function", "search", "grounding")
-                ):
-                    return True
-        except Exception:
-            pass
-        return False
 
     def _execute_tool(self, name: str, args: dict) -> dict:
         """Выполнить вызов инструмента и вернуть результат для function_response.

@@ -198,6 +198,27 @@ def classify_gemini_error(exc: Exception) -> str:
     return classify_gemini(exc).text
 
 
+def _is_grounding_failure(exc: Exception) -> bool:
+    """Сбой grounded-запроса, который лечится повтором БЕЗ grounding — и только такой.
+
+    Это БЫСТРЫЕ grounding-специфичные отказы: 429 (у веб-поиска ОТДЕЛЬНАЯ жёсткая квота) и
+    400 (модель отвергла google_search вместе с function_declarations). Их повтор без
+    grounding почти бесплатен и сразу даёт ответ. А вот таймаут/503/обрыв — НЕ сюда:
+    grounding там ни при чём, ungrounded на том же канале тоже упадёт, а лишний запрос лишь
+    удвоит ожидание перед фоллбэком; такие временные сбои лечит ретрай/ротация выше.
+    """
+    try:
+        from google.genai import errors as genai_errors
+
+        if isinstance(exc, genai_errors.APIError):
+            code = getattr(exc, "code", 0) or 0
+            status = (getattr(exc, "status", "") or "").upper()
+            return code in (400, 429) or status == "RESOURCE_EXHAUSTED"
+    except Exception:
+        pass
+    return False
+
+
 class CasualBackend:
     """Беседа через Gemini с памятью и grounding; офлайн-фоллбэк в характере.
 
@@ -219,6 +240,12 @@ class CasualBackend:
         self._client = None          # клиент текущего ключа (ленивое создание)
         self._client_failed = False  # фатальный сбой SDK/прокси — не пересоздавать
         self._offline_streak = 0     # выбор текста фоллбэка (первый/повторный)
+        # Grounding (веб-поиск google_search) — сессионный флаг. Включён из конфига, но
+        # гасится САМ при первом же сбое grounded-запроса (квота веб-поиска 429, таймаут,
+        # конфликт с функциями): дальше отвечаем без свежих фактов, а не уходим в офлайн.
+        self._grounding = config.GEMINI_GROUNDING
+        # Причина отключения grounding (для doctor): None — grounding ещё активен/выключен в конфиге.
+        self.last_grounding_error: str | None = None
         # Диагноз последнего сбоя (для doctor): None — последний запрос удался.
         self.last_error: str | None = None
         # Номер попытки запроса, на которой прошёл последний УСПЕХ (сквозной счётчик
@@ -344,10 +371,14 @@ class CasualBackend:
                 api_key=self._keys[self._key_index],
                 http_options=types.HttpOptions(**http_opts),
             )
+            thinking = ("выкл" if config.GEMINI_THINKING_BUDGET == 0
+                        else "по умолчанию" if config.GEMINI_THINKING_BUDGET < 0
+                        else f"{config.GEMINI_THINKING_BUDGET} ток.")
             self.log.info(
-                "Gemini-клиент готов: ключ #%d из %d, модель %s, grounding=%s, таймаут=%.1fс, %s",
+                "Gemini-клиент готов: ключ #%d из %d, модель %s, grounding=%s, thinking=%s, "
+                "таймаут=%.1fс, %s",
                 self._key_index + 1, len(self._keys),
-                config.GEMINI_MODEL, config.GEMINI_GROUNDING, config.GEMINI_TIMEOUT,
+                config.GEMINI_MODEL, config.GEMINI_GROUNDING, thinking, config.GEMINI_TIMEOUT,
                 "через прокси" if config.GEMINI_PROXY else "напрямую",
             )
         except Exception as exc:
@@ -377,26 +408,75 @@ class CasualBackend:
         )
         return contents
 
-    def _ask_gemini(self, client, text: str) -> str:
-        """Один запрос к Gemini: память + текущая реплика, характер, grounding."""
+    def _generate_content(self, client, contents, *, tools=None, **config_kwargs):
+        """Один generate_content с САМОИСЦЕЛЯЮЩИМ grounding — общий для беседы и мозга.
+
+        grounding (google_search) — частый источник сбоя: у веб-поиска ОТДЕЛЬНАЯ жёсткая
+        квота (исчерпание → мгновенный 429), а с function_declarations модель может его
+        отвергнуть (400). Раньше grounding-429 уводил весь ответ в офлайн, хотя обычная
+        генерация работает. Теперь: на быстром grounding-специфичном отказе (429/400 —
+        _is_grounding_failure) ОДИН раз повторяем БЕЗ grounding; вышло → гасим grounding на
+        сессию (self._grounding=False) и отвечаем без свежих фактов. Прочие сбои (таймаут/
+        503/сеть) пробрасываем наверх без удвоения ожидания — их разберёт ретрай/ротация.
+
+        tools — базовые инструменты (function_declarations мозга); grounding добавляется
+        поверх. config_kwargs идут в GenerateContentConfig (напр. automatic_function_calling).
+        """
         from google.genai import types
 
+        base_tools = list(tools or [])
+
+        # thinking (скрытое размышление) — общий рубильник для беседы и мозга. gemini-3.5-flash
+        # думает по умолчанию слишком долго: persona-запрос висел >40с и ловил таймаут, а с
+        # бюджетом 0 та же реплика приходит за ~2с (сверено на машине). Ставим централизованно,
+        # если вызывающий не задал свой thinking_config; -1 в конфиге = не трогать.
+        cfg_kwargs = dict(config_kwargs)
+        if config.GEMINI_THINKING_BUDGET >= 0 and "thinking_config" not in cfg_kwargs:
+            cfg_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=config.GEMINI_THINKING_BUDGET
+            )
+
+        def _call(with_grounding: bool):
+            all_tools = base_tools + (
+                [types.Tool(google_search=types.GoogleSearch())] if with_grounding else []
+            )
+            return client.models.generate_content(
+                model=config.GEMINI_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=JARVIS_PERSONA,
+                    tools=all_tools or None,
+                    **cfg_kwargs,
+                ),
+            )
+
+        if not self._grounding:
+            return _call(False)
+        try:
+            return _call(True)
+        except Exception as exc:
+            # Повтор без grounding — только на быстрых grounding-специфичных отказах (429/400),
+            # иначе пробрасываем наверх (таймаут/503/сеть — не вина grounding, см. _is_grounding_failure).
+            if not _is_grounding_failure(exc):
+                raise
+            try:
+                response = _call(False)
+            except Exception:
+                # Без grounding тоже не вышло — причина глубже (ключ/сеть/перегрузка).
+                raise
+            self._grounding = False
+            self.last_grounding_error = classify_gemini_error(exc)
+            self.log.warning(
+                "grounding недоступен (%s) — отключаю веб-поиск на сессию, отвечаю без него",
+                self.last_grounding_error,
+            )
+            return response
+
+    def _ask_gemini(self, client, text: str) -> str:
+        """Один запрос к Gemini: память + текущая реплика, характер, grounding."""
         # contents = история беседы (роли user/model) + текущая реплика пользователя.
         contents = self._history_contents(text)
-
-        tools = None
-        if config.GEMINI_GROUNDING:
-            # Новый способ grounding (не legacy google_search_retrieval).
-            tools = [types.Tool(google_search=types.GoogleSearch())]
-
-        response = client.models.generate_content(
-            model=config.GEMINI_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=JARVIS_PERSONA,
-                tools=tools,
-            ),
-        )
+        response = self._generate_content(client, contents)
         answer = (getattr(response, "text", None) or "").strip()
         if not answer:
             raise RuntimeError("Gemini вернул пустой ответ")
