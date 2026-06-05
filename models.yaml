@@ -47,3 +47,16 @@
     # ВНИМАНИЕ: сверить вручную. Конфиг голоса (содержит audio.sample_rate).
     url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/dmitri/medium/ru_RU-dmitri-medium.onnx.json"
     назначение: "ru_RU-dmitri-medium.onnx.json"
+
+  # --- Эмбеддер команд: rubert-tiny2 в ONNX (через onnxruntime, без torch) ---
+  # Готовый ONNX-экспорт (PyTorch-оригинал требовал бы torch для конвертации).
+  # Матчеру нужны ровно два файла: модель и токенизатор (tokenizer.json самодостаточен).
+  embedder_model:
+    url: "https://huggingface.co/Vuy/rubert-tiny2-onnx/resolve/main/model_optimized.onnx"
+    назначение: "rubert-tiny2-onnx/model_optimized.onnx"
+    размер: 116392715
+
+  embedder_tokenizer:
+    url: "https://huggingface.co/Vuy/rubert-tiny2-onnx/resolve/main/tokenizer.json"
+    назначение: "rubert-tiny2-onnx/tokenizer.json"
+    размер: 2413691

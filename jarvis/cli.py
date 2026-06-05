@@ -40,9 +40,10 @@ def _user_units_dir() -> Path:
 def _render_unit(svc, bin_dir: Path) -> str:
     """Текст юнита с ExecStart на реальный бинарь venv (без хардкода путей)."""
     exec_start = bin_dir / svc.command
-    # «Мозг» читает GEMINI_API_KEY (и прочие JARVIS_*) из .env проекта — прокидываем
-    # его в юнит. Дефис у пути: если .env ещё нет, юнит не падает (ключ опционален,
-    # есть офлайн-фоллбэк). config.py всё равно подхватит .env сам через load_dotenv.
+    # «Мозг» подхватывает необязательные JARVIS_*-оверрайды из .env проекта (пороги
+    # матчера, лог-уровень и т.п.) — прокидываем файл в юнит. Дефис у пути: если .env
+    # нет, юнит не падает (все параметры имеют дефолты в config.py). Секретов в .env
+    # больше нет — облако удалено.
     env_line = ""
     if svc.key == "core":
         env_line = f"EnvironmentFile=-{config.BASE_DIR / '.env'}\n"
@@ -150,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor = sub.add_parser("doctor", help="полная проверка здоровья системы")
     p_doctor.add_argument(
         "--quick", action="store_true",
-        help="быстро: пропустить долгие/сетевые/платные тесты (Gemini, синтез, цепочка)",
+        help="быстро: пропустить долгие тесты (синтез Piper, сквозная цепочка)",
     )
     p_doctor.add_argument(
         "--deep", action="store_true",

@@ -1,5 +1,5 @@
 [Unit]
-Description=Джарвис — «Мозг» (Ollama structured output)
+Description=Джарвис — «Мозг» (матчер: правила + ONNX-эмбеддинги)
 After=network.target
 # Переживаем крэш-бурст, но жёсткий цикл падений ограничиваем (виден, не маскируется).
 StartLimitIntervalSec=300
@@ -9,7 +9,8 @@ StartLimitBurst=10
 Type=simple
 # ПРИМЕР. Реальные юниты с верными путями ставит `jarvis start` (в ~/.config/systemd/user/).
 # Здесь %h/jarvis/.venv — лишь образец, если проект лежит в ~/jarvis.
-# GEMINI_API_KEY для casual-бэкенда берётся из .env проекта (дефис — не падать, если файла нет).
+# Необязательные JARVIS_*-оверрайды берутся из .env проекта (дефис — не падать, если файла
+# нет; все параметры имеют дефолты). Секретов в .env больше нет — облако удалено.
 EnvironmentFile=-%h/jarvis/.env
 ExecStart=%h/jarvis/.venv/bin/jarvis-core
 Restart=always

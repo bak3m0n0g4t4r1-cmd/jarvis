@@ -5,11 +5,7 @@
 «сервер недоступен». Здесь же — общий ретрай с человеческим логом.
 
 ВАЖНО: модуль НЕ импортирует bus/сервисы — только config/stdlib. Иначе получится цикл
-(bus → resilience → bus). Классификатор Gemini живёт в casual.py (там он нужен самому
-бэкенду и тоже не должен тянуть лишнего); при необходимости импортируется оттуда.
-
-Импорты сторонних либ (ollama/httpx) — ленивые и в try-except: сам классификатор не
-должен падать, даже если пакета нет.
+(bus → resilience → bus).
 """
 import logging
 import socket
@@ -45,41 +41,8 @@ def mqtt_disconnect_reason(reason_code) -> tuple[bool, str]:
 
 
 # --------------------------------------------------------------------------- #
-# Классификаторы сбоёв (перенесены из doctor.py — единый источник диагнозов)
+# Классификатор сбоя MQTT (единый источник диагнозов для сервисов и доктора)
 # --------------------------------------------------------------------------- #
-def classify_ollama_error(exc: Exception) -> str:
-    """Точный диагноз сбоя Ollama (сверено на ollama 0.6.2)."""
-    try:
-        import ollama
-
-        if isinstance(exc, ollama.ResponseError):
-            code = getattr(exc, "status_code", 0) or 0
-            if code == 404:
-                return "модель не найдена на сервере (404)"
-            if code == 400:
-                return "неверный запрос или имя модели (400)"
-            if code and code >= 500:
-                return f"внутренняя ошибка сервера Ollama ({code})"
-            return f"ошибка API Ollama ({code or '—'})"
-    except Exception:
-        pass
-    try:
-        import httpx
-
-        if isinstance(exc, httpx.TimeoutException):
-            return "превышено время ожидания Ollama (модель грузится или висит)"
-    except Exception:
-        pass
-    # ollama 0.6.x при недоступном сервере бросает builtins.ConnectionError.
-    if isinstance(exc, (ConnectionRefusedError, ConnectionError)):
-        return "сервер Ollama не запущен (нет соединения)"
-    if isinstance(exc, socket.gaierror):
-        return "не разрешается адрес Ollama (DNS) — проверьте JARVIS_OLLAMA_HOST"
-    if isinstance(exc, (socket.timeout, TimeoutError)):
-        return "Ollama не ответил вовремя (таймаут)"
-    return f"непредвиденная ошибка Ollama ({type(exc).__name__}: {exc})"
-
-
 def classify_mqtt_error(exc: Exception) -> str:
     """Точный диагноз сбоя подключения к MQTT-брокеру (сверено на paho-mqtt 2.1.0)."""
     if isinstance(exc, ConnectionRefusedError):

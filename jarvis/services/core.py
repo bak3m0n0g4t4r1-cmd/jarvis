@@ -1,27 +1,26 @@
-"""«Мозг» Джарвиса: диспетчер интентов поверх локальной 1.5B (Ollama).
+"""«Мозг» Джарвиса: лёгкий распознаватель команд (без облака и без LLM).
 
-Локальная модель работает КЛАССИФИКАТОРОМ: по реплике из jarvis/input она через
-structured output выдаёт интент (os_command | casual_talk) и, для команды, тег из
-commands.yaml + короткое подтверждение в характере. Дальше:
-  os_command  → подтверждение в jarvis/say + тег в jarvis/execute (быстро, офлайн);
-  casual_talk → сперва локальные инструменты (время/заряд), иначе живой ответ от
-                casual-бэкенда (Gemini), и он же — в jarvis/say.
-Так команды звучат мгновенно и без сети, а беседу ведёт облако.
+Реплика из jarvis/input проходит так:
+  1. встроенные info-ответы (время/заряд) — офлайн, мгновенно, в характере;
+  2. матчер (правила + ONNX-эмбеддинги, см. jarvis/matcher.py) → тег команды →
+     подтверждение в jarvis/say + тег в jarvis/execute (исполняет OS-агент);
+  3. ничего не распознано → переспрос в характере (без падения).
+
+Никакой генеративной модели: ум заменён на дешёвый гибридный матчер, чтобы
+N100/8 ГБ не тормозил. Команды звучат мгновенно и работают офлайн.
 """
 import logging
 import threading
-from collections import deque
 from datetime import datetime
 
-import ollama
 import yaml
 
 from jarvis import config, contracts
-from jarvis.brain import Brain, read_battery
 from jarvis.bus import JarvisModule
-from jarvis.resilience import classify_ollama_error, with_retry
+from jarvis.matcher import NOT_RECOGNIZED, Matcher
+from jarvis.sysinfo import read_battery
 
-# Ключевые слова локальных инструментов (срабатывают на явный вопрос в беседе).
+# Ключевые слова встроенных info-ответов (срабатывают на явный вопрос).
 _TIME_KEYS = (
     "который час", "которой час", "которое время", "сколько времени",
     "сколько время", "точное время", "время сейчас", "сколько на часах",
@@ -32,8 +31,7 @@ _BATTERY_KEYS = ("батаре", "аккумулят", "заряд", "сколь
 def _load_commands() -> dict:
     """Карта команд из commands.yaml (теги → спецификации). При сбое — пустой dict.
 
-    Один источник для системного промпта диспетчера И для инструментов Gemini-мозга,
-    чтобы и привратник, и облако видели ровно существующие теги — без выдуманных.
+    Источник истины и для матчера (синонимы/примеры/подтверждения), и для OS-агента.
     """
     try:
         with open(config.COMMANDS_FILE, encoding="utf-8") as f:
@@ -42,57 +40,16 @@ def _load_commands() -> dict:
         return {}
 
 
-def _build_system_prompt(commands: dict) -> str:
-    """Собирает системный промпт с актуальным списком команд из commands.yaml.
-
-    Теги передаются готовой картой, чтобы Мозг видел только реально существующие
-    команды — никаких выдуманных тегов модель не сгенерирует, потому что
-    неоткуда их взять.
-    """
-    tags = sorted(commands.keys())  # алфавитный порядок для стабильности промпта
-    tag_list = ", ".join(tags) if tags else "(нет доступных команд)"
-
-    return (
-        "Ты — Джарвис, голосовой ассистент-диспетчер в характере дворецкого ИИ "
-        "(в традиции J.A.R.V.I.S.): обращаешься на «сэр», по-русски, спокойно и "
-        "лаконично. Твоя задача — КЛАССИФИЦИРОВАТЬ реплику пользователя и вернуть "
-        "ТОЛЬКО валидный JSON по схеме. Развёрнутую беседу ведёт другой модуль — "
-        "ты её НЕ пишешь.\n\n"
-        "ИНТЕНТЫ (ровно два):\n"
-        "1. os_command — пользователь явно просит выполнить ОДНУ из команд ниже. "
-        "Тег бери РОВНО из списка, ничего не выдумывай. Если подходящей команды в "
-        "списке нет — это НЕ os_command, ставь casual_talk.\n"
-        f"Доступные команды (теги): {tag_list}.\n"
-        "2. casual_talk — всё остальное: беседа, приветствие, вопрос о тебе или о "
-        "мире, просьба рассказать или найти что-то, шутка, «как дела», а также "
-        "вопрос о времени или заряде батареи.\n\n"
-        "ПОЛЯ JSON:\n"
-        "- intent: 'os_command' или 'casual_talk'.\n"
-        "- payload: для os_command — РОВНО один тег из списка выше; для casual_talk — 'none'.\n"
-        "- speech_response: ТОЛЬКО для os_command — короткое подтверждение в "
-        "характере, ОДНОЙ фразой, на русском, с обращением «сэр», без острот и "
-        "лишних слов (например «Выключаю Wi-Fi, сэр», «Сделано, сэр», "
-        "«Запускаю Telegram, сэр»). Для casual_talk оставь пустую строку.\n"
-    )
-
-
 class CoreModule(JarvisModule):
-    """«Мозг»: преобразует текст пользователя в реплику и тег команды."""
+    """«Мозг»: преобразует текст пользователя в тег команды и реплику-подтверждение."""
 
     def __init__(self):
         super().__init__("jarvis-core")
-        # История диспетчера: до HISTORY_SIZE пар user/assistant -> 2 сообщения на пару.
-        self._history: deque = deque(maxlen=config.HISTORY_SIZE * 2)
-        # История команд (структурно) — последние 3, на будущее для commands.yaml-фич.
-        self._cmd_history: deque = deque(maxlen=3)
-        self._client = ollama.Client(host=config.OLLAMA_HOST)
-        # Карта команд — общий источник для промпта диспетчера и инструментов мозга.
         commands = _load_commands()
-        # Мозг-агент: беседу и сложные/составные запросы ведёт Gemini с function calling
-        # (или офлайн-фоллбэк). Команды управления он выполняет через jarvis/execute.
-        self._brain = Brain(self.log, self._execute_command, commands)
+        # Матчер: правила (мгновенно) + эмбеддинги (лениво, при промахе правил).
+        self._matcher = Matcher(commands)
+        # Один разбор за раз: на N100 нет смысла молотить эмбеддинги в несколько потоков.
         self._lock = threading.Lock()
-        self._system_prompt = _build_system_prompt(commands)
 
     def on_start(self):
         self.subscribe(contracts.TOPIC_INPUT, self.on_input)
@@ -101,116 +58,46 @@ class CoreModule(JarvisModule):
         text = (payload.get("text") or "").strip()
         if not text:
             return
-        # Обработку выносим в поток, чтобы не блокировать MQTT-loop
+        # Обработку выносим в поток, чтобы не блокировать MQTT-loop.
         threading.Thread(target=self._process, args=(text,), daemon=True).start()
 
     def _process(self, text: str):
-        # Один LLM-запрос за раз: на N100 нельзя держать две сессии в RAM.
-        # Весь обработчик под защитой: непредвиденный сбой не должен убить рабочий
-        # поток молча и не должен оставить шину висеть в состоянии thinking.
+        # Весь обработчик под защитой: непредвиденный сбой не должен убить рабочий поток
+        # и не должен оставить шину висеть в состоянии thinking.
         with self._lock:
             try:
                 self.set_state(contracts.STATE_THINKING)
-                messages = (
-                    [{"role": "system", "content": self._system_prompt}]
-                    + list(self._history)
-                    + [{"role": "user", "content": text}]
-                )
-                try:
-                    result = self._ask_ollama(messages)
-                except Exception as exc:
-                    # Локальный диспетчер не ответил/не разобрался даже после ретраев —
-                    # НЕ падаем, деградируем в характере. Точный диагноз — человеку в лог,
-                    # трасса — на DEBUG (чтобы лог не зарастал стеками при флапе Ollama).
-                    self.log.error(
-                        "Локальный диспетчер (Ollama) недоступен: %s — отвечаю в характере",
-                        classify_ollama_error(exc),
-                    )
-                    self.log.debug("Трасса ошибки Ollama (диспетчер)", exc_info=True)
-                    self.say("Прошу прощения, сэр — мой локальный мыслительный модуль "
-                             "временно недоступен.")
-                    self.set_state(contracts.STATE_IDLE)
+
+                # 1) Встроенные info-ответы (офлайн, без матчера).
+                info = self._local_info_answer(text)
+                if info is not None:
+                    self.say(info)
                     return
 
-                # Выполняем интент и получаем финальную реплику (она пойдёт в историю).
-                reply = self._dispatch(text, result)
+                # 2) Распознавание команды матчером.
+                match = self._matcher.match(text)
+                if match is not None:
+                    speech = self._matcher.confirmation(match.tag)
+                    self.log.info("Команда распознана: %s (%s, %.3f) — %s",
+                                  match.tag, match.layer, match.score, text)
+                    self.say(speech)
+                    self._execute_command(match.tag)
+                    return
 
-                # Обновляем историю диспетчера (FIFO ограничен maxlen у deque):
-                # пара user → финальная произнесённая реплика.
-                self._history.append({"role": "user", "content": text})
-                self._history.append({"role": "assistant", "content": reply})
+                # 3) Не распознано — переспрос в характере (не падаем).
+                self.log.info("Не распознано: %s", text)
+                self.say(NOT_RECOGNIZED)
             except Exception:
-                # Подстраховка: любой непредвиденный сбой обработки — в лог по-человечески,
+                # Подстраховка: любой непредвиденный сбой — в лог по-человечески,
                 # состояние сбрасываем в idle, поток продолжает жить.
                 self.log_exc(logging.ERROR,
                              "Непредвиденный сбой обработки реплики — сбрасываю состояние")
                 self.set_state(contracts.STATE_IDLE)
 
-    def _ask_ollama(self, messages) -> contracts.JarvisResponse:
-        """Запрос к локальной модели с ретраями; вернуть разобранный JarvisResponse.
-
-        Ретраим сам сетевой вызов (на N100 Ollama может «подвиснуть» на загрузке модели —
-        даём ей второй шанс с backoff). Разбор схемы — после успешного ответа. Если все
-        попытки исчерпаны или ответ не разобрался — исключение уходит наверх, и _process
-        деградирует в характере, без падения сервиса.
-        """
-        def _call() -> str:
-            response = self._client.chat(
-                model=config.OLLAMA_MODEL,
-                messages=messages,
-                format=contracts.JarvisResponse.model_json_schema(),
-                keep_alive=config.OLLAMA_KEEP_ALIVE,
-            )
-            return response["message"]["content"]
-
-        content = with_retry(
-            _call,
-            attempts=config.OLLAMA_RETRIES,
-            delay=config.OLLAMA_RETRY_DELAY,
-            log=self.log,
-            what="Локальная модель (Ollama)",
-            classify=classify_ollama_error,
-        )
-        return contracts.JarvisResponse.model_validate_json(content)
-
-    def _dispatch(self, text: str, result: contracts.JarvisResponse) -> str:
-        """Выполнить намерение, озвучить реплику и вернуть её текст (для истории).
-
-        Реплику публикуем в jarvis/say — TTS подхватит и сам выставит speaking/idle.
-        idle здесь НЕ ставим: иначе на шине «вспышка» idle между thinking и speaking.
-        """
-        if (
-            result.intent == "os_command"
-            and result.payload
-            and result.payload != "none"
-        ):
-            # Подтверждение генерит локальная модель; подстраховка — на случай пустого.
-            speech = result.speech_response.strip() or "Сделано, сэр."
-            self.say(speech)
-            self._execute_command(result.payload)
-            self._cmd_history.append({
-                "intent": result.intent,
-                "tag": result.payload,
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-            })
-            return speech
-
-        # casual_talk (и os_command без валидного тега тоже трактуем как беседу).
-        # Сначала быстрые локальные инструменты (время/заряд — мгновенно, офлайн),
-        # иначе — Gemini-мозг с function calling (сложное/составное/беседа/состояние).
-        local = self._local_tool_answer(text)
-        if local is not None:
-            self.say(local)
-            return local
-        answer = self._brain.think(text)
-        self.say(answer)
-        return answer
-
     def _execute_command(self, tag: str) -> None:
         """Опубликовать команду на выполнение «Руками» (OS-агент) через jarvis/execute.
 
-        Единая точка запуска команд: и привратник (os_command), и Gemini-мозг
-        (function calling) идут сюда, а не дёргают shell. Само исполнение — у OS-агента.
+        Само исполнение — у OS-агента (allow-list, shell=False). Здесь только тег.
         """
         self.publish_json(
             contracts.TOPIC_EXECUTE,
@@ -218,11 +105,8 @@ class CoreModule(JarvisModule):
             qos=contracts.QOS_EXECUTE,
         )
 
-    def _local_tool_answer(self, text: str) -> str | None:
-        """Локальные инструменты (офлайн, без Gemini): время и заряд батареи.
-
-        Срабатывают только на явный вопрос — иначе None, и беседу ведёт casual-бэкенд.
-        """
+    def _local_info_answer(self, text: str) -> str | None:
+        """Встроенные офлайн-ответы: время и заряд батареи. Иначе None."""
         low = text.lower()
         if any(k in low for k in _TIME_KEYS):
             return f"Сейчас {datetime.now():%H:%M}, сэр."
@@ -231,7 +115,7 @@ class CoreModule(JarvisModule):
         return None
 
     def _battery_answer(self) -> str:
-        """Реальный заряд в характере Джарвиса (read-only-функция из brain — без дублей)."""
+        """Реальный заряд в характере Джарвиса (read-only-проба из sysinfo)."""
         data = read_battery()
         if data.get("батарея") == "не обнаружена":
             return "Батарея не обнаружена, сэр."

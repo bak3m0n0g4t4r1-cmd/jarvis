@@ -5,9 +5,9 @@
 компонент реально работает на ЭТОМ железе сейчас, и при провале даёт человеческое
 решение: что произошло → почему (по типу/коду ошибки) → точная команда/правка.
 
-Режим по умолчанию — ПОЛНАЯ глубокая проверка (живые тесты Ollama/Gemini/Piper,
-маршрут прокси, стабильность MQTT, здоровье юнитов, сквозная цепочка). Флаг
-`--quick` пропускает долгие/сетевые/платные тесты (живой Gemini тратит квоту).
+Режим по умолчанию — ПОЛНАЯ глубокая проверка (загрузка моделей движком, эмбеддер
+команд, синтез Piper, стабильность MQTT, здоровье юнитов, сквозная цепочка). Флаг
+`--quick` пропускает долгие тесты (синтез Piper, сквозная цепочка).
 Флаг `--deep` оставлен как no-op алиас (дефолт и так полный).
 
 Сам doctor не падает: каждая проверка обёрнута в try-except И прогоняется через
@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 from jarvis import config, contracts
-from jarvis.resilience import classify_mqtt_error, classify_ollama_error
+from jarvis.resilience import classify_mqtt_error
 from jarvis.services_map import SERVICES
 from jarvis.ui import FAIL, OK, WARN, CheckResult, Reporter
 
@@ -29,9 +29,8 @@ from jarvis.ui import FAIL, OK, WARN, CheckResult, Reporter
 # --------------------------------------------------------------------------- #
 # Утилиты надёжности доктора
 # --------------------------------------------------------------------------- #
-# Классификаторы сбоёв (classify_ollama_error / classify_mqtt_error) переехали в
-# jarvis.resilience — единый источник человеческих диагнозов и для сервисов, и для
-# доктора (без дублирования). Импортируются выше.
+# Классификатор сбоя MQTT (classify_mqtt_error) живёт в jarvis.resilience — единый
+# источник человеческих диагнозов и для сервисов, и для доктора. Импортируется выше.
 def _safe(reporter: Reporter, func, *args) -> None:
     """Выполнить проверку, изолировав её падение: исключение ВНУТРИ проверки не
     должно ронять весь доктор. Проверка возвращает CheckResult или list[CheckResult];
@@ -84,7 +83,7 @@ def check_imports() -> list[CheckResult]:
     """Все зависимости реально импортируются (import, а не «пакет установлен»)."""
     modules = [
         "paho.mqtt.client", "pydantic", "yaml", "numpy",
-        "sounddevice", "ollama", "sherpa_onnx", "piper", "dotenv",
+        "sounddevice", "sherpa_onnx", "piper", "onnxruntime", "tokenizers",
     ]
     results = []
     for mod in modules:
@@ -123,8 +122,8 @@ def check_library_versions() -> list[CheckResult]:
                             reason=f"не удалось прочитать pyproject.toml: {exc}.",
                             fix="проверьте pyproject.toml")]
     # Либы, чьи версии реально влияют на поведение (имя пакета как в pyproject).
-    watched = {"google-genai", "paho-mqtt", "sherpa-onnx", "piper-tts",
-               "pydantic", "ollama", "numpy", "httpx"}
+    watched = {"onnxruntime", "tokenizers", "paho-mqtt", "sherpa-onnx",
+               "piper-tts", "pydantic", "numpy"}
     results = []
     for raw in deps:
         try:
@@ -152,11 +151,12 @@ def check_library_versions() -> list[CheckResult]:
 
 
 def check_env_file() -> list[CheckResult]:
-    """Разбор .env: дубли переменных и подозрительные значения ключей — с номерами строк.
+    """Разбор .env: дубли переменных и подозрительные значения — с номерами строк.
 
-    Подозрительное значение ключа (пробел/перенос внутри, имя GEMINI_API_KEY/KEY= внутри
-    значения) приводило к Illegal header value. Дубль переменной незаметно «перетирает»
-    значение. Значения секретов НЕ печатаем — только имя и номер строки.
+    Секретов в .env больше нет (облако удалено), но базовая гигиена полезна: дубль
+    переменной незаметно «перетирает» значение, а пробел/перенос внутри значения с
+    маркером KEY/TOKEN/SECRET/PASS — признак слипшихся строк. Значения НЕ печатаем —
+    только имя и номер строки.
     """
     env_path = config.BASE_DIR / ".env"
     if not env_path.exists():
@@ -184,12 +184,12 @@ def check_env_file() -> list[CheckResult]:
         else:
             seen[name] = i
         if any(m in name.upper() for m in secret_markers) and value:
-            if any(ch.isspace() for ch in value) or "GEMINI_API_KEY" in value or "KEY=" in value:
+            if any(ch.isspace() for ch in value) or "KEY=" in value:
                 results.append(CheckResult(
                     WARN, f".env: подозрительное значение {name}",
                     reason=f"строка {i}: пробел/перенос или имя переменной внутри значения "
-                           "(признак слипшихся строк; был Illegal header value).",
-                    fix=f"проверьте строку {i} в .env: значение без пробелов/переносов, один ключ",
+                           "(признак слипшихся строк).",
+                    fix=f"проверьте строку {i} в .env: значение без пробелов/переносов, одно на строку",
                 ))
     if not results:
         return [CheckResult(OK, f".env: {len(seen)} переменных, дублей и битых значений нет")]
@@ -210,6 +210,8 @@ def check_config_paths() -> list[CheckResult]:
         "zipformer bpe": Path(config.ZIPFORMER_BPE),
         "Piper-голос": Path(config.PIPER_MODEL),
         "Piper-config": Path(config.PIPER_CONFIG),
+        "эмбеддер (модель)": Path(config.EMBEDDER_MODEL),
+        "эмбеддер (токенизатор)": Path(config.EMBEDDER_TOKENIZER),
     }
     results = []
     for label, path in paths.items():
@@ -366,7 +368,7 @@ def check_hardware() -> list[CheckResult]:
             results.append(CheckResult(
                 WARN, "Память",
                 reason=f"мало свободной RAM: {detail}.",
-                fix="закройте лишнее; модели и Gemini требуют памяти — возможны своп и тормоза",
+                fix="закройте лишнее; модели STT/TTS и эмбеддер требуют памяти — возможны своп и тормоза",
             ))
         elif swap_total and swap_pct >= 50:
             results.append(CheckResult(
@@ -379,9 +381,9 @@ def check_hardware() -> list[CheckResult]:
     except Exception as exc:
         results.append(CheckResult(WARN, "Память",
                                    reason=f"не удалось прочитать /proc/meminfo: {exc}."))
-    # --- Загрузка CPU (переиспользуем read-only функцию мозга) ---
+    # --- Загрузка CPU (переиспользуем read-only пробу из sysinfo) ---
     try:
-        from jarvis.brain import read_system_load
+        from jarvis.sysinfo import read_system_load
 
         load = read_system_load()
         pct, l1, cores = (load.get("загрузка_cpu_процент"),
@@ -467,129 +469,89 @@ def check_mosquitto() -> CheckResult:
     )
 
 
-def check_ollama() -> CheckResult:
-    """HTTP к Ollama + наличие модели в списке (без долгой генерации)."""
-    # ВНИМАНИЕ: сверить API клиента ollama (структуру list()) с установленной версией.
-    try:
-        import ollama
-        client = ollama.Client(host=config.OLLAMA_HOST)
-        data = client.list()
-    except Exception as exc:
-        return CheckResult(
-            FAIL, "Ollama отвечает",
-            reason=f"сервер {config.OLLAMA_HOST}: {classify_ollama_error(exc)}.",
-            fix="ollama serve   (и проверьте JARVIS_OLLAMA_HOST)",
-        )
-    names = _ollama_model_names(data)
-    wanted = config.OLLAMA_MODEL
-    # Точное совпадение или совпадение по базовому имени до тега (model:tag)
-    if wanted in names or any(n.split(":")[0] == wanted.split(":")[0] for n in names):
-        return CheckResult(OK, f"Ollama: модель {wanted} доступна")
-    return CheckResult(
-        FAIL, f"Ollama: модель {wanted}",
-        reason="сервер отвечает, но модель не скачана на этой машине.",
-        fix=f"ollama pull {wanted}",
-    )
+class _DisabledEmbedder:
+    """Заглушка эмбеддера для проверки СЛОЯ ПРАВИЛ без загрузки ONNX-модели."""
+
+    def encode(self, texts):
+        return None
 
 
-def _ollama_model_names(data) -> list[str]:
-    """Извлечь имена моделей из разнообразных форматов ответа list()."""
-    models = []
-    raw = getattr(data, "models", None)
-    if raw is None and isinstance(data, dict):
-        raw = data.get("models", [])
-    for item in raw or []:
-        name = getattr(item, "model", None) or getattr(item, "name", None)
-        if name is None and isinstance(item, dict):
-            name = item.get("model") or item.get("name")
-        if name:
-            models.append(name)
-    return models
+def check_embedder() -> CheckResult:
+    """Эмбеддер команд (rubert-tiny2 ONNX) реально грузится и даёт осмысленные векторы.
 
-
-def check_gemini() -> CheckResult:
-    """Casual-бэкенд: при gemini — есть ли пакет и ключ (без сетевого запроса).
-
-    Gemini опционален: при отсутствии пакета/ключа беседа уходит в офлайн-фоллбэк,
-    поэтому это WARN (не блокер) — doctor остаётся зелёным, но честно предупреждает.
+    Проверяем не «файл на месте», а работоспособность: модель грузится onnxruntime,
+    токенизатор читается, и похожие фразы оказываются ближе разных (санити-разделение).
+    Матчер при сбое эмбеддера деградирует на слой правил, но зелёный doctor должен
+    означать, что выбранный слой эмбеддингов реально работает → при провале FAIL.
     """
-    if config.CASUAL_BACKEND != "gemini":
-        return CheckResult(OK, f"Casual-бэкенд: локальный режим ({config.CASUAL_BACKEND})")
-    try:
-        import google.genai  # noqa: F401
-    except Exception as exc:
+    from jarvis import matcher
+
+    sep = matcher.sanity_separation()
+    if sep is None:
         return CheckResult(
-            WARN, "Gemini casual-бэкенд",
-            reason=f"пакет google-genai не импортируется ({exc}); беседа уйдёт в офлайн-фоллбэк.",
-            fix="pip install -e .  (или JARVIS_CASUAL_BACKEND=local)",
+            FAIL, "Эмбеддер команд (rubert-tiny2)",
+            reason="модель/токенизатор не загрузились или не дали векторов.",
+            fix="jarvis models --download  (или сверьте JARVIS_EMBEDDER_MODEL/_TOKENIZER; "
+                "pip install -e . для onnxruntime/tokenizers)",
         )
-    if not config.GEMINI_API_KEYS:
+    similar, different = sep
+    if similar <= different:
         return CheckResult(
-            WARN, "Gemini casual-бэкенд",
-            reason="ключи Gemini не заданы — беседа будет уходить в офлайн-фоллбэк.",
-            fix="впишите GEMINI_API_KEY в .env (см. .env.example) или JARVIS_CASUAL_BACKEND=local",
+            FAIL, "Эмбеддер команд (rubert-tiny2)",
+            reason=f"векторы неосмысленны: похожие {similar:.3f} ≤ разные {different:.3f}.",
+            fix="сверьте модель эмбеддера и пулинг (mean) в jarvis/matcher.py",
         )
-    grounding = "вкл" if config.GEMINI_GROUNDING else "выкл"
-    proxy = ", через прокси" if config.GEMINI_PROXY else ""
     return CheckResult(
         OK,
-        f"Gemini casual-бэкенд: модель {config.GEMINI_MODEL}, grounding {grounding}{proxy}, "
-        f"ключей: {len(config.GEMINI_API_KEYS)}",
-    )
+        f"Эмбеддер команд грузится и осмыслен (похожие {similar:.3f} > разные {different:.3f})")
 
 
-def check_brain_tools() -> CheckResult:
-    """Инструменты Gemini-мозга собираются: команды commands.yaml + read-only (без сети).
+def check_matcher() -> CheckResult:
+    """Матчер реально распознаёт команды из commands.yaml (слой ПРАВИЛ, без сети).
 
-    Только сборка function declarations и валидность имён — живого вызова нет. При
-    бэкенде не-gemini инструменты не используются, но сборка всё равно валидна.
-    Опционально (google-genai/ключи) → WARN, не FAIL.
+    Для каждой команды берём её ПЕРВЫЙ синоним и убеждаемся, что матчер вернул именно
+    её тег. Это ловит опечатки в синонимах, пересечения и регрессии нормализации —
+    «работает», а не «существует». Команды без синонимов подсвечиваем (их не распознать).
     """
-    if config.CASUAL_BACKEND != "gemini":
-        return CheckResult(OK, f"Инструменты мозга: пропущено (бэкенд {config.CASUAL_BACKEND})")
-    try:
-        import yaml
+    import yaml
 
+    from jarvis import matcher as matcher_mod
+
+    try:
         with open(config.COMMANDS_FILE, encoding="utf-8") as f:
             commands = yaml.safe_load(f) or {}
     except Exception as exc:
+        return CheckResult(WARN, "Матчер команд",
+                           reason=f"не удалось прочитать {config.COMMANDS_FILE}: {exc}.",
+                           fix="проверьте синтаксис commands.yaml")
+    if not commands:
+        return CheckResult(WARN, "Матчер команд", reason="карта команд пуста.",
+                           fix="добавьте команды в commands.yaml")
+    # Только правила: эмбеддер не трогаем (его проверяет check_embedder отдельно).
+    m = matcher_mod.Matcher(commands, embedder=_DisabledEmbedder())
+    no_synonyms = [t for t, s in commands.items() if not (s or {}).get("синонимы")]
+    wrong = []
+    for tag, spec in commands.items():
+        synonyms = (spec or {}).get("синонимы") or []
+        if not synonyms:
+            continue
+        got = m.match(synonyms[0])
+        if got is None or got.tag != tag:
+            wrong.append(f"{tag}→{got.tag if got else '∅'}")
+    if wrong:
         return CheckResult(
-            WARN, "Инструменты мозга (function calling)",
-            reason=f"не удалось прочитать {config.COMMANDS_FILE}: {exc}.",
-            fix="проверьте синтаксис commands.yaml",
+            FAIL, "Матчер команд",
+            reason=f"первый синоним распознан неверно: {', '.join(wrong)}.",
+            fix="поправьте синонимы в commands.yaml (уникальные, без пересечений)",
         )
-    try:
-        import re
-
-        from jarvis import brain
-
-        tools = brain.build_function_tools(commands)
-        decls = (tools[0].function_declarations if tools else []) or []
-        names = [d.name for d in decls]
-        if not names:
-            return CheckResult(
-                WARN, "Инструменты мозга (function calling)",
-                reason="не собрано ни одной функции (пустая карта команд?).",
-                fix="добавьте команды в commands.yaml",
-            )
-        bad = [n for n in names if not n or not re.fullmatch(r"[A-Za-z0-9_]+", n)]
-        if bad:
-            return CheckResult(
-                WARN, "Инструменты мозга (function calling)",
-                reason=f"имена функций невалидны для Gemini: {bad}.",
-                fix="теги commands.yaml — латиница/цифры/подчёркивание (как имена функций)",
-            )
+    if no_synonyms:
         return CheckResult(
-            OK,
-            f"Инструменты мозга: {len(commands)} команд + {len(brain.READONLY_TOOLS)} "
-            f"состояния (function calling)",
+            WARN, "Матчер команд",
+            reason=f"у команд нет синонимов (их не распознать правилами): {', '.join(no_synonyms)}.",
+            fix="добавьте поле «синонимы» этим командам в commands.yaml",
         )
-    except Exception as exc:
-        return CheckResult(
-            WARN, "Инструменты мозга (function calling)",
-            reason=f"сборка инструментов упала: {exc}.",
-            fix="pip install -e .  (нужен google-genai) или JARVIS_CASUAL_BACKEND=local",
-        )
+    return CheckResult(
+        OK, f"Матчер: {len(commands)} команд распознаются по синонимам (правила)")
 
 
 def check_audio() -> list[CheckResult]:
@@ -615,55 +577,6 @@ def check_audio() -> list[CheckResult]:
                                reason="не найдено ни одного устройства воспроизведения.",
                                fix="проверьте вывод звука: wpctl status"))
     return results
-
-
-def _proxy_external_ip(timeout: float = 8.0) -> tuple[str, str]:
-    """Внешний IP и страна (ISO) ЧЕРЕЗ прокси Gemini. Бросает при сбое/отсутствии httpx.
-
-    Тот же proxy, что у Gemini-клиента — подтверждает, что облачный трафик реально идёт
-    через прокси. Системный/пентест-трафик это не затрагивает (разовый запрос только
-    этого клиента). Используется и в маршруте прокси, и в живом тесте Gemini.
-    """
-    import httpx
-
-    with httpx.Client(proxy=config.GEMINI_PROXY, timeout=timeout) as client:
-        data = client.get("https://ipinfo.io/json").json()
-    return (data.get("ip") or "?", (data.get("country") or "").upper())
-
-
-def check_proxy_route() -> CheckResult:
-    """Реальный маршрут прокси Gemini: внешний IP и страна ЧЕРЕЗ тот же прокси-клиент.
-
-    «Прокси задан» ≠ «трафик идёт через него». Делаем запрос к сервису определения IP с
-    тем же proxy, что у Gemini-клиента, и показываем внешний IP/страну. Российский IP или
-    молчащий прокси → WARN (Gemini упрётся в геоблок). Без прокси — инфо «напрямую».
-    Системный/пентест-трафик это не затрагивает — разовый запрос только этого клиента.
-    """
-    if not config.GEMINI_PROXY:
-        return CheckResult(OK, "Прокси Gemini не задан (облако — напрямую)")
-    try:
-        import httpx  # noqa: F401
-    except Exception as exc:
-        return CheckResult(WARN, "Маршрут прокси Gemini",
-                           reason=f"httpx недоступен: {exc}.", fix="pip install -e .")
-    try:
-        ip, country = _proxy_external_ip()
-    except Exception as exc:
-        from jarvis.casual import classify_gemini_error
-
-        return CheckResult(
-            WARN, "Маршрут прокси Gemini",
-            reason=f"прокси не отвечает: {classify_gemini_error(exc)}.",
-            fix="проверьте JARVIS_GEMINI_PROXY (адрес/логин/пароль) и доступность прокси",
-        )
-    if not country or country == "RU":
-        return CheckResult(
-            WARN, "Маршрут прокси Gemini",
-            reason=f"внешний IP {ip}, страна {country or '?'} — не зарубежная; "
-                   "Gemini упрётся в геоблок.",
-            fix="нужен прокси с зарубежным IP (см. CLAUDE.md, раздел «Прокси»)",
-        )
-    return CheckResult(OK, f"Маршрут прокси Gemini: внешний IP {ip}, страна {country}")
 
 
 def check_mqtt_stability(quick: bool = False) -> CheckResult:
@@ -1067,40 +980,6 @@ def check_heartbeat() -> list[CheckResult]:
 # --------------------------------------------------------------------------- #
 # Слой 2/3 (--deep): реально долгие живые тесты
 # --------------------------------------------------------------------------- #
-def check_ollama_generation() -> CheckResult:
-    """Пробная генерация Ollama → валидация ответа через JarvisResponse."""
-    try:
-        import ollama
-        client = ollama.Client(host=config.OLLAMA_HOST)
-    except Exception as exc:
-        return CheckResult(FAIL, "Ollama: генерация + схема",
-                           reason=f"клиент недоступен: {classify_ollama_error(exc)}",
-                           fix="ollama serve")
-    try:
-        response = client.chat(
-            model=config.OLLAMA_MODEL,
-            messages=[{"role": "user", "content": "джарвис, скажи что-нибудь короткое"}],
-            format=contracts.JarvisResponse.model_json_schema(),
-            keep_alive=config.OLLAMA_KEEP_ALIVE,
-        )
-        content = response["message"]["content"]
-    except Exception as exc:
-        return CheckResult(
-            FAIL, "Ollama: генерация + схема",
-            reason=f"модель {config.OLLAMA_MODEL}: {classify_ollama_error(exc)}.",
-            fix=f"ollama run {config.OLLAMA_MODEL}  — проверьте, что модель рабочая",
-        )
-    try:
-        contracts.JarvisResponse.model_validate_json(content)
-        return CheckResult(OK, "Ollama: генерация даёт валидный JarvisResponse")
-    except Exception as exc:
-        return CheckResult(
-            FAIL, "Ollama: генерация + схема",
-            reason=f"модель отвечает, но JSON не проходит схему: {exc}.",
-            fix="проверьте системный промпт/формат; при необходимости поднимите модель до 1.5b",
-        )
-
-
 def check_piper_synthesis() -> CheckResult:
     """Голос Piper реально синтезирует тестовый сэмпл (не пустой звук).
 
@@ -1122,142 +1001,6 @@ def check_piper_synthesis() -> CheckResult:
         return CheckResult(FAIL, "Piper синтезирует звук",
                            reason=f"сбой синтеза: {exc}",
                            fix="jarvis models --download; сверьте API piper-tts")
-
-
-def check_gemini_live() -> CheckResult:
-    """Живой запрос к Gemini: реальный ответ в пределах таймаута (только --deep).
-
-    Гоняем через настоящий CasualBackend — заодно проверяем ключ, сеть, имя модели
-    и grounding-конфиг. Если вернулся офлайн-фоллбэк, значит облако не ответило.
-    """
-    if config.CASUAL_BACKEND != "gemini":
-        return CheckResult(OK, f"Gemini: живой тест пропущен (бэкенд {config.CASUAL_BACKEND})")
-    if not config.GEMINI_API_KEYS:
-        return CheckResult(
-            WARN, "Gemini: живой ответ",
-            reason="ключи Gemini не заданы — живой тест пропущен.",
-            fix="впишите GEMINI_API_KEY в .env (см. .env.example)",
-        )
-    try:
-        import logging
-
-        from jarvis import casual
-
-        backend = casual.CasualBackend(logging.getLogger("jarvis-doctor-gemini"))
-        answer = backend.reply("Ответь одним коротким словом для проверки связи.")
-    except Exception as exc:
-        # Gemini опционален (есть офлайн-фоллбэк), поэтому недоступность — WARN, не блокер.
-        return CheckResult(
-            WARN, "Gemini: живой ответ",
-            reason=f"запрос упал: {exc}",
-            fix="проверьте GEMINI_API_KEY, сеть и имя модели JARVIS_GEMINI_MODEL",
-        )
-    # Внешний IP через прокси — подтверждение, что облачный трафик реально идёт через
-    # прокси (и подсказка при гео-блоке). Best-effort: короткий таймаут, на сбое пропускаем.
-    ip_info = ""
-    if config.GEMINI_PROXY:
-        try:
-            ip, country = _proxy_external_ip(timeout=6.0)
-            ip_info = f", внешний IP {ip} ({country or '?'})"
-        except Exception:
-            pass
-
-    if answer in (casual._FALLBACK_FIRST, casual._FALLBACK_AGAIN):
-        # backend прогнан тем же путём, что casual (включая прокси), поэтому диагноз
-        # из last_error точный: гео-блок/квота/ключ/503/504/сеть, а не ложное «429».
-        diag = backend.last_error or "облако недоступно, неверный ключ или имя модели"
-        return CheckResult(
-            WARN, "Gemini: живой ответ",
-            reason=f"вернулся офлайн-фоллбэк: {diag}{ip_info}.",
-            fix="проверьте GEMINI_API_KEY, JARVIS_GEMINI_PROXY, сеть и "
-                "JARVIS_GEMINI_MODEL; см. logs/jarvis-core.log",
-        )
-    proxy = " (через прокси)" if config.GEMINI_PROXY else ""
-    # На каком по счёту ключе прошёл запрос — видно, сработала ли ротация.
-    total = len(config.GEMINI_API_KEYS)
-    on_key = f", на ключе #{backend._key_index + 1} из {total}" if total > 1 else ""
-    # С какой попытки прошло (ретраи на 503/504 + ротация) — видно, что retry сработал.
-    on_attempt = f", с попытки {backend.last_attempt}" if backend.last_attempt > 1 else ""
-    # grounding мог отвалиться (квота веб-поиска/таймаут), но обычная генерация работает —
-    # это НЕ исчерпание ключа: честно отделяем «ключ жив, свежих фактов нет».
-    if config.GEMINI_GROUNDING and not backend._grounding:
-        diag = backend.last_grounding_error or "квота веб-поиска исчерпана"
-        return CheckResult(
-            WARN, "Gemini: живой ответ",
-            reason=f"ответ получен{on_key}{on_attempt}{proxy}, но grounding (веб-поиск) "
-                   f"недоступен: {diag}{ip_info}.",
-            fix="не критично — ключ работает; свежие факты (погода/курсы/новости) недоступны: "
-                "добавьте ключи GEMINI_API_KEY_2..5 или примите работу без веб-поиска",
-        )
-    return CheckResult(OK,
-                       f"Gemini: живой ответ получен{on_key}{on_attempt}{proxy}{ip_info}")
-
-
-def check_brain_live() -> CheckResult:
-    """Живой прогон function calling (--deep): Gemini вызывает read-only функцию.
-
-    Вопрос про загрузку системы минует локальный перехват времени/заряда и должен
-    спровоцировать вызов get_system_load. Успех — был хотя бы один вызов инструмента и
-    ответ не офлайн-фоллбэк. Облако опционально → WARN при недоступности, не FAIL.
-    Команды управления в тесте не исполняются: execute-колбэк лишь копит теги.
-    """
-    if config.CASUAL_BACKEND != "gemini":
-        return CheckResult(OK, f"Мозг: тест function calling пропущен (бэкенд {config.CASUAL_BACKEND})")
-    if not config.GEMINI_API_KEYS:
-        return CheckResult(
-            WARN, "Мозг: function calling",
-            reason="ключи Gemini не заданы — живой тест пропущен.",
-            fix="впишите GEMINI_API_KEY в .env (см. .env.example)",
-        )
-    try:
-        import logging
-
-        import yaml
-
-        from jarvis import brain, casual
-
-        with open(config.COMMANDS_FILE, encoding="utf-8") as f:
-            commands = yaml.safe_load(f) or {}
-        executed: list[str] = []
-        backend = brain.Brain(
-            logging.getLogger("jarvis-doctor-brain"),
-            lambda tag: executed.append(tag),  # в тесте команды не исполняем
-            commands,
-        )
-        answer = backend.think("Какая сейчас загрузка системы?")
-    except Exception as exc:
-        return CheckResult(
-            WARN, "Мозг: function calling",
-            reason=f"прогон упал: {exc}.",
-            fix="проверьте google-genai, GEMINI_API_KEY и сеть",
-        )
-    if answer in (casual._FALLBACK_FIRST, casual._FALLBACK_AGAIN):
-        diag = backend.last_error or "облако недоступно"
-        return CheckResult(
-            WARN, "Мозг: function calling",
-            reason=f"вернулся офлайн-фоллбэк: {diag}.",
-            fix="проверьте GEMINI_API_KEY, JARVIS_GEMINI_PROXY, сеть; logs/jarvis-core.log",
-        )
-    if not backend.last_tool_calls:
-        return CheckResult(
-            WARN, "Мозг: function calling",
-            reason="ответ получен, но Gemini не вызвал ни одной функции.",
-            fix="сверьте описания инструментов; возможно, модель ответила без вызова",
-        )
-    proxy = " (через прокси)" if config.GEMINI_PROXY else ""
-    # Функции отработали; отдельно отметим, если grounding отвалился по своей квоте.
-    if config.GEMINI_GROUNDING and not backend._grounding:
-        diag = backend.last_grounding_error or "квота веб-поиска исчерпана"
-        return CheckResult(
-            WARN, "Мозг: function calling",
-            reason=f"функции работают (вызвано {backend.last_tool_calls}){proxy}, но "
-                   f"grounding (веб-поиск) недоступен: {diag}.",
-            fix="не критично — мозг и команды работают; свежие факты недоступны: "
-                "добавьте ключи GEMINI_API_KEY_2..5 или примите работу без веб-поиска",
-        )
-    return CheckResult(
-        OK, f"Мозг: function calling работает — вызвано {backend.last_tool_calls}{proxy}"
-    )
 
 
 def live_chain_test() -> bool:
@@ -1303,10 +1046,10 @@ def live_chain_test() -> bool:
         client.publish(contracts.TOPIC_EXECUTE, '{"command_tag":"__doctor_probe__"}',
                        qos=contracts.QOS_EXECUTE)
         time.sleep(2.0)
-        # 3) input → должен ответить «Мозг» (state=thinking + say)
-        reporter.note("публикую jarvis/input и жду реакции «Мозга» (может быть долго)…")
+        # 3) input → должен ответить «Мозг» (state=thinking + say-переспрос)
+        reporter.note("публикую jarvis/input (нераспознанная фраза) и жду реакции «Мозга»…")
         client.publish(contracts.TOPIC_INPUT, '{"text":"джарвис как дела"}')
-        time.sleep(8.0)
+        time.sleep(3.0)
     finally:
         try:
             client.loop_stop()
@@ -1340,9 +1083,9 @@ def live_chain_test() -> bool:
 # Оркестрация
 # --------------------------------------------------------------------------- #
 def run(quick: bool = False) -> bool:
-    """Полная глубокая диагностика (дефолт). quick=True пропускает долгие/сетевые/платные
-    тесты (живой Gemini тратит квоту, синтез/цепочка — секунды). Каждая проверка идёт
-    через _safe: её падение не роняет весь доктор.
+    """Полная глубокая диагностика (дефолт). quick=True пропускает долгие тесты
+    (синтез Piper, сквозная цепочка — секунды). Каждая проверка идёт через _safe:
+    её падение не роняет весь доктор.
     """
     reporter = Reporter()
 
@@ -1363,22 +1106,17 @@ def run(quick: bool = False) -> bool:
     if not quick:
         reporter.note("проверяю стабильность MQTT (≈5 c)…")
     _safe(reporter, check_mqtt_stability, quick)
-    _safe(reporter, check_ollama)
-    _safe(reporter, check_gemini)
-    _safe(reporter, check_brain_tools)
-    if not quick:
-        reporter.note("проверяю маршрут прокси Gemini (внешний IP)…")
-        _safe(reporter, check_proxy_route)
     _safe(reporter, check_audio)
 
-    reporter.section("Слой 4. Модели")
+    reporter.section("Слой 4. Модели и распознавание")
     reporter.note("загружаю модели движком…")
     _safe(reporter, check_sherpa_models)
     _safe(reporter, check_piper_voice)
     _safe(reporter, check_sample_rate)
+    reporter.note("проверяю эмбеддер команд (rubert-tiny2)…")
+    _safe(reporter, check_embedder)
+    _safe(reporter, check_matcher)
     if not quick:
-        reporter.note("пробная генерация Ollama…")
-        _safe(reporter, check_ollama_generation)
         reporter.note("синтез тестового сэмпла Piper…")
         _safe(reporter, check_piper_synthesis)
 
@@ -1387,13 +1125,6 @@ def run(quick: bool = False) -> bool:
     _safe(reporter, check_subscription_restore)
     _safe(reporter, check_service_health)
     _safe(reporter, check_heartbeat)
-
-    if not quick:
-        reporter.section("Слой 6. Облако и функции (живые)")
-        reporter.note("живой запрос к Gemini (ротация ключей/прокси)…")
-        _safe(reporter, check_gemini_live)
-        reporter.note("живой function-calling прогон мозга…")
-        _safe(reporter, check_brain_live)
 
     ok = reporter.summary()
 
