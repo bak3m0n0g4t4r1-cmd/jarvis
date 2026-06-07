@@ -105,13 +105,14 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 ```
 /home/tux/proj/jarvis/
 ├── pyproject.toml            # entry points: jarvis, jarvis-stt, jarvis-core, jarvis-os-agent, jarvis-tts
+├── settings.yaml             # ★ ЕДИНЫЙ файл ВСЕХ настраиваемых параметров (секции + русские комментарии)
 ├── commands.yaml             # тег → {описание, команда:[...], ждать_вывод, синонимы:[...], примеры:[...], подтверждение}
 ├── models.yaml               # карта моделей для загрузчика (zipformer, piper, эмбеддер rubert-tiny2)
-├── .env / .env.example       # .env в .gitignore; СЕКРЕТОВ НЕТ — только необязательные JARVIS_*-оверрайды
+├── .env / .env.example       # пусто; настройки теперь в settings.yaml (env JARVIS_* — опц. оверрайд)
 ├── jarvis/
 │   ├── bus.py                # JarvisModule: базовый класс (MQTT paho-2.x VERSION2, reconnect+backoff,
 │   │                         #   RotatingFileHandler, heartbeat, graceful shutdown, say/publish_json/set_state)
-│   ├── config.py             # всё через os.getenv с дефолтами; BASE_DIR = корень репо (без dotenv)
+│   ├── config.py             # ЕДИНАЯ загрузка settings.yaml (приоритет env→yaml→дефолт); BASE_DIR=корень
 │   ├── contracts.py          # топики + QoS + State + Intent=Literal["os_command"] (чистый typing, без pydantic)
 │   ├── matcher.py            # распознавание: правила + ONNX-эмбеддинги (rubert-tiny2)
 │   ├── sysinfo.py            # read-only пробы системы (заряд, загрузка CPU/RAM, громкость)
@@ -127,6 +128,12 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 
 **MQTT-топики:** `jarvis/input` {"text"} · `jarvis/execute` {"command_tag"} QoS1 ·
 `jarvis/say` {"text","source"} · `jarvis/state` {"state": idle|listening|thinking|speaking}.
+
+**Настройки** = ОДИН файл `settings.yaml` в корне (секции voice/adaptive_audio/hearing/
+recognition/system/models, русские комментарии к каждому параметру). Код читает ТОЛЬКО через
+`config.py` (единая загрузка: приоритет env `JARVIS_*` → `settings.yaml` → дефолт; отсутствие
+файла/параметра → дефолт, не падает). Менять параметр = править `settings.yaml`, Python не трогать.
+VAD-пороги (0.3/0.8) и анти-эхо в файле помечены ⚠ «настроено опытным путём».
 
 **Лего-модульность:** новые модули наследуют `JarvisModule` из `bus.py`. Не дублировать
 MQTT/логирование/shutdown — всё в базовом классе.

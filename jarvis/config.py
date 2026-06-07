@@ -1,162 +1,182 @@
-"""Общие настройки «Джарвиса».
+"""Общие настройки «Джарвиса» — ЕДИНАЯ точка загрузки из settings.yaml.
 
-Все параметры читаются из переменных окружения с разумными дефолтами,
-чтобы ничего не хардкодить и легко переопределять под конкретную машину.
+ВСЕ настраиваемые параметры живут в одном человекочитаемом файле `settings.yaml`
+(в корне проекта) с русскими комментариями. Здесь — загрузка этого файла, выбор
+источника значения и приведение типов. Имена переменных (VAD_THRESHOLD и т.п.)
+сохранены — их читает остальной код.
+
+Приоритет источников: переменная окружения JARVIS_* (опц. оверрайд, в т.ч. для
+systemd/отладки) → settings.yaml → разумный дефолт. Отсутствие файла/параметра НЕ
+роняет сервис (берётся дефолт); битый YAML — предупреждение в stderr + дефолты.
 """
 import os
+import sys
 from pathlib import Path
+
+import yaml
 
 # Корень проекта (jarvis/config.py -> на уровень выше пакета)
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Настройки берутся из переменных окружения с дефолтами. Секретов больше нет
-# (облако удалено), .env не обязателен; необязательные JARVIS_*-оверрайды для
-# сервисов systemd подхватывает сам через EnvironmentFile (см. cli.py/юниты).
+# Единый файл настроек (можно переопределить путь через JARVIS_SETTINGS).
+SETTINGS_FILE = os.getenv("JARVIS_SETTINGS", str(BASE_DIR / "settings.yaml"))
 
-MODELS_DIR = Path(os.getenv("JARVIS_MODELS_DIR", str(BASE_DIR / "models")))
-LOGS_DIR = Path(os.getenv("JARVIS_LOGS_DIR", str(BASE_DIR / "logs")))
+_SETTINGS: dict = {}
+try:
+    with open(SETTINGS_FILE, encoding="utf-8") as _f:
+        _SETTINGS = yaml.safe_load(_f) or {}
+except FileNotFoundError:
+    pass  # файла нет — работаем на дефолтах (+ возможные env-оверрайды)
+except Exception as _exc:  # битый YAML — НЕ падаем, предупреждаем и берём дефолты
+    print(f"[config] ВНИМАНИЕ: не удалось разобрать {SETTINGS_FILE}: {_exc} — беру дефолты",
+          file=sys.stderr)
+    _SETTINGS = {}
 
-# --- MQTT ---
-MQTT_HOST = os.getenv("JARVIS_MQTT_HOST", "localhost")
-MQTT_PORT = int(os.getenv("JARVIS_MQTT_PORT", "1883"))
-MQTT_KEEPALIVE = int(os.getenv("JARVIS_MQTT_KEEPALIVE", "60"))
-# Автопереподключение (экспоненциальный backoff между попытками, секунды).
-# Брокер локальный и поднимается быстро; на этой машине разрывы — это перезапуск
-# mosquitto и спящий режим (диагностировано по journalctl). Поэтому потолок мал (15с),
-# иначе после suspend Джарвис «глохнет» до ~2 мин, пока backoff дорастёт до старого max=60.
-MQTT_RECONNECT_MIN = float(os.getenv("JARVIS_MQTT_RECONNECT_MIN", "1"))
-MQTT_RECONNECT_MAX = float(os.getenv("JARVIS_MQTT_RECONNECT_MAX", "15"))
 
-# --- Аудио (захват/воспроизведение) ---
-SAMPLE_RATE = int(os.getenv("JARVIS_SAMPLE_RATE", "16000"))
-CHANNELS = 1
+def _cast(value, default):
+    """Привести значение к типу дефолта (bool/int/float/list/str)."""
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() not in ("0", "false", "no", "")
+    if isinstance(default, int) and not isinstance(default, bool):
+        return int(value)
+    if isinstance(default, float):
+        return float(value)
+    if isinstance(default, list):
+        if isinstance(value, list):
+            return [str(v) for v in value]
+        return [s.strip() for s in str(value).split(",") if s.strip()]
+    return str(value)
 
-# --- Wake-word ---
-# Список вариантов: zipformer-ru стабильно искажает «джарвис» → добавляй
-# реально встреченные искажения сюда, без правки кода.
-WAKE_WORDS = os.getenv("JARVIS_WAKE_WORDS", "джарвис,джарвиз,жарвис,жарвиз,сервис,джарвес").split(",")
-# Порог нечёткого совпадения (difflib ratio, 0–1): ниже — больше ложных срабатываний.
-WAKE_WORD_FUZZY_THRESHOLD = float(os.getenv("JARVIS_WAKE_WORD_FUZZY_THRESHOLD", "0.7"))
 
-# Защита от эхо-петли: пока Джарвис говорит (state=speaking), STT глушит вход.
-# «Хвост» — пауза после окончания речи перед возобновлением, чтобы не словить
-# конец фразы из колонок (с). 1.0с покрывает «звон» колонок и реверберацию,
-# которые остаются уже после того, как PortAudio считает буфер опустошённым.
-SPEAKING_TAIL = float(os.getenv("JARVIS_SPEAKING_TAIL", "1.0"))
-# Контент-фильтр эха (страховка): сколько секунд после возобновления слушания
-# сверять распознанное с последней фразой Джарвиса (с).
-ECHO_CONTENT_WINDOW = float(os.getenv("JARVIS_ECHO_CONTENT_WINDOW", "2.0"))
-# Порог похожести (difflib ratio 0–1): выше — фраза считается эхом и отбрасывается.
-ECHO_SIMILARITY_THRESHOLD = float(os.getenv("JARVIS_ECHO_SIMILARITY_THRESHOLD", "0.6"))
+def _get(section: str, key: str, default, env: str | None = None):
+    """Значение параметра: env-переменная → settings.yaml[section][key] → дефолт.
 
-# Минимальная длина аудиосегмента в семплах для подачи в zipformer-распознаватель.
-# Короче этого — гарантированный RuntimeError Reshape, модель не может обработать.
-# 8000 семплов = 0.5 с при 16 кГц, минимально стабильная длина для transducer.
-MIN_SEGMENT_SAMPLES = int(os.getenv("JARVIS_MIN_SEGMENT_SAMPLES", "8000"))
+    Всё в try-except: любой сбой приведения/чтения → дефолт (сервис не падает).
+    """
+    if env:
+        ev = os.getenv(env)
+        if ev is not None and ev != "":
+            try:
+                return _cast(ev, default)
+            except Exception:
+                pass
+    try:
+        sec = _SETTINGS.get(section) or {}
+        if key in sec and sec[key] is not None:
+            return _cast(sec[key], default)
+    except Exception:
+        pass
+    return default
 
-# --- STT: sherpa-onnx (silero-VAD + zipformer-ru offline transducer) ---
-VAD_MODEL = os.getenv("JARVIS_VAD_MODEL", str(MODELS_DIR / "silero_vad.onnx"))
-VAD_THRESHOLD = float(os.getenv("JARVIS_VAD_THRESHOLD", "0.3"))
-VAD_MIN_SILENCE = float(os.getenv("JARVIS_VAD_MIN_SILENCE", "0.8"))
-VAD_MIN_SPEECH = float(os.getenv("JARVIS_VAD_MIN_SPEECH", "0.25"))
-# Размер кольцевого буфера VAD (с). Команды короткие — 10с с запасом; меньше памяти,
-# чем прежние 30с. НЕ путать с порогами VAD (их НЕ трогаем).
-VAD_BUFFER_SECONDS = int(os.getenv("JARVIS_VAD_BUFFER_SECONDS", "10"))
-# Потоки sherpa-onnx (VAD + распознаватель). На N100 один поток экономнее и без
-# потоковой возни на крошечной модели — меньше CPU при постоянном прослушивании.
-STT_NUM_THREADS = int(os.getenv("JARVIS_STT_NUM_THREADS", "1"))
-# Архив распаковывается во вложенную папку — учитываем в пути.
+
+# === Пути и модели (секция models) ===
+MODELS_DIR = Path(_get("models", "models_dir", str(BASE_DIR / "models"), "JARVIS_MODELS_DIR"))
+LOGS_DIR = Path(_get("models", "logs_dir", str(BASE_DIR / "logs"), "JARVIS_LOGS_DIR"))
+COMMANDS_FILE = _get("models", "commands_file", str(BASE_DIR / "commands.yaml"), "JARVIS_COMMANDS_FILE")
+
+# === Система: MQTT, логи, heartbeat (секция system) ===
+MQTT_HOST = _get("system", "mqtt_host", "localhost", "JARVIS_MQTT_HOST")
+MQTT_PORT = _get("system", "mqtt_port", 1883, "JARVIS_MQTT_PORT")
+MQTT_KEEPALIVE = _get("system", "mqtt_keepalive", 60, "JARVIS_MQTT_KEEPALIVE")
+# Автопереподключение (экспоненциальный backoff, секунды). Потолок мал (15с): локальный
+# брокер поднимается быстро, после suspend Джарвис восстанавливается за ~15с, а не ~2 мин.
+MQTT_RECONNECT_MIN = _get("system", "mqtt_reconnect_min", 1.0, "JARVIS_MQTT_RECONNECT_MIN")
+MQTT_RECONNECT_MAX = _get("system", "mqtt_reconnect_max", 15.0, "JARVIS_MQTT_RECONNECT_MAX")
+LOG_MAX_BYTES = _get("system", "log_max_bytes", 2 * 1024 * 1024, "JARVIS_LOG_MAX_BYTES")
+LOG_BACKUP_COUNT = _get("system", "log_backup_count", 3, "JARVIS_LOG_BACKUP_COUNT")
+LOG_LEVEL = str(_get("system", "log_level", "INFO", "JARVIS_LOG_LEVEL")).strip().upper()
+# Раз в столько секунд каждый сервис пишет в лог «жив» (INFO). 0 — выключить.
+HEARTBEAT_INTERVAL = _get("system", "heartbeat_interval", 300.0, "JARVIS_HEARTBEAT_INTERVAL")
+
+# === Слух (STT): захват, wake-word, VAD, анти-эхо (секция hearing) ===
+SAMPLE_RATE = _get("hearing", "sample_rate", 16000, "JARVIS_SAMPLE_RATE")
+CHANNELS = 1  # моно (не настраивается — модели и весь конвейер рассчитаны на 1 канал)
+# Варианты wake-word: zipformer-ru искажает «джарвис» → добавляй встреченные искажения.
+WAKE_WORDS = _get("hearing", "wake_words",
+                  ["джарвис", "джарвиз", "жарвис", "жарвиз", "сервис", "джарвес"],
+                  "JARVIS_WAKE_WORDS")
+WAKE_WORD_FUZZY_THRESHOLD = _get("hearing", "wake_word_fuzzy_threshold", 0.7,
+                                 "JARVIS_WAKE_WORD_FUZZY_THRESHOLD")
+# Анти-эхо: «хвост» паузы после речи Джарвиса (с) — НАСТРОЕНО ОПЫТНО, менять осторожно.
+SPEAKING_TAIL = _get("hearing", "speaking_tail", 1.0, "JARVIS_SPEAKING_TAIL")
+ECHO_CONTENT_WINDOW = _get("hearing", "echo_content_window", 2.0, "JARVIS_ECHO_CONTENT_WINDOW")
+ECHO_SIMILARITY_THRESHOLD = _get("hearing", "echo_similarity_threshold", 0.6,
+                                 "JARVIS_ECHO_SIMILARITY_THRESHOLD")
+# Мин. длина сегмента (семплы) для zipformer: короче → RuntimeError Reshape. 8000 = 0.5с@16к.
+MIN_SEGMENT_SAMPLES = _get("hearing", "min_segment_samples", 8000, "JARVIS_MIN_SEGMENT_SAMPLES")
+# VAD-пороги — НАСТРОЕНЫ ОПЫТНЫМ ПУТЁМ. Менять осторожно: влияет на распознавание речи.
+VAD_THRESHOLD = _get("hearing", "vad_threshold", 0.3, "JARVIS_VAD_THRESHOLD")
+VAD_MIN_SILENCE = _get("hearing", "vad_min_silence", 0.8, "JARVIS_VAD_MIN_SILENCE")
+VAD_MIN_SPEECH = _get("hearing", "vad_min_speech", 0.25, "JARVIS_VAD_MIN_SPEECH")
+VAD_BUFFER_SECONDS = _get("hearing", "vad_buffer_seconds", 10, "JARVIS_VAD_BUFFER_SECONDS")
+STT_NUM_THREADS = _get("hearing", "stt_num_threads", 1, "JARVIS_STT_NUM_THREADS")
+# Источник захвата: пусто = системный default-микрофон; имя echo-cancel source → шумоподавление.
+STT_SOURCE = str(_get("hearing", "stt_source", "", "JARVIS_STT_SOURCE")).strip()
+
+# Пути моделей STT (выводятся из models_dir; обычно не трогают — можно задать явно).
+VAD_MODEL = _get("models", "vad_model", str(MODELS_DIR / "silero_vad.onnx"), "JARVIS_VAD_MODEL")
 _ZIPFORMER_DIR = MODELS_DIR / "sherpa-onnx-small-zipformer-ru-2024-09-18"
-ZIPFORMER_ENCODER = os.getenv(
-    "JARVIS_ZIPFORMER_ENCODER", str(_ZIPFORMER_DIR / "encoder.int8.onnx")
-)
-ZIPFORMER_DECODER = os.getenv(
-    "JARVIS_ZIPFORMER_DECODER", str(_ZIPFORMER_DIR / "decoder.int8.onnx")
-)
-ZIPFORMER_JOINER = os.getenv(
-    "JARVIS_ZIPFORMER_JOINER", str(_ZIPFORMER_DIR / "joiner.int8.onnx")
-)
-ZIPFORMER_TOKENS = os.getenv(
-    "JARVIS_ZIPFORMER_TOKENS", str(_ZIPFORMER_DIR / "tokens.txt")
-)
-ZIPFORMER_BPE = os.getenv(
-    "JARVIS_ZIPFORMER_BPE", str(_ZIPFORMER_DIR / "bpe.model")
-)
+ZIPFORMER_ENCODER = _get("models", "zipformer_encoder", str(_ZIPFORMER_DIR / "encoder.int8.onnx"),
+                         "JARVIS_ZIPFORMER_ENCODER")
+ZIPFORMER_DECODER = _get("models", "zipformer_decoder", str(_ZIPFORMER_DIR / "decoder.int8.onnx"),
+                         "JARVIS_ZIPFORMER_DECODER")
+ZIPFORMER_JOINER = _get("models", "zipformer_joiner", str(_ZIPFORMER_DIR / "joiner.int8.onnx"),
+                        "JARVIS_ZIPFORMER_JOINER")
+ZIPFORMER_TOKENS = _get("models", "zipformer_tokens", str(_ZIPFORMER_DIR / "tokens.txt"),
+                        "JARVIS_ZIPFORMER_TOKENS")
+ZIPFORMER_BPE = _get("models", "zipformer_bpe", str(_ZIPFORMER_DIR / "bpe.model"),
+                     "JARVIS_ZIPFORMER_BPE")
 
-# --- Распознавание команд: матчер (правила + ONNX-эмбеддинги, см. matcher.py) ---
-# Автономный лёгкий эмбеддер rubert-tiny2 (ONNX, через onnxruntime, без torch).
-# Считает семантическую близость, когда слой правил не дал уверенного ответа.
-EMBEDDER_DIR = Path(os.getenv("JARVIS_EMBEDDER_DIR", str(MODELS_DIR / "rubert-tiny2-onnx")))
-EMBEDDER_MODEL = os.getenv("JARVIS_EMBEDDER_MODEL", str(EMBEDDER_DIR / "model_optimized.onnx"))
-EMBEDDER_TOKENIZER = os.getenv("JARVIS_EMBEDDER_TOKENIZER", str(EMBEDDER_DIR / "tokenizer.json"))
-# Кеш эмбеддингов команд на диске (npz): считаются один раз, при старте берутся готовыми.
-MATCHER_CACHE = os.getenv("JARVIS_MATCHER_CACHE", str(EMBEDDER_DIR / "cmd_emb_cache.npz"))
-# Порог слоя ПРАВИЛ (difflib ratio 0–1): ниже — фраза не считается совпавшей с синонимом.
-MATCHER_FUZZY_THRESHOLD = float(os.getenv("JARVIS_MATCHER_FUZZY_THRESHOLD", "0.7"))
-# Порог слоя ЭМБЕДДИНГОВ (косинус 0–1): ниже — семантический поиск не уверен → переспрос.
-MATCHER_EMB_THRESHOLD = float(os.getenv("JARVIS_MATCHER_EMB_THRESHOLD", "0.6"))
-# Минимальный отрыв лучшего кандидата от второго (косинус). Меньше — кандидаты почти
-# равны (часто антонимы вроде вкл/выкл) → не угадываем, лучше переспросить.
-MATCHER_EMB_MARGIN = float(os.getenv("JARVIS_MATCHER_EMB_MARGIN", "0.04"))
+# === Распознавание команд: матчер (секция recognition) ===
+EMBEDDER_DIR = Path(_get("models", "embedder_dir", str(MODELS_DIR / "rubert-tiny2-onnx"),
+                         "JARVIS_EMBEDDER_DIR"))
+EMBEDDER_MODEL = _get("models", "embedder_model", str(EMBEDDER_DIR / "model_optimized.onnx"),
+                      "JARVIS_EMBEDDER_MODEL")
+EMBEDDER_TOKENIZER = _get("models", "embedder_tokenizer", str(EMBEDDER_DIR / "tokenizer.json"),
+                          "JARVIS_EMBEDDER_TOKENIZER")
+MATCHER_CACHE = _get("models", "matcher_cache", str(EMBEDDER_DIR / "cmd_emb_cache.npz"),
+                     "JARVIS_MATCHER_CACHE")
+# Порог слоя ПРАВИЛ (difflib 0–1): ниже — фраза не считается совпавшей с синонимом.
+MATCHER_FUZZY_THRESHOLD = _get("recognition", "fuzzy_threshold", 0.7, "JARVIS_MATCHER_FUZZY_THRESHOLD")
+# Порог слоя ЭМБЕДДИНГОВ (косинус 0–1): ниже — поиск не уверен → переспрос.
+MATCHER_EMB_THRESHOLD = _get("recognition", "emb_threshold", 0.6, "JARVIS_MATCHER_EMB_THRESHOLD")
+# Мин. отрыв лучшего кандидата от второго (косинус): меньше — кандидаты почти равны → переспрос.
+MATCHER_EMB_MARGIN = _get("recognition", "emb_margin", 0.04, "JARVIS_MATCHER_EMB_MARGIN")
 
-# --- TTS: Piper ---
-PIPER_MODEL = os.getenv("JARVIS_PIPER_MODEL", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx"))
-PIPER_CONFIG = os.getenv(
-    "JARVIS_PIPER_CONFIG", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx.json")
-)
+# === Голос (TTS): Piper + громкость (секция voice) ===
+PIPER_MODEL = _get("models", "piper_model", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx"),
+                   "JARVIS_PIPER_MODEL")
+PIPER_CONFIG = _get("models", "piper_config", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx.json"),
+                    "JARVIS_PIPER_CONFIG")
 # Sink PipeWire для воспроизведения (pw-cat --target). Пусто = системный default sink.
-# На TUXEDO sounddevice/PortAudio не видит аналоговый вывод (только HDMI) — играем через
-# PipeWire (pw-cat), иначе Джарвис нем (paInvalidSampleRate на 22050 Гц). См. tts.py.
-TTS_SINK = os.getenv("JARVIS_TTS_SINK", "").strip()
-# Греть Piper в фоне при старте (1) — первая фраза без ~3с задержки (ценой ~106 МБ RAM);
-# 0 — лениво (экономия RAM, но первая реплика ждёт загрузку голоса).
-TTS_PRELOAD = os.getenv("JARVIS_TTS_PRELOAD", "1") not in ("0", "false", "no", "")
+TTS_SINK = str(_get("voice", "tts_sink", "", "JARVIS_TTS_SINK")).strip()
+# Греть Piper при старте (true) — первая фраза без ~3с (ценой ~106 МБ RAM); false — лениво.
+TTS_PRELOAD = _get("voice", "preload", True, "JARVIS_TTS_PRELOAD")
 # Задержка узла pw-cat (мс): меньше — быстрее старт звука. 30 мс комфортно на N100.
-TTS_LATENCY_MS = int(os.getenv("JARVIS_TTS_LATENCY_MS", "30"))
-
-# --- STT: источник захвата (опц. шумоподавление через PipeWire echo-cancel) ---
-# Пусто = системный default-микрофон. Имя обработанного source (echo-cancel) → STT слушает его.
-STT_SOURCE = os.getenv("JARVIS_STT_SOURCE", "").strip()
-
-# --- Адаптивная громкость голоса (основа TTS, см. audio_env.py) ---
-# Меряем РЕАЛЬНЫЕ уровни сигнала (RMS 0..1), НЕ позиции регуляторов. Громкость голоса —
-# функция от внешнего шума И громкости речи пользователя: в тишине следуем за пользователем
-# (вплоть до шёпота), в шуме — за уровнем шума (разборчивость важнее).
-ADAPTIVE_VOLUME = os.getenv("JARVIS_ADAPTIVE_VOLUME", "1") not in ("0", "false", "no", "")
-# Порог реального уровня воспроизведения ноута (RMS monitor): выше — приглушаем музыку (ducking).
-DUCK_THRESHOLD = float(os.getenv("JARVIS_DUCK_THRESHOLD", "0.02"))
-# До какой доли громкости приглушать музыку (0.35 = 35%, НЕ в ноль — слышна фоном).
-DUCK_LEVEL = float(os.getenv("JARVIS_DUCK_LEVEL", "0.35"))
-# Связь «колонки→микрофон»: внешний шум = mic_rms − k·monitor_rms (вычесть свой звук из ноута).
-NOISE_SUBTRACT_K = float(os.getenv("JARVIS_NOISE_SUBTRACT_K", "0.7"))
-# Порог «тихо вокруг» (RMS внешнего шума): ниже — громкость следует за речью пользователя,
-# выше — за шумом (разборчивость важнее тихости пользователя).
-QUIET_THRESHOLD = float(os.getenv("JARVIS_QUIET_THRESHOLD", "0.015"))
-# Громкость голоса pw-cat (0..1): мин (шёпот в полной тишине), база (норма), макс (до gain).
-VOICE_VOLUME_MIN = float(os.getenv("JARVIS_VOICE_VOLUME_MIN", "0.35"))
-VOICE_VOLUME_BASE = float(os.getenv("JARVIS_VOICE_VOLUME_BASE", "0.7"))
-VOICE_VOLUME_MAX = float(os.getenv("JARVIS_VOICE_VOLUME_MAX", "1.0"))
+TTS_LATENCY_MS = _get("voice", "latency_ms", 30, "JARVIS_TTS_LATENCY_MS")
+# Базовая громкость голоса (0..1) — ОТПРАВНАЯ ТОЧКА адаптации (поверх: шум/шёпот/ducking).
+VOICE_VOLUME_BASE = _get("voice", "base_volume", 0.85, "JARVIS_VOICE_VOLUME_BASE")
+VOICE_VOLUME_MIN = _get("voice", "volume_min", 0.35, "JARVIS_VOICE_VOLUME_MIN")
+VOICE_VOLUME_MAX = _get("voice", "volume_max", 1.0, "JARVIS_VOICE_VOLUME_MAX")
 # Макс программное усиление PCM при сильном шуме (>1.0 = громче нормы; на пиках возможен клиппинг).
-VOICE_GAIN_MAX = float(os.getenv("JARVIS_VOICE_GAIN_MAX", "1.5"))
-# Чувствительность: насколько громкость следует за шумом / за громкостью речи пользователя.
-NOISE_TO_VOLUME = float(os.getenv("JARVIS_NOISE_TO_VOLUME", "3.0"))
-USER_TO_VOLUME = float(os.getenv("JARVIS_USER_TO_VOLUME", "4.0"))
+VOICE_GAIN_MAX = _get("voice", "gain_max", 1.5, "JARVIS_VOICE_GAIN_MAX")
+
+# === Адаптивная громкость: реальные уровни сигнала RMS (секция adaptive_audio) ===
+ADAPTIVE_VOLUME = _get("adaptive_audio", "enabled", True, "JARVIS_ADAPTIVE_VOLUME")
+# Порог реального уровня воспроизведения ноута (RMS monitor): выше — приглушаем музыку (ducking).
+DUCK_THRESHOLD = _get("adaptive_audio", "duck_threshold", 0.02, "JARVIS_DUCK_THRESHOLD")
+# До какой доли громкости приглушать музыку (0.35 = 35%, НЕ в ноль — слышна фоном).
+DUCK_LEVEL = _get("adaptive_audio", "duck_level", 0.35, "JARVIS_DUCK_LEVEL")
+# Связь «колонки→микрофон»: внешний шум = mic_rms − k·monitor_rms (вычесть свой звук из ноута).
+NOISE_SUBTRACT_K = _get("adaptive_audio", "noise_subtract_k", 0.7, "JARVIS_NOISE_SUBTRACT_K")
+# Порог «тихо вокруг» (RMS внешнего шума): ниже — громкость следует за речью пользователя.
+QUIET_THRESHOLD = _get("adaptive_audio", "quiet_threshold", 0.015, "JARVIS_QUIET_THRESHOLD")
+# Чувствительность громкости к шуму / к громкости речи пользователя.
+NOISE_TO_VOLUME = _get("adaptive_audio", "noise_to_volume", 3.0, "JARVIS_NOISE_TO_VOLUME")
+USER_TO_VOLUME = _get("adaptive_audio", "user_to_volume", 4.0, "JARVIS_USER_TO_VOLUME")
 # Скорость плавных переходов громкости/ducking (доля приближения к цели за шаг рампы, 0..1).
-VOLUME_RAMP = float(os.getenv("JARVIS_VOLUME_RAMP", "0.25"))
+VOLUME_RAMP = _get("adaptive_audio", "volume_ramp", 0.25, "JARVIS_VOLUME_RAMP")
 # Окно/период замера RMS фоновыми замерщиками (с) — короткое, лёгкое по CPU.
-NOISE_WINDOW = float(os.getenv("JARVIS_NOISE_WINDOW", "0.1"))
-
-# --- OS-агент ---
-COMMANDS_FILE = os.getenv("JARVIS_COMMANDS_FILE", str(BASE_DIR / "commands.yaml"))
-
-# --- Логирование ---
-LOG_MAX_BYTES = int(os.getenv("JARVIS_LOG_MAX_BYTES", str(2 * 1024 * 1024)))
-LOG_BACKUP_COUNT = int(os.getenv("JARVIS_LOG_BACKUP_COUNT", "3"))
-# Порог логирования. По умолчанию INFO: человеческие строки видны, лог чистый. Поставь
-# DEBUG, чтобы увидеть стек-трассы ожидаемых сбоёв (их пишем на DEBUG, чтобы не засорять).
-LOG_LEVEL = os.getenv("JARVIS_LOG_LEVEL", "INFO").strip().upper()
-
-# --- Heartbeat (видимость «сервис жив») ---
-# Раз в столько секунд каждый сервис пишет в лог, что он жив (INFO). 0 — выключить.
-# По логам видно, что сервис работает, а не висит молча. На шину ничего не публикуем.
-HEARTBEAT_INTERVAL = float(os.getenv("JARVIS_HEARTBEAT_INTERVAL", "300"))
+NOISE_WINDOW = _get("adaptive_audio", "noise_window", 0.1, "JARVIS_NOISE_WINDOW")

@@ -196,6 +196,36 @@ def check_env_file() -> list[CheckResult]:
     return results
 
 
+def check_settings() -> CheckResult:
+    """Единый файл настроек settings.yaml — валидный YAML. Битый файл config молча игнорирует
+    (берёт дефолты), поэтому проверяем явно: иначе правки пользователя «не применяются» без причины."""
+    import yaml
+
+    path = Path(config.SETTINGS_FILE)
+    if not path.exists():
+        return CheckResult(
+            WARN, "settings.yaml",
+            reason=f"файла нет ({path}) — все параметры на дефолтах.",
+            fix="создайте settings.yaml в корне проекта (или это намеренно — работаем на дефолтах)",
+        )
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            return CheckResult(
+                FAIL, "settings.yaml",
+                reason="файл не словарь (пустой/битый) — правки игнорируются, идут дефолты.",
+                fix="проверьте структуру: секции voice/adaptive_audio/hearing/recognition/system/models",
+            )
+        return CheckResult(OK, f"settings.yaml валиден ({len(data)} секций)")
+    except Exception as exc:
+        return CheckResult(
+            FAIL, "settings.yaml",
+            reason=f"невалидный YAML: {exc} — параметры МОЛЧА берутся из дефолтов!",
+            fix=f"исправьте синтаксис {path}",
+        )
+
+
 def check_config_paths() -> list[CheckResult]:
     """Все пути из config.py резолвятся в существующие места."""
     paths = {
@@ -1115,6 +1145,7 @@ def run(quick: bool = False) -> bool:
     _safe(reporter, check_venv)
     _safe(reporter, check_imports)
     _safe(reporter, check_library_versions)
+    _safe(reporter, check_settings)
     _safe(reporter, check_config_paths)
     _safe(reporter, check_env_file)
     _safe(reporter, check_commands_yaml)
