@@ -87,6 +87,9 @@ CORE «Мозг» (jarvis/services/core.py — тонкий сервис)
 - **TTS «Голос»**: Piper 1.4.2, `ru_RU-dmitri-medium.onnx` (22050 Гц). API: `synthesize()`
   → итератор AudioChunk (`audio_int16_*`, `sample_rate`). НЕ старый `synthesize_stream_raw`.
   Голос грузится ЛЕНИВО при первой фразе (на TUXEDO: idle TTS ~40 МБ, с Piper ~162 МБ).
+  **ВОСПРОИЗВЕДЕНИЕ — через PipeWire `pw-cat` (subprocess), НЕ sounddevice/PortAudio**: на
+  TUXEDO PortAudio видит только HDMI-выходы → была немота (см. ГРАБЛИ). `JARVIS_TTS_SINK`
+  переопределяет sink (пусто = системный default). STT-захват остаётся на sounddevice.
 - **OS-агент «Руки»**: исполняет теги из `commands.yaml`. `shell=False`, allow-list,
   без произвольного исполнения.
 
@@ -111,7 +114,7 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 │   ├── config.py             # всё через os.getenv с дефолтами; BASE_DIR = корень репо (без dotenv)
 │   ├── contracts.py          # топики + QoS + State + Intent=Literal["os_command"] (чистый typing, без pydantic)
 │   ├── matcher.py            # распознавание: правила + ONNX-эмбеддинги (rubert-tiny2)
-│   ├── sysinfo.py            # read-only пробы системы (заряд батареи, загрузка CPU/RAM)
+│   ├── sysinfo.py            # read-only пробы системы (заряд, загрузка CPU/RAM, громкость)
 │   ├── resilience.py         # диагнозы сбоёв MQTT (классификатор + расшифровка разрыва)
 │   ├── cli.py, doctor.py, downloader.py, ui.py, services_map.py
 │   └── services/             # stt.py, core.py, os_agent.py, tts.py — наследники JarvisModule, есть main()
@@ -154,6 +157,11 @@ MQTT/логирование/shutdown — всё в базовом классе.
   пересоздан `.venv`, поставлены mosquitto/brightnessctl, `browser`→`thorium-browser`, удалён
   мёртвый sense-voice (1,1 ГБ), починены зомби-процессы OS-агента и нестабильный выбор
   подтверждений (`hash()`→стабильный), вычищены хвосты (Ollama/SenseVoice/Kali). `jarvis doctor` зелёный.
+- **Этап 4 (немота + команды) — ✅ СДЕЛАНО.** Причина немоты: sounddevice/PortAudio играл в
+  HDMI (22050 Гц не поддержан) → исключение глоталось. Фикс: воспроизведение через PipeWire
+  `pw-cat`. Терминал→kitty. `commands.yaml` расширен до 39 команд (звук/яркость уровни, медиа
+  `playerctl`, скрины окно/область/буфер, рабочие столы KWin-DBus, сон, буфер `wl-clipboard`,
+  приложения KDE6). Info-ответы: дата/громкость/CPU-RAM. `jarvis doctor` зелёный.
 - **Возможное будущее (необязательно):** HUD — киношный визуал поверх готового пульта
   (веб-стек в прозрачном окне на Wayland, чисто визуальный). Только после устойчивой работы.
 
@@ -195,15 +203,24 @@ MQTT/логирование/shutdown — всё в базовом классе.
   `thorium-browser` (НЕ firefox-esr; запущен из `/opt/chromium.org/thorium`, бинарь-обёртка
   в `/usr/bin`). `mosquitto` (брокер) и `brightnessctl` (яркость) на новой системе ставятся
   через `sudo apt install`. konsole/spectacle (`-b -f -n` работают)/dolphin/wpctl/nmcli/
-  bluetoothctl/loginctl — на месте.
+  bluetoothctl/loginctl — на месте. Терминал — **kitty**. Приложения: kcalc/kate/gwenview/
+  okular/plasma-systemmonitor/systemsettings. Рабочие столы — `qdbus6 org.kde.KWin` (Wayland).
+- **НЕМОТА на TUXEDO (важно, не повторить):** sounddevice/PortAudio видит ТОЛЬКО сырые
+  ALSA-выходы (HDMI), не аналог/PipeWire → `sd.play` слал звук в HDMI на 22050 Гц →
+  `paInvalidSampleRate`, исключение глоталось как WARNING. Фикс: TTS играет через **`pw-cat`**
+  (PipeWire, default sink, авто-ресемплинг). НЕ возвращать sounddevice в `tts.py`; `pw-cat`
+  обязателен (есть чек в doctor). Захват STT при этом остаётся на sounddevice (он работает).
 - **swap = 0 на TUXEDO** (на Kali был). На 8 ГБ без swap выше риск OOM-kill голосового
   конвейера под нагрузкой. Рекомендация — включить zram-swap (`sudo apt install zram-tools`).
   Жёсткий `MemoryMax` в юнитах намеренно НЕ ставим (лимит → OOM убил бы пульт).
-- `commands.yaml`: команды с `ждать_вывод: true` пишут `cmd_<тег>_<время>.log` в `logs/` и
-  НЕ ротируются. Сейчас таких команд нет (network_scan убран) — учесть при добавлении.
+- `commands.yaml`: команды с `ждать_вывод: true` (сейчас `network_status`) пишут
+  `cmd_<тег>_<время>.log` в `logs/` и НЕ ротируются — периодически чистить при активном use.
 - OS-агент дожинает fire-and-forget процессы (`_reap`), иначе короткие команды (wpctl/
   brightnessctl) копились бы зомби `<defunct>` — родитель обязан делать `wait()`.
-- `telegram-desktop` не установлен → команда `telegram` даёт WARN (не блокер).
+- `telegram-desktop` не установлен → команда `telegram` даёт WARN (не блокер). Так же
+  `playerctl` (медиа) и `wl-clipboard` (буфер) ставятся `sudo apt install` — без них команды
+  `media_*`/`clipboard_clear` дают WARN. Уровни громкости/яркости семантически близки —
+  направление задают ПРАВИЛА (синонимы), эмбеддинги по margin переспросят (безопасно).
 - Анти-эхо: при низком VAD-пороге микрофон ловит голос Джарвиса из колонок. Защита:
   STT молчит при `state=speaking` + хвост `SPEAKING_TAIL=1.0` от конца воспроизведения +
   сброс VAD-буфера при возобновлении + подавление по содержанию (difflib). Требует

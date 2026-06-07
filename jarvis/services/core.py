@@ -18,7 +18,7 @@ import yaml
 from jarvis import config, contracts
 from jarvis.bus import JarvisModule
 from jarvis.matcher import NOT_RECOGNIZED, Matcher
-from jarvis.sysinfo import read_battery
+from jarvis.sysinfo import read_battery, read_system_load, read_volume
 
 # Ключевые слова встроенных info-ответов (срабатывают на явный вопрос).
 _TIME_KEYS = (
@@ -26,6 +26,17 @@ _TIME_KEYS = (
     "сколько время", "точное время", "время сейчас", "сколько на часах",
 )
 _BATTERY_KEYS = ("батаре", "аккумулят", "заряд", "сколько процент")
+_DATE_KEYS = ("какое сегодня число", "какое число", "какая дата", "какой сегодня день",
+              "число сегодня", "сегодня какое", "какой день недели", "какое число сегодня")
+_VOLUME_KEYS = ("какая громкость", "уровень громкости", "текущая громкость",
+                "насколько громко", "громкость сейчас", "какая сейчас громкость")
+_LOAD_KEYS = ("загрузка системы", "загрузка процессора", "загрузка цпу", "нагрузка системы",
+              "сколько памяти", "сколько оперативной", "сколько озу", "использование памяти",
+              "загружен процессор", "загружена память", "свободной памяти", "оперативной памяти")
+
+# Родительный падеж месяцев для произнесения даты («5 июня»).
+_MONTHS_RU = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+              "августа", "сентября", "октября", "ноября", "декабря")
 
 
 def _load_commands() -> dict:
@@ -106,13 +117,48 @@ class CoreModule(JarvisModule):
         )
 
     def _local_info_answer(self, text: str) -> str | None:
-        """Встроенные офлайн-ответы: время и заряд батареи. Иначе None."""
+        """Встроенные офлайн-ответы: время, дата, громкость, загрузка, заряд. Иначе None."""
         low = text.lower()
         if any(k in low for k in _TIME_KEYS):
             return f"Сейчас {datetime.now():%H:%M}, сэр."
+        if any(k in low for k in _DATE_KEYS):
+            return self._date_answer()
+        if any(k in low for k in _VOLUME_KEYS):
+            return self._volume_answer()
+        if any(k in low for k in _LOAD_KEYS):
+            return self._load_answer()
         if any(k in low for k in _BATTERY_KEYS):
             return self._battery_answer()
         return None
+
+    def _date_answer(self) -> str:
+        """Текущая дата в характере (число + месяц словом)."""
+        now = datetime.now()
+        return f"Сегодня {now.day} {_MONTHS_RU[now.month - 1]} {now.year} года, сэр."
+
+    def _volume_answer(self) -> str:
+        """Текущая громкость основного вывода (read-only проба wpctl)."""
+        data = read_volume()
+        if "ошибка" in data:
+            self.log.warning("Не удалось снять громкость: %s", data["ошибка"])
+            return "Не удалось узнать громкость, сэр."
+        if data.get("выключен"):
+            return "Звук сейчас выключен, сэр."
+        return f"Громкость на {data.get('громкость_процент')} процентах, сэр."
+
+    def _load_answer(self) -> str:
+        """Загрузка процессора и памяти в характере (read-only из /proc)."""
+        data = read_system_load()
+        cpu = data.get("загрузка_cpu_процент")
+        ram = data.get("память_занято_процент")
+        parts = []
+        if cpu is not None:
+            parts.append(f"процессор на {cpu} процентах")
+        if ram is not None:
+            parts.append(f"память на {ram} процентах")
+        if not parts:
+            return "Не удалось снять загрузку системы, сэр."
+        return "Загрузка: " + ", ".join(parts) + ", сэр."
 
     def _battery_answer(self) -> str:
         """Реальный заряд в характере Джарвиса (read-only-проба из sysinfo)."""

@@ -104,6 +104,10 @@ PIPER_MODEL = os.getenv("JARVIS_PIPER_MODEL", str(MODELS_DIR / "ru_RU-dmitri-med
 PIPER_CONFIG = os.getenv(
     "JARVIS_PIPER_CONFIG", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx.json")
 )
+# Sink PipeWire для воспроизведения (pw-cat --target). Пусто = системный default sink.
+# На TUXEDO sounddevice/PortAudio не видит аналоговый вывод (только HDMI) — играем через
+# PipeWire (pw-cat), иначе Джарвис нем (paInvalidSampleRate на 22050 Гц). См. tts.py.
+TTS_SINK = os.getenv("JARVIS_TTS_SINK", "").strip()
 
 # --- OS-агент ---
 COMMANDS_FILE = os.getenv("JARVIS_COMMANDS_FILE", str(BASE_DIR / "commands.yaml"))

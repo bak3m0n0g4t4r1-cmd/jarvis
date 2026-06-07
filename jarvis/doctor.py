@@ -237,6 +237,8 @@ _SAFE_VERSION_PROBE = {
     "nmcli": ["--version"],
     "bluetoothctl": ["--version"],
     "loginctl": ["--version"],
+    "playerctl": ["--version"],
+    "systemctl": ["--version"],
 }
 
 
@@ -576,6 +578,16 @@ def check_audio() -> list[CheckResult]:
                    CheckResult(FAIL, "Аудио: устройство вывода",
                                reason="не найдено ни одного устройства воспроизведения.",
                                fix="проверьте вывод звука: wpctl status"))
+    # TTS воспроизводит через pw-cat (PipeWire), НЕ sounddevice — на TUXEDO PortAudio
+    # видит только HDMI и Джарвис был нем. Без pw-cat голос недоступен → это блокер.
+    if shutil.which("pw-cat"):
+        results.append(CheckResult(OK, "Воспроизведение TTS: pw-cat (PipeWire) доступен"))
+    else:
+        results.append(CheckResult(
+            FAIL, "Воспроизведение TTS: pw-cat",
+            reason="pw-cat не найден в $PATH — TTS не сможет играть звук (Джарвис будет нем).",
+            fix="sudo apt install -y pipewire-bin (обычно уже стоит вместе с PipeWire)",
+        ))
     return results
 
 

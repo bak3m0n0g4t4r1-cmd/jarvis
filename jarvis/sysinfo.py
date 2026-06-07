@@ -68,3 +68,27 @@ def read_battery() -> dict:
         return {"процент": capacity, "статус": status_ru}
     except Exception as exc:
         return {"ошибка": f"не удалось снять показания батареи: {exc}"}
+
+
+def read_volume() -> dict:
+    """Громкость основного аудиовыхода в процентах (wpctl, read-only).
+
+    Парсит вывод `wpctl get-volume @DEFAULT_AUDIO_SINK@` («Volume: 0.45» или
+    «Volume: 0.45 [MUTED]»). НИКОГДА не бросает: при сбое — {"ошибка": ...}.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        parts = out.stdout.split()
+        # Ожидаем формат «Volume: <float> [MUTED]»
+        volume = float(parts[1])
+        return {
+            "громкость_процент": round(volume * 100),
+            "выключен": "MUTED" in out.stdout,
+        }
+    except Exception as exc:
+        return {"ошибка": f"не удалось снять громкость: {exc}"}
