@@ -93,7 +93,7 @@ def _systemctl(*args: str) -> int:
         return subprocess.call(["systemctl", "--user", *args])
     except FileNotFoundError:
         print("✗ systemctl не найден. Управление сервисами доступно только под "
-              "systemd-сессией пользователя (на целевой Kali).")
+              "systemd-сессией пользователя.")
         return 1
 
 

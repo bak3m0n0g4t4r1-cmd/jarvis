@@ -73,6 +73,28 @@ class OsAgentModule(JarvisModule):
             threading.Thread(
                 target=self._wait_and_report, args=(tag, proc), daemon=True
             ).start()
+        else:
+            # Fire-and-forget тоже дожинаем в фоне: иначе короткие команды
+            # (wpctl/brightnessctl/loginctl) копятся зомби-процессами <defunct> —
+            # родитель ОБЯЗАН сделать wait(). Поток daemon: короткая команда реапится
+            # мгновенно, GUI-приложение держит поток до закрытия и выходу не мешает.
+            threading.Thread(
+                target=self._reap, args=(tag, proc), daemon=True
+            ).start()
+
+    def _reap(self, tag: str, proc: subprocess.Popen) -> None:
+        """Дожать fire-and-forget процесс, чтобы не плодить зомби <defunct>.
+
+        Для команд с ждать_вывод:false статус не озвучиваем — важно лишь снять
+        процесс из таблицы (wait). Короткая команда завершается сразу, GUI-приложение
+        держит поток до своего закрытия. Ненулевой код — на DEBUG (тут не наша забота).
+        """
+        try:
+            code = proc.wait()
+            if code != 0:
+                self.log.debug("Команда %s завершилась с кодом %s (fire-and-forget)", tag, code)
+        except Exception:
+            self.log.debug("Не удалось дождать процесс команды %s", tag, exc_info=True)
 
     def _wait_and_report(self, tag: str, proc: subprocess.Popen):
         try:

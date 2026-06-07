@@ -197,8 +197,10 @@ class Matcher:
         own = (spec.get("подтверждение") or "").strip()
         if own:
             return own
-        # Детерминированный выбор из пула по тегу (без рандома — стабильно и тестируемо).
-        return _GENERIC_CONFIRMATIONS[hash(tag) % len(_GENERIC_CONFIRMATIONS)]
+        # Детерминированный выбор из пула по тегу. ВАЖНО: встроенный hash() для строк
+        # рандомизирован между процессами (PYTHONHASHSEED) — иначе фолбэк-подтверждение
+        # скакало бы при каждом перезапуске. sum(ord) даёт стабильный индекс без импортов.
+        return _GENERIC_CONFIRMATIONS[sum(map(ord, tag)) % len(_GENERIC_CONFIRMATIONS)]
 
     # ------------------------------------------------------------------ #
     # Слой 1: правила

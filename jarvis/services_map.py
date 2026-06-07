@@ -28,7 +28,7 @@ SERVICES = [
     ),
     ServiceDef(
         "core", "jarvis-core.service", "jarvis-core",
-        "jarvis.services.core", "CoreModule", "«Мозг» — Ollama structured output",
+        "jarvis.services.core", "CoreModule", "«Мозг» — матчер (правила + ONNX-эмбеддинги)",
     ),
     ServiceDef(
         "os_agent", "jarvis-os-agent.service", "jarvis-os-agent",

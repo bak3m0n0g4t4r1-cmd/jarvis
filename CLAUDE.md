@@ -24,11 +24,13 @@ N100/8 ГБ не тянет умные модели, система тупит. 
 
 ## ЖЕЛЕЗО И ОКРУЖЕНИЕ (важно для всех решений)
 
-- **Intel N100, без GPU, 8 ГБ RAM** — слабое железо, RAM впритык, swap под нагрузкой.
-  Это первопричина перехода в локальный пульт: всё должно быть лёгким.
-- **Kali Linux**, KDE Plasma на **Wayland**, оболочка **zsh**.
+- **Intel N100 (4 ядра), без GPU, 8 ГБ RAM, swap = 0** — слабое железо, RAM впритык.
+  На TUXEDO swap НЕ настроен (на Kali был) → OOM-риск выше, всё должно быть лёгким
+  (рекомендация — включить zram, см. ГРАБЛИ). Первопричина перехода в локальный пульт.
+- **TUXEDO OS 24.04** (Ubuntu-база), KDE Plasma 6 (Qt 6.9), ядро 6.17, **Wayland**, **zsh**.
+  Раньше была Kali — окружение сменилось, бинарии сверены под TUXEDO (см. ГРАБЛИ/commands.yaml).
 - Пользователь занимается пентестом — НЕЛЬЗЯ гнать системный трафик через прокси/VPN.
-- Проект: `~/projects/Jarvis_3`. Гитхаб: `github.com/stsarapkinser-arch/jarvis_data-bus`.
+- Проект: `/home/tux/proj/jarvis` (пользователь `tux`). Гитхаб: `github.com/stsarapkinser-arch/jarvis_data-bus`.
 - venv в `.venv` (`source .venv/bin/activate`). PEP 668 — pip ТОЛЬКО в venv, без `--break-system-packages`.
 - Интернета в работе НЕ требуется (нужен лишь разово — скачать модели).
 
@@ -75,15 +77,16 @@ CORE «Мозг» (jarvis/services/core.py — тонкий сервис)
   sounddevice 16кГц моно. Wake-word «джарвис» через VAD+ASR + difflib (ловит «джарвиз/сервис»).
   VAD-пороги ЗАКРЕПЛЕНЫ: `JARVIS_VAD_THRESHOLD=0.3`, `JARVIS_VAD_MIN_SILENCE=0.8` — НЕ ТРОГАТЬ.
   Лёгкость: `VAD_BUFFER_SECONDS=10` (было 30), `STT_NUM_THREADS=1` (sherpa — один поток).
+  Замер TUXEDO: RSS ~115 МБ (модели), CPU ~4–5% одного ядра при прослушивании в покое.
 - **Матчер (распознавание)**: `jarvis/matcher.py` — правила (синонимы из `commands.yaml`
   + difflib) + автономный эмбеддер **rubert-tiny2** (ONNX через onnxruntime, БЕЗ torch;
   токенизатор — `tokenizers`). Пулинг **mean** (сверено: разделяет лучше CLS),
   L2-норма. Модель грузится ЛЕНИВО (при первом промахе правил, ~0.3с), эмбеддинги
-  команд кешируются в памяти и на диск (`cmd_emb_cache.npz`). В RAM эмбеддер ~270 МБ
-  когда активен — поэтому ленив; на правилах он не нужен.
+  команд кешируются в памяти и на диск (`cmd_emb_cache.npz`). На TUXEDO процесс с эмбеддером
+  ~190 МБ RSS (≈ +165 МБ к core) — поэтому ленив; на правилах он не нужен.
 - **TTS «Голос»**: Piper 1.4.2, `ru_RU-dmitri-medium.onnx` (22050 Гц). API: `synthesize()`
   → итератор AudioChunk (`audio_int16_*`, `sample_rate`). НЕ старый `synthesize_stream_raw`.
-  Голос грузится ЛЕНИВО при первой фразе (idle TTS ~57 МБ, с Piper ~163 МБ).
+  Голос грузится ЛЕНИВО при первой фразе (на TUXEDO: idle TTS ~40 МБ, с Piper ~162 МБ).
 - **OS-агент «Руки»**: исполняет теги из `commands.yaml`. `shell=False`, allow-list,
   без произвольного исполнения.
 
@@ -97,7 +100,7 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 ## РАСКЛАДКА КОДА
 
 ```
-~/projects/Jarvis_3/
+/home/tux/proj/jarvis/
 ├── pyproject.toml            # entry points: jarvis, jarvis-stt, jarvis-core, jarvis-os-agent, jarvis-tts
 ├── commands.yaml             # тег → {описание, команда:[...], ждать_вывод, синонимы:[...], примеры:[...], подтверждение}
 ├── models.yaml               # карта моделей для загрузчика (zipformer, piper, эмбеддер rubert-tiny2)
@@ -147,6 +150,10 @@ MQTT/логирование/shutdown — всё в базовом классе.
 - **Этап 2 — ✅ СДЕЛАНО.** Оптимизация под минимум ресурсов: ленивый Piper (~106 МБ в
   простое), ленивый эмбеддер + диск-кеш, VAD-буфер 30→10с, `num_threads=1`, чистка
   мёртвого кода (`with_retry`, `JarvisResponse`+pydantic) и осиротевших пакетов.
+- **Этап 3 (чекап на TUXEDO) — ✅ СДЕЛАНО.** Переезд Kali→TUXEDO OS 24.04 (Ubuntu-база):
+  пересоздан `.venv`, поставлены mosquitto/brightnessctl, `browser`→`thorium-browser`, удалён
+  мёртвый sense-voice (1,1 ГБ), починены зомби-процессы OS-агента и нестабильный выбор
+  подтверждений (`hash()`→стабильный), вычищены хвосты (Ollama/SenseVoice/Kali). `jarvis doctor` зелёный.
 - **Возможное будущее (необязательно):** HUD — киношный визуал поверх готового пульта
   (веб-стек в прозрачном окне на Wayland, чисто визуальный). Только после устойчивой работы.
 
@@ -184,6 +191,18 @@ MQTT/логирование/shutdown — всё в базовом классе.
 
 ## ИЗВЕСТНЫЕ ГРАБЛИ
 
+- **Переезд на TUXEDO OS (Ubuntu-база):** бинарии команд отличаются от Kali. Браузер —
+  `thorium-browser` (НЕ firefox-esr; запущен из `/opt/chromium.org/thorium`, бинарь-обёртка
+  в `/usr/bin`). `mosquitto` (брокер) и `brightnessctl` (яркость) на новой системе ставятся
+  через `sudo apt install`. konsole/spectacle (`-b -f -n` работают)/dolphin/wpctl/nmcli/
+  bluetoothctl/loginctl — на месте.
+- **swap = 0 на TUXEDO** (на Kali был). На 8 ГБ без swap выше риск OOM-kill голосового
+  конвейера под нагрузкой. Рекомендация — включить zram-swap (`sudo apt install zram-tools`).
+  Жёсткий `MemoryMax` в юнитах намеренно НЕ ставим (лимит → OOM убил бы пульт).
+- `commands.yaml`: команды с `ждать_вывод: true` пишут `cmd_<тег>_<время>.log` в `logs/` и
+  НЕ ротируются. Сейчас таких команд нет (network_scan убран) — учесть при добавлении.
+- OS-агент дожинает fire-and-forget процессы (`_reap`), иначе короткие команды (wpctl/
+  brightnessctl) копились бы зомби `<defunct>` — родитель обязан делать `wait()`.
 - `telegram-desktop` не установлен → команда `telegram` даёт WARN (не блокер).
 - Анти-эхо: при низком VAD-пороге микрофон ловит голос Джарвиса из колонок. Защита:
   STT молчит при `state=speaking` + хвост `SPEAKING_TAIL=1.0` от конца воспроизведения +
@@ -192,7 +211,7 @@ MQTT/логирование/shutdown — всё в базовом классе.
 - **Эмбеддинги НЕ различают антонимы** (вкл/выкл, громче/тише — косинус ~0.97/0.80).
   Направление ОБЯЗАН задавать слой правил конкретными синонимами; иначе матчер по
   margin-защите переспросит, а не угадает (это правильное безопасное поведение).
-- Эмбеддер rubert-tiny2 fp32 в RAM ~270 МБ — поэтому ленивый; arena/mem-pattern в
+- Эмбеддер rubert-tiny2 в RAM ~165–190 МБ — поэтому ленивый; arena/mem-pattern в
   onnxruntime RSS не уменьшают (сверено). Если эмбеддер не нужен — правила работают без него.
 - `rubert-tiny2` официально только в PyTorch; используем готовый ONNX-экспорт
   `Vuy/rubert-tiny2-onnx` (конвертация своими силами требовала бы torch — нельзя).

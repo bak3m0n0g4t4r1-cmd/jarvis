@@ -1,5 +1,5 @@
 [Unit]
-Description=Джарвис — «Уши» (STT: VAD + SenseVoice)
+Description=Джарвис — «Уши» (STT: silero-VAD + zipformer-ru)
 # Аудио-сервис: нужен пользовательский PipeWire
 Wants=pipewire.service
 After=pipewire.service network.target
