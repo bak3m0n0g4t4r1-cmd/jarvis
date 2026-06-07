@@ -115,6 +115,7 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 │   ├── contracts.py          # топики + QoS + State + Intent=Literal["os_command"] (чистый typing, без pydantic)
 │   ├── matcher.py            # распознавание: правила + ONNX-эмбеддинги (rubert-tiny2)
 │   ├── sysinfo.py            # read-only пробы системы (заряд, загрузка CPU/RAM, громкость)
+│   ├── speech.py             # числа/время/дата словами для TTS (произносимый русский)
 │   ├── resilience.py         # диагнозы сбоёв MQTT (классификатор + расшифровка разрыва)
 │   ├── cli.py, doctor.py, downloader.py, ui.py, services_map.py
 │   └── services/             # stt.py, core.py, os_agent.py, tts.py — наследники JarvisModule, есть main()
@@ -162,6 +163,12 @@ MQTT/логирование/shutdown — всё в базовом классе.
   `pw-cat`. Терминал→kitty. `commands.yaml` расширен до 39 команд (звук/яркость уровни, медиа
   `playerctl`, скрины окно/область/буфер, рабочие столы KWin-DBus, сон, буфер `wl-clipboard`,
   приложения KDE6). Info-ответы: дата/громкость/CPU-RAM. `jarvis doctor` зелёный.
+- **Этап 5 (вширь+вглубь + произношение) — ✅ СДЕЛАНО.** commands.yaml → 70 команд: сайты
+  (Thorium URL: ютуб/диск/фото/карты/gemini/claude), Я.Музыка + «моя волна», XDG-папки (русские
+  имена), носители по метке `/media/tux/<МЕТКА>` (поле `требует_путь` → ответ в характере, если не
+  подключён), вкладки браузера (ydotool, Wayland), VPN Amnezia (только запуск GUI), LibreOffice/
+  gparted, ночной режим (kglobalaccel «Toggle Night Color»). Новый `speech.py`: время/дата/проценты
+  словами («четырнадцать часов тридцать минут»). `jarvis doctor` зелёный.
 - **Возможное будущее (необязательно):** HUD — киношный визуал поверх готового пульта
   (веб-стек в прозрачном окне на Wayland, чисто визуальный). Только после устойчивой работы.
 
@@ -205,6 +212,21 @@ MQTT/логирование/shutdown — всё в базовом классе.
   через `sudo apt install`. konsole/spectacle (`-b -f -n` работают)/dolphin/wpctl/nmcli/
   bluetoothctl/loginctl — на месте. Терминал — **kitty**. Приложения: kcalc/kate/gwenview/
   okular/plasma-systemmonitor/systemsettings. Рабочие столы — `qdbus6 org.kde.KWin` (Wayland).
+- **Команды захода 5 (вширь):** сайты — `thorium-browser <url>`. Папки — `dolphin` по русским
+  XDG-путям (`/home/tux/Загрузки` и т.д.), корзина `trash:/`. Носители — `/media/tux/<МЕТКА>`
+  (TOSHIBA, Ventoy) + поле `требует_путь` в commands.yaml (не подключён → ответ в характере, без
+  запуска). Ночной режим — `qdbus6 org.kde.kglobalaccel /component/kwin invokeShortcut "Toggle
+  Night Color"` (это TOGGLE; прямого on/off в NightLight DBus нет — только `stopPreview`/`Ping`).
+  VPN **Amnezia — только запуск GUI** (`/usr/local/sbin/AmneziaVPN`; CLI awg/wg-quick нет, конфиги
+  root → вкл/выкл голосом невозможно). **gparted — только запуск** (polkit спросит пароль).
+- **Вкладки браузера = ydotool (Wayland):** клавиши шлются только через `ydotool` (`ydotool key
+  29:1 20:1 20:0 29:0` = Ctrl+T) — нужен `sudo apt install ydotool` + udev-правило на `/dev/uinput`
+  (группа `input`, MODE 0660) + `usermod -aG input` + демон `ydotoold` + **ПЕРЕЛОГИН** (группа
+  применяется только после него). Без этого `tab_*` дают WARN (бинаря нет). xdotool/wmctrl на
+  Wayland НЕ работают.
+- **Произношение чисел (`speech.py`):** время/дата/проценты в info-ответах — словами («четырнадцать
+  часов тридцать минут», «седьмое июня…», «сорок пять процентов»), иначе Piper читал криво. Все
+  числа в озвучке идут через `speech.py`; падежи в `core.py` подобраны под него (винит./именит.).
 - **НЕМОТА на TUXEDO (важно, не повторить):** sounddevice/PortAudio видит ТОЛЬКО сырые
   ALSA-выходы (HDMI), не аналог/PipeWire → `sd.play` слал звук в HDMI на 22050 Гц →
   `paInvalidSampleRate`, исключение глоталось как WARNING. Фикс: TTS играет через **`pw-cat`**

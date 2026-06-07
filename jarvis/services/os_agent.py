@@ -4,6 +4,7 @@
 аргументов. Пользовательский текст в команду НЕ подставляется — только
 lookup тега в карте. Неизвестный тег → лог + предупреждение в jarvis/say.
 """
+import os
 import subprocess
 import threading
 from datetime import datetime
@@ -46,6 +47,13 @@ class OsAgentModule(JarvisModule):
         if not isinstance(args, list) or not args:
             self.log.error("Некорректная команда для тега %s: %r", tag, args)
             self.say(f"Сэр, команда «{tag}» настроена неверно.")
+            return
+        # Команда может требовать примонтированный путь (носитель: флешка/диск). Если пути
+        # нет — носитель не подключён: отвечаем в характере и НЕ запускаем (без падения).
+        required = spec.get("требует_путь")
+        if required and not os.path.exists(str(required)):
+            self.log.info("Путь для «%s» отсутствует (%s) — носитель не подключён", tag, required)
+            self.say(spec.get("ответ_нет_пути") or "Сэр, похоже, этот носитель не подключён.")
             return
         wait_output = bool(spec.get("ждать_вывод", False))
         self._run(tag, [str(a) for a in args], wait_output)
