@@ -132,6 +132,7 @@ class SttModule(JarvisModule):
             channels=config.CHANNELS,
             samplerate=config.SAMPLE_RATE,
             dtype="float32",
+            device=config.STT_SOURCE or None,  # опц. denoise-source (echo-cancel); пусто = default
         )
         self._stream.start()
 
@@ -242,10 +243,16 @@ class SttModule(JarvisModule):
         self.log.info("Распознано: %s", text)
         command = self._match_wake_word(text)
         if command:
-            self.publish_json(
-                contracts.TOPIC_INPUT, {"text": command}, qos=contracts.QOS_INPUT
-            )
-            self.log.info("Команда в шину: %s", command)
+            # Громкость речи пользователя (RMS сегмента) — для адаптивной громкости ответа TTS.
+            try:
+                user_level = round(float(np.sqrt(np.mean(np.square(samples)) + 1e-12)), 5)
+            except Exception:
+                user_level = None
+            payload = {"text": command}
+            if user_level is not None:
+                payload["user_level"] = user_level
+            self.publish_json(contracts.TOPIC_INPUT, payload, qos=contracts.QOS_INPUT)
+            self.log.info("Команда в шину: %s (громкость речи %.4f)", command, user_level or 0.0)
 
     @staticmethod
     def _normalize(text: str) -> str:

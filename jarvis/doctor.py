@@ -588,6 +588,16 @@ def check_audio() -> list[CheckResult]:
             reason="pw-cat не найден в $PATH — TTS не сможет играть звук (Джарвис будет нем).",
             fix="sudo apt install -y pipewire-bin (обычно уже стоит вместе с PipeWire)",
         ))
+    # Адаптивная громкость (audio_env): pactl — ducking музыки, pw-cat --record — замер реального
+    # уровня воспроизведения. Нет → деградация в фиксированную громкость (WARN, не блокер).
+    if shutil.which("pactl"):
+        results.append(CheckResult(OK, "Адаптивная громкость: pactl + pw-cat доступны"))
+    else:
+        results.append(CheckResult(
+            WARN, "Адаптивная громкость: pactl",
+            reason="нет pactl — ducking музыки и замер уровня недоступны, громкость фиксированная.",
+            fix="sudo apt install -y pipewire-pulse (даёт pactl)",
+        ))
     return results
 
 

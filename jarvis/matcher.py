@@ -151,8 +151,10 @@ class Matcher:
     def __init__(self, commands: dict, embedder: Optional[Embedder] = None):
         self._commands = commands or {}
         self._embedder = embedder if embedder is not None else Embedder()
-        # Слой правил: тег → список нормализованных синонимов (с разбивкой на слова).
-        self._rules: dict[str, list[str]] = {}
+        # Слой правил: тег → список (синоним, множество слов, многословный?).
+        self._rules: dict[str, list] = {}
+        # Индекс точных синонимов: норм. фраза → тег (мгновенное распознавание частых команд).
+        self._exact: dict[str, str] = {}
         # Слой эмбеддингов: плоский список (тег, фраза) для кодирования одним батчем.
         self._emb_tags: list[str] = []
         self._emb_phrases: list[str] = []
@@ -165,7 +167,14 @@ class Matcher:
         for tag, spec in self._commands.items():
             spec = spec or {}
             synonyms = [normalize(s) for s in (spec.get("синонимы") or []) if s]
-            self._rules[tag] = [s for s in synonyms if s]
+            # Предпосчёт для быстрых проверок без difflib: (синоним, множество слов,
+            # многословный?) + индекс точных синонимов для O(1)-распознавания.
+            rule_list = []
+            for s in synonyms:
+                self._exact.setdefault(s, tag)  # первый тег с таким синонимом
+                words = s.split()
+                rule_list.append((s, set(words), len(words) >= 2))
+            self._rules[tag] = rule_list
             # Для эмбеддингов берём примеры + синонимы + описание — чем больше живых
             # формулировок, тем устойчивее семантический поиск при промахе правил.
             phrases = list(spec.get("примеры") or [])
@@ -206,46 +215,56 @@ class Matcher:
     # Слой 1: правила
     # ------------------------------------------------------------------ #
     def _match_rules(self, query: str) -> Optional[Match]:
-        """Лучшее совпадение по синонимам: точное/вхождение/слово/нечёткое."""
+        """Лучшее совпадение по синонимам. Горячий путь — БЕЗ difflib: точное совпадение
+        (O(1) по индексу), вхождение фразы, все слова синонима во фразе. Нечёткое (difflib)
+        — только fallback, когда быстрые проверки не дали сильного сигнала (искажения STT).
+        Так частые/точные команды распознаются за <1 мс вместо ~24 мс (difflib по всем).
+        Приоритеты совпадения сохранены: точное 1.0, вхождение 0.96, все слова 0.94, слово 0.92.
+        """
+        # 1) Точное совпадение — мгновенно, по индексу.
+        tag = self._exact.get(query)
+        if tag is not None:
+            return Match(tag, 1.0, "rules")
+        # 2) Быстрые проверки (вхождение / все слова / однословное ключевое) — без difflib.
         q_tokens = query.split()
+        q_set = set(q_tokens)
         best_tag, best_score = None, 0.0
-        for tag, synonyms in self._rules.items():
-            score = self._rule_score(query, q_tokens, synonyms)
+        for tag, rules in self._rules.items():
+            score = 0.0
+            for s, s_words, is_multi in rules:
+                if is_multi:
+                    if s in query:
+                        score = max(score, 0.96)
+                    elif s_words <= q_set:
+                        score = max(score, 0.94)
+                elif s in q_set:
+                    score = max(score, 0.92)
+            if score > best_score:
+                best_tag, best_score = tag, score
+        # Сильный сигнал (точное слово/вхождение) — difflib не нужен, выходим сразу.
+        if best_tag is not None and best_score >= 0.92:
+            return Match(best_tag, round(best_score, 3), "rules")
+        # 3) Fallback: нечёткое сравнение difflib — редкий путь (быстрые промахнулись).
+        return self._match_rules_fuzzy(query, q_tokens, best_tag, best_score)
+
+    def _match_rules_fuzzy(self, query: str, q_tokens: list[str],
+                           best_tag, best_score) -> Optional[Match]:
+        """Нечёткое (difflib) сравнение — ловит искажения STT, когда точных совпадений нет.
+        Стартует от лучшего быстрого результата, difflib может его только улучшить."""
+        for tag, rules in self._rules.items():
+            score = 0.0
+            for s, _s_words, is_multi in rules:
+                if is_multi:
+                    score = max(score, _ratio(query, s))
+                else:
+                    for tok in q_tokens:
+                        score = max(score, _ratio(tok, s))
+                    score = max(score, _ratio(query, s))
             if score > best_score:
                 best_tag, best_score = tag, score
         if best_tag is not None and best_score >= config.MATCHER_FUZZY_THRESHOLD:
             return Match(best_tag, round(best_score, 3), "rules")
         return None
-
-    @staticmethod
-    def _rule_score(query: str, q_tokens: list[str], synonyms: list[str]) -> float:
-        """Оценка совпадения фразы с синонимами одной команды (0–1)."""
-        best = 0.0
-        for s in synonyms:
-            if not s:
-                continue
-            if query == s:
-                return 1.0
-            s_words = s.split()
-            if len(s_words) >= 2:
-                # Многословный синоним. Вхождение фразы целиком — сильнейший сигнал;
-                # иначе достаточно, чтобы ВСЕ слова синонима встретились во фразе
-                # (порядок неважен) — так направление/полярность задаёт ключевой глагол
-                # («включи»/«выключи»), а не нечёткое сходство строк целиком.
-                if s in query:
-                    best = max(best, 0.96)
-                elif all(w in q_tokens for w in s_words):
-                    best = max(best, 0.94)
-                best = max(best, _ratio(query, s))
-            else:
-                # Однословный синоним (ключевое слово): целое слово во фразе.
-                if s in q_tokens:
-                    return 0.92
-                # Нечёткое сравнение по словам — ловит искажения STT отдельного слова.
-                for tok in q_tokens:
-                    best = max(best, _ratio(tok, s))
-                best = max(best, _ratio(query, s))
-        return best
 
     # ------------------------------------------------------------------ #
     # Слой 2: эмбеддинги

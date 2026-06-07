@@ -66,10 +66,13 @@ class CoreModule(JarvisModule):
         text = (payload.get("text") or "").strip()
         if not text:
             return
+        # Громкость речи пользователя (от STT) пробрасываем в ответ — для адаптивной громкости TTS.
+        level = payload.get("user_level")
+        user_level = level if isinstance(level, (int, float)) else None
         # Обработку выносим в поток, чтобы не блокировать MQTT-loop.
-        threading.Thread(target=self._process, args=(text,), daemon=True).start()
+        threading.Thread(target=self._process, args=(text, user_level), daemon=True).start()
 
-    def _process(self, text: str):
+    def _process(self, text: str, user_level: float | None = None):
         # Весь обработчик под защитой: непредвиденный сбой не должен убить рабочий поток
         # и не должен оставить шину висеть в состоянии thinking.
         with self._lock:
@@ -79,7 +82,7 @@ class CoreModule(JarvisModule):
                 # 1) Встроенные info-ответы (офлайн, без матчера).
                 info = self._local_info_answer(text)
                 if info is not None:
-                    self.say(info)
+                    self._say(info, user_level)
                     return
 
                 # 2) Распознавание команды матчером.
@@ -88,19 +91,26 @@ class CoreModule(JarvisModule):
                     speech = self._matcher.confirmation(match.tag)
                     self.log.info("Команда распознана: %s (%s, %.3f) — %s",
                                   match.tag, match.layer, match.score, text)
-                    self.say(speech)
+                    self._say(speech, user_level)
                     self._execute_command(match.tag)
                     return
 
                 # 3) Не распознано — переспрос в характере (не падаем).
                 self.log.info("Не распознано: %s", text)
-                self.say(NOT_RECOGNIZED)
+                self._say(NOT_RECOGNIZED, user_level)
             except Exception:
                 # Подстраховка: любой непредвиденный сбой — в лог по-человечески,
                 # состояние сбрасываем в idle, поток продолжает жить.
                 self.log_exc(logging.ERROR,
                              "Непредвиденный сбой обработки реплики — сбрасываю состояние")
                 self.set_state(contracts.STATE_IDLE)
+
+    def _say(self, text: str, user_level: float | None = None) -> None:
+        """Реплика в jarvis/say с опц. громкостью речи пользователя (для адаптивной громкости TTS)."""
+        payload = {"text": text, "source": self.name}
+        if user_level is not None:
+            payload["user_level"] = user_level
+        self.publish_json(contracts.TOPIC_SAY, payload, qos=contracts.QOS_SAY)
 
     def _execute_command(self, tag: str) -> None:
         """Опубликовать команду на выполнение «Руками» (OS-агент) через jarvis/execute.

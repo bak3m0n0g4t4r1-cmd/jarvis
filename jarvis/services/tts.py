@@ -1,13 +1,11 @@
-"""«Голос» Джарвиса: синтез речи через Piper и воспроизведение через PipeWire.
+"""«Голос» Джарвиса: синтез Piper + воспроизведение через PipeWire с адаптивной громкостью.
 
-Слушает jarvis/say, складывает фразы в очередь и проигрывает их по одной
-(worker-поток), чтобы реплики не накладывались. На время воспроизведения
-публикует state=speaking.
+Слушает jarvis/say, проигрывает фразы по одной (worker-поток). На время речи — state=speaking.
 
-ВОСПРОИЗВЕДЕНИЕ — через PipeWire (`pw-cat`), НЕ sounddevice/PortAudio. На TUXEDO
-PortAudio видит только сырые ALSA-выходы (HDMI) и не отдаёт звук в аналоговый
-вывод/PipeWire → Джарвис был нем (paInvalidSampleRate на 22050 Гц, исключение
-глоталось). pw-cat идёт в системный default sink с авто-ресемплингом.
+ВОСПРОИЗВЕДЕНИЕ — через PipeWire (`pw-cat`), НЕ sounddevice (PortAudio видит только HDMI →
+была немота). АДАПТИВНАЯ ГРОМКОСТЬ (audio_env): меряем реальные уровни сигнала (микрофон +
+monitor воспроизведения), приглушаем музыку (ducking) и подстраиваем громкость голоса под
+внешний шум И громкость речи пользователя. Синтез ПОТОКОВЫЙ — играем чанки по мере готовности.
 """
 import logging
 import queue
@@ -15,67 +13,77 @@ import subprocess
 import threading
 
 from jarvis import config, contracts
+from jarvis.audio_env import AudioEnv
 from jarvis.bus import JarvisModule
 
-# Сколько фраз подряд должны не озвучиться, чтобы признать сбой стойким и крикнуть в
-# лог CRITICAL (синтез/вывод звука недоступен). Воркер при этом продолжает пытаться —
-# когда устройство вернётся, озвучка восстановится сама (без рестарта сервиса).
+# Сколько фраз подряд не озвучилось, чтобы крикнуть CRITICAL (синтез/вывод недоступен).
 _TTS_FAILS_CRITICAL = 3
 
 
 class TtsModule(JarvisModule):
-    """«Голос»: озвучивает фразы из jarvis/say через Piper + PipeWire (pw-cat)."""
+    """«Голос»: озвучивает фразы из jarvis/say через Piper + PipeWire с адаптивной громкостью."""
 
     def __init__(self):
         super().__init__("jarvis-tts")
-        self._queue: "queue.Queue[str]" = queue.Queue()
+        # Очередь хранит (текст, громкость_речи_пользователя) — уровень от STT для адаптации.
+        self._queue: "queue.Queue[tuple[str, float | None]]" = queue.Queue()
         self._voice = None
-        self._voice_tried = False  # ленивую загрузку пробуем один раз
+        self._voice_tried = False
+        self._voice_lock = threading.Lock()
         self._worker = None
-        # Текущий процесс воспроизведения (pw-cat) — чтобы on_stop мог его прервать.
         self._play_proc: subprocess.Popen | None = None
+        self._env = AudioEnv()  # замер обстановки + ducking + расчёт громкости
 
     def on_start(self):
-        # Голос Piper грузим ЛЕНИВО (при первой фразе), а не на старте — пока Джарвис
-        # молчит, ~120 МБ модели не висят в RAM. Загрузка происходит в _speak.
         self.subscribe(contracts.TOPIC_SAY, self.on_say)
         self._worker = threading.Thread(target=self._run_worker, daemon=True)
         self._worker.start()
-
-    def _load_voice(self):
-        # ВНИМАНИЕ: сверить API piper с установленной версией (пакет piper-tts).
+        # Постоянный замер звуковой обстановки (микрофон + monitor воспроизведения).
         try:
-            from piper import PiperVoice
-
-            self._voice = PiperVoice.load(
-                config.PIPER_MODEL, config_path=config.PIPER_CONFIG
-            )
-            self.log.info("Голос Piper загружен: %s", config.PIPER_MODEL)
+            self._env.start()
         except Exception:
-            self.log_exc(logging.ERROR,
-                         "Не удалось загрузить голос Piper — озвучка будет недоступна")
-            self._voice = None
+            self.log_exc(logging.WARNING, "Не удалось запустить замер обстановки — громкость фиксированная")
+        # Прогрев Piper в фоне при старте: первая фраза не ждёт ~3с загрузки (ценой ~106 МБ RAM).
+        if config.TTS_PRELOAD:
+            threading.Thread(target=self._ensure_voice, daemon=True, name="piper-preload").start()
+
+    def _ensure_voice(self):
+        """Загрузить голос Piper один раз (потокобезопасно). Используется и прогревом, и _speak."""
+        if self._voice is not None or self._voice_tried:
+            return
+        with self._voice_lock:
+            if self._voice is not None or self._voice_tried:
+                return
+            self._voice_tried = True
+            try:
+                from piper import PiperVoice
+
+                self._voice = PiperVoice.load(config.PIPER_MODEL, config_path=config.PIPER_CONFIG)
+                self.log.info("Голос Piper загружен: %s", config.PIPER_MODEL)
+            except Exception:
+                self.log_exc(logging.ERROR,
+                             "Не удалось загрузить голос Piper — озвучка будет недоступна")
+                self._voice = None
 
     def on_say(self, payload: dict):
         text = (payload.get("text") or "").strip()
         if text:
-            self._queue.put(text)
+            # Уровень громкости речи пользователя (от STT через core) — для адаптации громкости.
+            level = payload.get("user_level")
+            self._queue.put((text, level if isinstance(level, (int, float)) else None))
 
     def _run_worker(self):
-        """Очередь озвучки: фразы по одной (не наложатся). Воркер НЕ должен умереть от
-        единичного сбоя — иначе Джарвис онемеет молча. Любое исключение тела цикла
-        ловим и продолжаем. Стойкий сбой (3+ фразы подряд) — CRITICAL в лог, но
-        продолжаем пытаться: вернётся устройство — озвучка восстановится сама.
-        """
+        """Очередь озвучки по одной фразе. Воркер не умирает от единичного сбоя; стойкий сбой
+        (3+ фразы) → CRITICAL, но продолжаем пытаться (вернётся устройство — озвучка оживёт)."""
         fails = 0
         announced_critical = False
         while not self._stop_event.is_set():
             try:
                 try:
-                    text = self._queue.get(timeout=0.5)
+                    text, level = self._queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                if self._speak(text):
+                if self._speak(text, level):
                     if announced_critical:
                         self.log.info("Озвучка восстановлена — звук снова работает")
                     fails = 0
@@ -84,37 +92,37 @@ class TtsModule(JarvisModule):
                     fails += 1
                     if fails >= _TTS_FAILS_CRITICAL and not announced_critical:
                         self.log.critical(
-                            "Озвучка не работает уже %d фраз подряд (синтез или вывод "
-                            "звука) — продолжаю пытаться, но голос сейчас недоступен", fails,
+                            "Озвучка не работает уже %d фраз подряд (синтез или вывод звука) — "
+                            "продолжаю пытаться, но голос сейчас недоступен", fails,
                         )
                         announced_critical = True
             except Exception:
                 self.log_exc(logging.WARNING, "Сбой в цикле озвучки — продолжаю работу")
 
-    def _speak(self, text: str) -> bool:
-        """Озвучить фразу. True — успех; False — пропустили (нет голоса/сбой синтеза/вывода).
+    def _speak(self, text: str, user_level: float | None) -> bool:
+        """Озвучить фразу с адаптивной громкостью. True — успех; False — пропуск (нет голоса/сбой).
 
-        Один плохой кусок не валит сервис: ошибку ловим, логируем по-человечески (с СУТЬю
-        ошибки — проглоченное исключение тут и было причиной немоты) и возвращаем False.
-        «Один speaking на ответ» сохранён: speaking на входе, idle в finally; speaking
-        держится РЕАЛЬНО пока играет звук (pw-cat дожидается) — корректный тайминг анти-эхо.
+        speaking держится РЕАЛЬНО пока играет звук (корректный тайминг анти-эхо). Перед речью:
+        приглушаем музыку (ducking) если она реально звучит, и считаем громкость голоса под
+        внешний шум + громкость речи пользователя. После речи — возвращаем музыку плавно.
         """
-        # Ленивая загрузка голоса при первой фразе (одна попытка). Если не вышло —
-        # дальше просто пропускаем озвучку, не пытаясь грузить каждый раз.
-        if self._voice is None and not self._voice_tried:
-            self._voice_tried = True
-            self._load_voice()
+        self._ensure_voice()
         if self._voice is None:
             self.log.warning("Голос Piper не загружен — не могу озвучить фразу: %r", text[:60])
             return False
+        ducked = False
         try:
             self.set_state(contracts.STATE_SPEAKING)
-            pcm, sample_rate = self._synthesize(text)
-            self._play_pcm(pcm, sample_rate)
+            self._env.set_speaking(True)
+            # Ducking музыки ноута, если она реально звучит выше порога.
+            if self._env.should_duck():
+                self._env.duck()
+                ducked = True
+            volume, gain = self._env.target_voice(user_level)
+            self.log.debug("Громкость голоса %.2f (gain %.2f), ducking=%s", volume, gain, ducked)
+            self._synth_and_play(text, volume, gain)
             return True
         except Exception as exc:
-            # СУТЬ ошибки — прямо в WARNING-строку (видно при LOG_LEVEL=INFO), трасса на DEBUG.
-            # Так будущая немота читается из лога сразу, а не теряется в stderr ALSA/PipeWire.
             self.log.warning(
                 "Не удалось синтезировать/воспроизвести фразу — пропускаю: %r (%s: %s)",
                 text[:60], type(exc).__name__, exc,
@@ -123,45 +131,56 @@ class TtsModule(JarvisModule):
             return False
         finally:
             self.set_state(contracts.STATE_IDLE)
+            self._env.set_speaking(False)
+            if ducked:
+                self._env.restore()  # плавно вернуть музыку к исходной громкости
 
-    def _play_pcm(self, pcm: bytes, sample_rate: int) -> None:
-        """Воспроизвести PCM (signed-16 mono) через PipeWire: pw-cat → default sink.
-
-        Почему не sounddevice: на TUXEDO PortAudio видит лишь сырые ALSA-выходы (HDMI),
-        аналоговый вывод/PipeWire ему недоступен → была немота. pw-cat отдаёт звук в
-        системный default sink (или JARVIS_TTS_SINK) с авто-ресемплингом частоты.
-        Процесс держим в self._play_proc, чтобы on_stop мог прервать воспроизведение.
-        """
-        cmd = ["pw-cat", "-p", "--raw", "--rate", str(sample_rate),
-               "--channels", "1", "--format", "s16", "-"]
+    def _synth_and_play(self, text: str, volume: float, gain: float) -> None:
+        """ПОТОКОВЫЙ синтез+воспроизведение: чанки Piper пишем в stdin pw-cat по мере готовности
+        (время до первого звука ↓). Громкость — pw-cat --volume; усиление >1 — gain PCM."""
+        rate = int(self._voice.config.sample_rate)
+        cmd = ["pw-cat", "-p", "--raw", "--rate", str(rate), "--channels", "1", "--format", "s16",
+               "--volume", f"{max(0.0, volume):.3f}", "--latency", f"{config.TTS_LATENCY_MS}ms", "-"]
         if config.TTS_SINK:
             cmd += ["--target", config.TTS_SINK]
-        proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        )
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         self._play_proc = proc
+        err = b""
         try:
-            _, err = proc.communicate(pcm)
+            for chunk in self._voice.synthesize(text):
+                pcm = chunk.audio_int16_bytes
+                if gain > 1.0:
+                    pcm = AudioEnv.apply_gain(pcm, gain)
+                try:
+                    proc.stdin.write(pcm)  # стримим по мере синтеза
+                except BrokenPipeError:
+                    break
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            proc.wait()  # дождаться конца воспроизведения (НЕ communicate — stdin уже закрыт)
+            try:
+                err = proc.stderr.read() or b""
+            except Exception:
+                err = b""
         finally:
             self._play_proc = None
-        if proc.returncode != 0:
+        if proc.returncode not in (0, None):
             detail = err.decode("utf-8", "replace").strip() if err else ""
-            raise RuntimeError(
-                f"pw-cat вернул код {proc.returncode}: {detail or 'без stderr'}"
-            )
+            raise RuntimeError(f"pw-cat вернул код {proc.returncode}: {detail or 'без stderr'}")
 
     def on_stop(self):
-        """Прерываем воспроизведение и ждём воркер ДО выхода интерпретатора.
-
-        Иначе резкое убийство потока с активным pw-cat оставляет осиротевший процесс
-        воспроизведения. Сначала прерываем текущий pw-cat (разблокирует communicate),
-        затем ждём выхода воркера.
-        """
+        """Останавливаем замерщики, прерываем воспроизведение, ждём воркер ДО выхода."""
+        try:
+            self._env.stop()
+        except Exception:
+            self.log.debug("Ошибка остановки замерщиков обстановки", exc_info=True)
         proc = self._play_proc
         if proc is not None:
             try:
-                proc.terminate()  # прерываем текущее воспроизведение
+                proc.terminate()
             except Exception:
                 self.log.debug("Не удалось прервать pw-cat", exc_info=True)
         try:
@@ -169,20 +188,6 @@ class TtsModule(JarvisModule):
                 self._worker.join(timeout=2.0)
         except Exception:
             self.log_exc(logging.ERROR, "Ошибка ожидания воспроизводящего потока")
-
-    def _synthesize(self, text: str) -> tuple[bytes, int]:
-        """Синтез фразы -> (PCM signed-16 mono, sample_rate).
-
-        piper-tts 1.4.x: synthesize() возвращает итератор AudioChunk (по одному на
-        предложение). Собираем int16-PCM из всех чанков; частоту берём из самого
-        чанка — она достовернее, чем из конфига.
-        """
-        pcm = bytearray()
-        sample_rate = self._voice.config.sample_rate  # запасное значение
-        for chunk in self._voice.synthesize(text):
-            pcm += chunk.audio_int16_bytes
-            sample_rate = chunk.sample_rate
-        return bytes(pcm), sample_rate
 
 
 def main():

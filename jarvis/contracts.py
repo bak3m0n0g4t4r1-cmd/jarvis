@@ -7,9 +7,9 @@
 from typing import Literal
 
 # --- Имена топиков шины ---
-TOPIC_INPUT = "jarvis/input"      # {"text": "..."}
+TOPIC_INPUT = "jarvis/input"      # {"text": "...", "user_level"?: float}  (опц. громкость речи)
 TOPIC_EXECUTE = "jarvis/execute"  # {"command_tag": "..."}
-TOPIC_SAY = "jarvis/say"          # {"text": "...", "source": "..."}
+TOPIC_SAY = "jarvis/say"          # {"text": "...", "source": "...", "user_level"?: float}
 TOPIC_STATE = "jarvis/state"      # {"state": "...", "source": "..."}
 
 # --- Уровни QoS (см. таблицу контрактов в CLAUDE.md) ---

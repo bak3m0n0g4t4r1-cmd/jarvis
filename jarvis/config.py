@@ -108,6 +108,43 @@ PIPER_CONFIG = os.getenv(
 # На TUXEDO sounddevice/PortAudio не видит аналоговый вывод (только HDMI) — играем через
 # PipeWire (pw-cat), иначе Джарвис нем (paInvalidSampleRate на 22050 Гц). См. tts.py.
 TTS_SINK = os.getenv("JARVIS_TTS_SINK", "").strip()
+# Греть Piper в фоне при старте (1) — первая фраза без ~3с задержки (ценой ~106 МБ RAM);
+# 0 — лениво (экономия RAM, но первая реплика ждёт загрузку голоса).
+TTS_PRELOAD = os.getenv("JARVIS_TTS_PRELOAD", "1") not in ("0", "false", "no", "")
+# Задержка узла pw-cat (мс): меньше — быстрее старт звука. 30 мс комфортно на N100.
+TTS_LATENCY_MS = int(os.getenv("JARVIS_TTS_LATENCY_MS", "30"))
+
+# --- STT: источник захвата (опц. шумоподавление через PipeWire echo-cancel) ---
+# Пусто = системный default-микрофон. Имя обработанного source (echo-cancel) → STT слушает его.
+STT_SOURCE = os.getenv("JARVIS_STT_SOURCE", "").strip()
+
+# --- Адаптивная громкость голоса (основа TTS, см. audio_env.py) ---
+# Меряем РЕАЛЬНЫЕ уровни сигнала (RMS 0..1), НЕ позиции регуляторов. Громкость голоса —
+# функция от внешнего шума И громкости речи пользователя: в тишине следуем за пользователем
+# (вплоть до шёпота), в шуме — за уровнем шума (разборчивость важнее).
+ADAPTIVE_VOLUME = os.getenv("JARVIS_ADAPTIVE_VOLUME", "1") not in ("0", "false", "no", "")
+# Порог реального уровня воспроизведения ноута (RMS monitor): выше — приглушаем музыку (ducking).
+DUCK_THRESHOLD = float(os.getenv("JARVIS_DUCK_THRESHOLD", "0.02"))
+# До какой доли громкости приглушать музыку (0.35 = 35%, НЕ в ноль — слышна фоном).
+DUCK_LEVEL = float(os.getenv("JARVIS_DUCK_LEVEL", "0.35"))
+# Связь «колонки→микрофон»: внешний шум = mic_rms − k·monitor_rms (вычесть свой звук из ноута).
+NOISE_SUBTRACT_K = float(os.getenv("JARVIS_NOISE_SUBTRACT_K", "0.7"))
+# Порог «тихо вокруг» (RMS внешнего шума): ниже — громкость следует за речью пользователя,
+# выше — за шумом (разборчивость важнее тихости пользователя).
+QUIET_THRESHOLD = float(os.getenv("JARVIS_QUIET_THRESHOLD", "0.015"))
+# Громкость голоса pw-cat (0..1): мин (шёпот в полной тишине), база (норма), макс (до gain).
+VOICE_VOLUME_MIN = float(os.getenv("JARVIS_VOICE_VOLUME_MIN", "0.35"))
+VOICE_VOLUME_BASE = float(os.getenv("JARVIS_VOICE_VOLUME_BASE", "0.7"))
+VOICE_VOLUME_MAX = float(os.getenv("JARVIS_VOICE_VOLUME_MAX", "1.0"))
+# Макс программное усиление PCM при сильном шуме (>1.0 = громче нормы; на пиках возможен клиппинг).
+VOICE_GAIN_MAX = float(os.getenv("JARVIS_VOICE_GAIN_MAX", "1.5"))
+# Чувствительность: насколько громкость следует за шумом / за громкостью речи пользователя.
+NOISE_TO_VOLUME = float(os.getenv("JARVIS_NOISE_TO_VOLUME", "3.0"))
+USER_TO_VOLUME = float(os.getenv("JARVIS_USER_TO_VOLUME", "4.0"))
+# Скорость плавных переходов громкости/ducking (доля приближения к цели за шаг рампы, 0..1).
+VOLUME_RAMP = float(os.getenv("JARVIS_VOLUME_RAMP", "0.25"))
+# Окно/период замера RMS фоновыми замерщиками (с) — короткое, лёгкое по CPU.
+NOISE_WINDOW = float(os.getenv("JARVIS_NOISE_WINDOW", "0.1"))
 
 # --- OS-агент ---
 COMMANDS_FILE = os.getenv("JARVIS_COMMANDS_FILE", str(BASE_DIR / "commands.yaml"))
