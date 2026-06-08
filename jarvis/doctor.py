@@ -1140,6 +1140,101 @@ def live_chain_test() -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Напоминания о перерыве (детектор активности): доступ к /dev/input и яркость
+# --------------------------------------------------------------------------- #
+# Биты EV для отбора устройств ВВОДА (бит N = тип события N; см. activity_monitor.py).
+# EV_KEY=0x02, EV_REL=0x04, EV_ABS=0x08, EV_REP=0x100000 (0x01=EV_SYN — у всех, не показателен).
+_EV_KEY, _EV_REL, _EV_ABS, _EV_REP = 0x02, 0x04, 0x08, 0x100000
+
+
+def _input_event_paths() -> list:
+    """Пути /dev/input/eventN клавиатуры/мыши/тачпада по /proc/bus/input/devices."""
+    paths: list = []
+    try:
+        text = Path("/proc/bus/input/devices").read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return paths
+    handlers, ev = None, 0
+    for line in text.splitlines() + [""]:
+        if line.startswith("H: Handlers="):
+            handlers = line.split("=", 1)[1]
+        elif line.startswith("B: EV="):
+            try:
+                ev = int(line.split("=", 1)[1].strip(), 16)
+            except Exception:
+                ev = 0
+        elif not line.strip():
+            if handlers and ev and (ev & (_EV_REL | _EV_ABS)
+                                    or (ev & _EV_KEY and ev & _EV_REP)):
+                for tok in handlers.split():
+                    if tok.startswith("event"):
+                        paths.append("/dev/input/" + tok)
+                        break
+            handlers, ev = None, 0
+    return paths
+
+
+def check_input_access() -> CheckResult:
+    """Детектор активности читает /dev/input (idle на Wayland опрашивать нельзя) — нужен
+    доступ к устройствам ввода (группа input). Без него сервис «спит» — проверяем явно."""
+    if not config.BREAKS_ENABLED:
+        return CheckResult(OK, "напоминания о перерыве выключены (break_reminders.enabled=false)")
+    paths = _input_event_paths()
+    if not paths:
+        return CheckResult(
+            WARN, "детектор активности: устройства ввода",
+            reason="клавиатура/мышь не найдены в /proc/bus/input/devices.",
+            fix="подключите мышь/клавиатуру; проверьте /proc/bus/input/devices",
+        )
+    import os
+
+    for p in paths:
+        try:
+            fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+            os.close(fd)
+            return CheckResult(OK, f"детектор активности: /dev/input читается ({len(paths)} устройств)")
+        except OSError:
+            continue
+    return CheckResult(
+        WARN, "детектор активности: нет доступа к /dev/input",
+        reason="пользователь не в группе input → idle не отслеживается, сервис «спит».",
+        fix="sudo usermod -aG input $USER, затем ПЕРЕЛОГИН (та же группа нужна ydotool)",
+    )
+
+
+def check_brightness():
+    """Затемнение экрана при напоминании — read-only проба brightnessctl (get/max)."""
+    if not config.BREAKS_ENABLED:
+        return None
+    if not shutil.which("brightnessctl"):
+        return CheckResult(
+            WARN, "затемнение экрана: brightnessctl",
+            reason="бинаря brightnessctl нет → затемнение при напоминании не сработает.",
+            fix="sudo apt install brightnessctl",
+        )
+    try:
+        cur = subprocess.run(["brightnessctl", "get"], capture_output=True, text=True,
+                             timeout=3, check=False)
+        mx = subprocess.run(["brightnessctl", "max"], capture_output=True, text=True,
+                            timeout=3, check=False)
+        if cur.returncode == 0 and cur.stdout.strip().isdigit() and mx.stdout.strip().isdigit():
+            return CheckResult(
+                OK, f"затемнение экрана: brightnessctl читает яркость "
+                    f"({cur.stdout.strip()}/{mx.stdout.strip()})")
+        return CheckResult(
+            WARN, "затемнение экрана: brightnessctl",
+            reason=f"неожиданный вывод get/max (код {cur.returncode}).",
+            fix="проверьте `brightnessctl get` вручную",
+        )
+    except Exception as exc:
+        return CheckResult(
+            WARN, "затемнение экрана: brightnessctl",
+            reason=f"проба не удалась: {exc}",
+            fix="проверьте `brightnessctl get` вручную",
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Оркестрация
 # --------------------------------------------------------------------------- #
 def run(quick: bool = False) -> bool:
@@ -1168,6 +1263,8 @@ def run(quick: bool = False) -> bool:
         reporter.note("проверяю стабильность MQTT (≈5 c)…")
     _safe(reporter, check_mqtt_stability, quick)
     _safe(reporter, check_audio)
+    _safe(reporter, check_input_access)
+    _safe(reporter, check_brightness)
 
     reporter.section("Слой 4. Модели и распознавание")
     reporter.note("загружаю модели движком…")

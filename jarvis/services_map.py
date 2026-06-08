@@ -39,4 +39,10 @@ SERVICES = [
         "jarvis.services.tts", "TtsModule", "«Голос» — Piper TTS",
         needs_audio=True,
     ),
+    ServiceDef(
+        "activity_monitor", "jarvis-activity-monitor.service", "jarvis-activity-monitor",
+        "jarvis.services.activity_monitor", "ActivityMonitorModule",
+        "«Внимание» — детектор активности и напоминания о перерыве",
+        needs_audio=False,
+    ),
 ]

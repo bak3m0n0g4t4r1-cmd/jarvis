@@ -16,6 +16,7 @@ from datetime import datetime
 import yaml
 
 from jarvis import config, contracts
+from jarvis.breaks import is_stop_phrase
 from jarvis.bus import JarvisModule
 from jarvis.matcher import NOT_RECOGNIZED, Matcher
 from jarvis.sysinfo import read_battery, read_system_load, read_volume
@@ -65,6 +66,12 @@ class CoreModule(JarvisModule):
     def on_input(self, payload: dict):
         text = (payload.get("text") or "").strip()
         if not text:
+            return
+        # Стоп-фразу перерыва («не сейчас», «я работаю» и т.п.) обрабатывает сервис
+        # activity_monitor (он же ответит и сбросит цикл). Здесь молчим, чтобы не было
+        # двойного ответа — иначе поверх ответа на стоп прозвучало бы «не разобрал».
+        if is_stop_phrase(text):
+            self.log.info("Стоп-фраза перерыва — обработает монитор активности: %s", text)
             return
         # Громкость речи пользователя (от STT) пробрасываем в ответ — для адаптивной громкости TTS.
         level = payload.get("user_level")

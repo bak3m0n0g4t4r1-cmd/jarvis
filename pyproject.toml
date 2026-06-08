@@ -28,6 +28,7 @@ jarvis-stt = "jarvis.services.stt:main"
 jarvis-core = "jarvis.services.core:main"
 jarvis-os-agent = "jarvis.services.os_agent:main"
 jarvis-tts = "jarvis.services.tts:main"
+jarvis-activity-monitor = "jarvis.services.activity_monitor:main"
 
 [tool.setuptools.packages.find]
 include = ["jarvis*"]

@@ -205,3 +205,87 @@ USER_TO_VOLUME = _get("adaptive_audio", "user_to_volume", 4.0, "JARVIS_USER_TO_V
 VOLUME_RAMP = _get("adaptive_audio", "volume_ramp", 0.25, "JARVIS_VOLUME_RAMP")
 # Окно/период замера RMS фоновыми замерщиками (с) — короткое, лёгкое по CPU.
 NOISE_WINDOW = _get("adaptive_audio", "noise_window", 0.1, "JARVIS_NOISE_WINDOW")
+
+# === Напоминания о перерыве: детектор активности (секция break_reminders) ===
+# Дефолтные фразы (полные списки — чтобы фича работала даже без settings.yaml).
+# Авторитетная редактируемая копия — в settings.yaml.
+_DEFAULT_OFFER_PHRASES = [
+    "Сэр, вы за работой уже больше двадцати минут без передышки. Рекомендую короткий "
+    "перерыв — глаза и спина будут признательны.",
+    "Позволю себе заметить, сэр: вы трудитесь без остановки довольно долго. Пять минут "
+    "паузы сейчас сэкономят вам час усталости позже.",
+    "Сэр, даже самые надёжные системы нуждаются в охлаждении. Краткий перерыв пошёл бы "
+    "вам на пользу.",
+    "Прошу прощения, что вмешиваюсь, сэр, но вы давно не отрывались от экрана. Самое "
+    "время размяться.",
+    "Сэр, ваша продуктивность впечатляет, но даже она выигрывает от короткой паузы. "
+    "Предлагаю передохнуть.",
+    "Замечу без нотаций о здоровье, сэр: небольшой перерыв сейчас — разумная инвестиция "
+    "в следующий час работы.",
+    "Сэр, вы работаете уже изрядное время. Если позволите совет — встаньте, пройдитесь, "
+    "дайте глазам отдых.",
+    "Не сочтите за назойливость, сэр, но человеческий организм не рассчитан на "
+    "непрерывную работу за экраном. Перерыв?",
+    "Сэр, я бы рекомендовал паузу. Дела никуда не денутся, а свежая голова после отдыха "
+    "работает заметно лучше.",
+    "Время сделать перерыв, сэр. Обещаю присмотреть за всем, пока вы переведёте дух.",
+]
+_DEFAULT_PRAISE_PHRASES = [
+    "С возвращением, сэр. Разумное решение — отдых ещё никому не вредил.",
+    "Превосходно, сэр. Перерыв пойдёт вам только на пользу.",
+    "Рад, что вы прислушались, сэр. Теперь, полагаю, дело пойдёт бодрее.",
+    "Отдохнули — и правильно сделали, сэр. Я ценю благоразумие.",
+    "С возвращением, сэр. Свежая голова — лучший инструмент, и вы только что его наточили.",
+    "Хорошее решение, сэр. Даже короткая пауза творит чудеса с концентрацией.",
+    "Вот это по-взрослому, сэр. Отдых — не роскошь, а необходимость.",
+    "Признаться, я доволен, сэр. Перерыв был кстати.",
+    "С возвращением, сэр. Надеюсь, отдых был приятным — продолжим?",
+    "Отлично, сэр. Вы позаботились о себе — это всегда верный ход.",
+]
+_DEFAULT_STOP_REPLIES = [
+    "Как скажете, сэр. Напоминать не буду — но за вами всё равно присмотрю.",
+    "Понял, сэр. Снимаю вопрос о перерыве.",
+    "Воля ваша, сэр. Отсчёт обнулю.",
+]
+_DEFAULT_STOP_PHRASES = [
+    "не сейчас", "не время", "позже", "потом", "я работаю",
+    "не мешай", "продолжаю работать", "отложим перерыв", "перерыв не нужен",
+]
+
+# Включить фичу напоминаний о перерыве (false — сервис работает «вхолостую», молчит).
+BREAKS_ENABLED = _get("break_reminders", "enabled", True, "JARVIS_BREAKS_ENABLED")
+# Период тика логики (с). Реже — легче по CPU, грубее реакция. 5с — комфортный баланс.
+BREAK_TICK = _get("break_reminders", "tick_seconds", 5.0, "JARVIS_BREAK_TICK")
+# Длительность цикла активности (мин) — случайная в диапазоне при каждом цикле. В секунды ниже.
+BREAK_CYCLE_MIN = _get("break_reminders", "cycle_min_minutes", 20, "JARVIS_BREAK_CYCLE_MIN") * 60
+BREAK_CYCLE_MAX = _get("break_reminders", "cycle_max_minutes", 30, "JARVIS_BREAK_CYCLE_MAX") * 60
+# Микропауза (с): простой короче — активность ПРОДОЛЖАЕТ копиться (задумался, потянулся).
+BREAK_MICRO_PAUSE = _get("break_reminders", "micro_pause_seconds", 80, "JARVIS_BREAK_MICRO")
+# Смена деятельности (с): простой ≥ этого → цикл ПОЛНОСТЬЮ сбрасывается (отошёл). Перекрывает микропаузу.
+BREAK_RESET_IDLE = _get("break_reminders", "reset_idle_seconds", 180, "JARVIS_BREAK_RESET")
+# Длительность ЗАСЧИТАННОГО перерыва (с) — случайная в диапазоне. После него — похвала + цикл заново.
+BREAK_MIN_SECONDS = _get("break_reminders", "break_min_seconds", 240, "JARVIS_BREAK_MIN")
+BREAK_MAX_SECONDS = _get("break_reminders", "break_max_seconds", 300, "JARVIS_BREAK_MAX")
+# Задержка повторного напоминания при игноре (с) — случайная. Считается по АКТИВНОМУ времени.
+BREAK_REMIND_MIN = _get("break_reminders", "remind_after_min_seconds", 300, "JARVIS_BREAK_REMIND_MIN")
+BREAK_REMIND_MAX = _get("break_reminders", "remind_after_max_seconds", 360, "JARVIS_BREAK_REMIND_MAX")
+# На сколько процентов затемнять экран при ре-напоминании (40–50 по ТЗ; 45 — середина).
+BREAK_DIM_PERCENT = _get("break_reminders", "dim_percent", 45, "JARVIS_BREAK_DIM")
+# Нижний предел яркости при затемнении (% от максимума) — экран не в ноль.
+BREAK_DIM_FLOOR_PERCENT = _get("break_reminders", "dim_floor_percent", 10, "JARVIS_BREAK_DIM_FLOOR")
+# Плавность затемнения: число шагов рампы и её длительность (с).
+BREAK_DIM_STEPS = _get("break_reminders", "dim_ramp_steps", 8, "JARVIS_BREAK_DIM_STEPS")
+BREAK_DIM_RAMP_SECONDS = _get("break_reminders", "dim_ramp_seconds", 2.0, "JARVIS_BREAK_DIM_DUR")
+# Период переэнумерации устройств ввода /dev/input (с) — для hotplug.
+BREAK_DEVICE_RESCAN = _get("break_reminders", "device_rescan_seconds", 60, "JARVIS_BREAK_RESCAN")
+# Порог распознавания стоп-фразы (difflib 0..1, полное совпадение). ВЫСОКИЙ — чтобы не
+# проглатывать похожие обычные команды.
+BREAK_STOP_THRESHOLD = _get("break_reminders", "stop_phrase_threshold", 0.85, "JARVIS_STOP_THRESHOLD")
+# Минимум отработанного активного времени (мин) для похвалы — защита от похвалы за «перерыв»
+# сразу после логина. 0 = хвалить за любой засчитанный перерыв (поведение ТЗ).
+BREAK_PRAISE_MIN_WORK = _get("break_reminders", "praise_min_work_minutes", 0, "JARVIS_BREAK_PRAISE_MIN") * 60
+# Списки фраз (env-оверрайд бессмыслен из-за запятых внутри — только settings.yaml; env=None).
+BREAK_OFFER_PHRASES = _get("break_reminders", "offer_phrases", _DEFAULT_OFFER_PHRASES, None)
+BREAK_PRAISE_PHRASES = _get("break_reminders", "praise_phrases", _DEFAULT_PRAISE_PHRASES, None)
+BREAK_STOP_REPLIES = _get("break_reminders", "stop_replies", _DEFAULT_STOP_REPLIES, None)
+BREAK_STOP_PHRASES = _get("break_reminders", "stop_phrases", _DEFAULT_STOP_PHRASES, None)
