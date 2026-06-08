@@ -29,7 +29,7 @@ from collections import namedtuple
 from difflib import SequenceMatcher
 from typing import Optional
 
-from jarvis import config
+from jarvis import config, phrases
 
 _log = logging.getLogger("jarvis-matcher")
 
@@ -37,7 +37,12 @@ _log = logging.getLogger("jarvis-matcher")
 Match = namedtuple("Match", ["tag", "score", "layer"])
 
 # Фолбэк-пул подтверждений в характере (если у команды нет своего «подтверждение»).
-_GENERIC_CONFIRMATIONS = ("Сделано, сэр.", "Готово, сэр.", "Выполняю, сэр.")
+# Выбираются без повторов в цикле (общий механизм jarvis.phrases) — мгновенно даёт
+# вариативность всем командам, у которых нет собственного пака.
+_GENERIC_CONFIRMATIONS = (
+    "Сделано, сэр.", "Готово, сэр.", "Выполняю, сэр.", "Выполнено, сэр.",
+    "Будет сделано, сэр.", "Как пожелаете, сэр.", "Сию минуту, сэр.", "Разумеется, сэр.",
+)
 # Реплика на нераспознанное — в характере, без падения.
 NOT_RECOGNIZED = "Боюсь, не разобрал, сэр. Повторите?"
 
@@ -201,15 +206,21 @@ class Matcher:
         return self._match_embeddings(query)
 
     def confirmation(self, tag: str) -> str:
-        """Подтверждение в характере для тега: своё из yaml или из общего пула."""
+        """Подтверждение в характере для тега: свой пак из commands.yaml или общий пул.
+
+        Поле «подтверждение» может быть СТРОКОЙ (одна фраза) или СПИСКОМ (пак вариаций) — в
+        обоих случаях выбор идёт через общий механизм без повторов (jarvis.phrases): для пака
+        чередуем вариации (не повторяясь в пределах цикла), для одной фразы возвращаем её же.
+        Нет поля — общий пул в характере (тоже без повторов)."""
         spec = self._commands.get(tag) or {}
-        own = (spec.get("подтверждение") or "").strip()
-        if own:
-            return own
-        # Детерминированный выбор из пула по тегу. ВАЖНО: встроенный hash() для строк
-        # рандомизирован между процессами (PYTHONHASHSEED) — иначе фолбэк-подтверждение
-        # скакало бы при каждом перезапуске. sum(ord) даёт стабильный индекс без импортов.
-        return _GENERIC_CONFIRMATIONS[sum(map(ord, tag)) % len(_GENERIC_CONFIRMATIONS)]
+        own = spec.get("подтверждение")
+        if isinstance(own, (list, tuple)):
+            variants = [str(v).strip() for v in own if str(v).strip()]
+            if variants:
+                return phrases.pick(f"confirm:{tag}", variants)
+        elif isinstance(own, str) and own.strip():
+            return own.strip()
+        return phrases.pick("confirm.generic", _GENERIC_CONFIRMATIONS)
 
     # ------------------------------------------------------------------ #
     # Слой 1: правила

@@ -28,8 +28,8 @@ import threading
 import time
 from pathlib import Path
 
-from jarvis import config, contracts
-from jarvis.breaks import is_stop_phrase, pick_phrase
+from jarvis import config, contracts, phrases
+from jarvis.breaks import is_stop_phrase
 from jarvis.bus import JarvisModule
 
 # Биты битовой маски `B: EV=` в /proc/bus/input/devices: бит N взведён, если устройство
@@ -86,10 +86,9 @@ class ActivityMonitorModule(JarvisModule):
         self._dim_saved_raw = None                   # исходная яркость (raw) до затемнения; None = не затемняли
         self._dim_state_file = config.LOGS_DIR / "break_dim_state.json"
 
-        # --- фразы без немедленного повтора ---
-        self._last_offer = -1
-        self._last_praise = -1
-        self._last_reply = -1
+        # Выбор фраз (без повторов в цикле) — общий механизм jarvis.phrases; состояние
+        # циклов хранится в нём по ключам пака ("break.offer"/"break.praise"/"break.reply"),
+        # поэтому локальные индексы здесь больше не нужны.
 
         # Состояние автомата мутируется из ДВУХ потоков: логики (_tick) и MQTT-колбэка
         # (_on_input/_on_execute). Один lock сериализует мутации. _last_input под lock НЕ
@@ -332,8 +331,7 @@ class ActivityMonitorModule(JarvisModule):
         # держим тёмный экран после того, как человек уже отошёл и вернулся).
         self._restore_brightness()
         if credited and worked_enough:
-            idx, phrase = pick_phrase(config.BREAK_PRAISE_PHRASES, self._last_praise)
-            self._last_praise = idx
+            phrase = phrases.pick("break.praise", config.BREAK_PRAISE_PHRASES)
             if phrase:
                 self._say(phrase)
             self.log.info("Пользователь вернулся с перерыва — похвала")
@@ -346,8 +344,7 @@ class ActivityMonitorModule(JarvisModule):
         self._last_input = now  # возврат = активность (если не было _say выше)
 
     def _offer_break(self):
-        idx, phrase = pick_phrase(config.BREAK_OFFER_PHRASES, self._last_offer)
-        self._last_offer = idx
+        phrase = phrases.pick("break.offer", config.BREAK_OFFER_PHRASES)
         if phrase:
             self._say(phrase)
         self._state = _OFFERED
@@ -358,8 +355,7 @@ class ActivityMonitorModule(JarvisModule):
 
     def _enter_dimmed(self):
         self._dim_screen()
-        idx, phrase = pick_phrase(config.BREAK_OFFER_PHRASES, self._last_offer)
-        self._last_offer = idx
+        phrase = phrases.pick("break.offer", config.BREAK_OFFER_PHRASES)
         if phrase:
             self._say(phrase)
         self._state = _DIMMED
@@ -368,8 +364,7 @@ class ActivityMonitorModule(JarvisModule):
         self.log.info("Предложение проигнорировано — экран затемнён, напоминание повторено")
 
     def _repeat_reminder(self):
-        idx, phrase = pick_phrase(config.BREAK_OFFER_PHRASES, self._last_offer)
-        self._last_offer = idx
+        phrase = phrases.pick("break.offer", config.BREAK_OFFER_PHRASES)
         if phrase:
             self._say(phrase)
         self._remind_active_accum = 0.0
@@ -398,8 +393,7 @@ class ActivityMonitorModule(JarvisModule):
             if not acting:
                 self.log.debug("Стоп-фраза вне контекста напоминания — игнорирую")
                 return
-            idx, reply = pick_phrase(config.BREAK_STOP_REPLIES, self._last_reply)
-            self._last_reply = idx
+            reply = phrases.pick("break.reply", config.BREAK_STOP_REPLIES)
             if reply:
                 self._say(reply)
             self._restore_brightness()

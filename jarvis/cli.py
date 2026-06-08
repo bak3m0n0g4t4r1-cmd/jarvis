@@ -124,6 +124,69 @@ def cmd_test(args) -> int:
     return 0 if doctor.live_chain_test() else 1
 
 
+def _unit_running(unit: str) -> bool:
+    """True, если юнит реально работает (ActiveState=active И SubState=running).
+
+    Парсим key=value (без --value) — устойчиво к порядку полей. Любой сбой → False."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", unit, "-p", "ActiveState,SubState"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        kv = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        return kv.get("ActiveState") == "active" and kv.get("SubState") == "running"
+    except Exception:
+        return False
+
+
+def _settle_and_status() -> bool:
+    """Дать сервисам осесть и определить статус запуска по РЕАЛЬНОМУ состоянию юнитов.
+
+    Type=simple → 'active' появляется при СТАРТЕ процесса, не при готовности; даём время на
+    загрузку моделей STT и прогрев Piper. Крэш-цикл на инициализации (Restart=always) ловим
+    двумя замерами с паузой: упавший сервис не держится 'running' на обоих. Все active/running
+    на обоих замерах → успех; иначе → проблема."""
+    import time
+
+    time.sleep(5.0)  # старт процессов + загрузка моделей STT и прогрев Piper
+    ok = True
+    for _ in range(2):
+        ok = ok and all(_unit_running(svc.unit) for svc in SERVICES)
+        time.sleep(1.2)
+    return ok
+
+
+def _announce_startup(ok: bool) -> None:
+    """Озвучить старт по статусу (успех/проблема) фирменной фразой без повторов.
+
+    Публикуем в jarvis/say разовым MQTT-клиентом (как сквозной тест доктора): сервисы уже
+    осели и подписаны, TTS прогрет. Всё в try-except: сбой объявления НЕ влияет на `jarvis start`."""
+    import json
+    import time
+
+    from jarvis import contracts, phrases
+
+    pack = config.STARTUP_SUCCESS_PHRASES if ok else config.STARTUP_PROBLEM_PHRASES
+    text = phrases.pick("startup.ok" if ok else "startup.warn", pack)
+    if not text:
+        return
+    import paho.mqtt.client as mqtt
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="jarvis-start-announce")
+    client.connect(config.MQTT_HOST, config.MQTT_PORT, 5)
+    client.loop_start()
+    try:
+        client.publish(contracts.TOPIC_SAY,
+                       json.dumps({"text": text, "source": "startup"}),
+                       qos=contracts.QOS_SAY)
+        time.sleep(1.0)  # дать сообщению долететь до брокера/TTS до disconnect
+    finally:
+        client.loop_stop()
+        client.disconnect()
+    status = "успех" if ok else "проблема"
+    print(f"✓ Старт объявлен ({status}): {text}")
+
+
 def cmd_start(args) -> int:
     units_dir = _install_units()
     print(f"✓ Юниты обновлены: {units_dir}")
@@ -135,6 +198,13 @@ def cmd_start(args) -> int:
         # с новым кодом (старый --now этого не делал — крутился старый процесс).
         rc |= _systemctl("enable", svc.unit)
         rc |= _systemctl("restart", svc.unit)
+    # Объявить старт голосом по реальному статусу сервисов (успех/проблема). В try-except:
+    # сбой объявления НЕ должен менять код возврата `jarvis start` (печать выше остаётся).
+    try:
+        if config.STARTUP_ANNOUNCE:
+            _announce_startup(_settle_and_status())
+    except Exception as exc:
+        print(f"(объявление старта пропущено: {exc})")
     return 0 if rc == 0 else 1
 
 

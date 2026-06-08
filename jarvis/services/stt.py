@@ -25,6 +25,9 @@ _AUDIO_MAX_RETRIES = 5
 _AUDIO_RETRY_BASE = 1.0   # секунды
 _AUDIO_RETRY_MAX = 10.0   # секунды
 
+# Адаптивный порог VAD: не пересобираем детектор чаще, чем раз в столько секунд (анти-дёрганье).
+_VAD_SWITCH_MIN_INTERVAL = 10.0
+
 
 class SttModule(JarvisModule):
     """«Уши»: слушает микрофон и публикует команды после wake-word."""
@@ -43,6 +46,11 @@ class SttModule(JarvisModule):
         # Контент-фильтр эха: последняя фраза Джарвиса и срок действия фильтра.
         self._last_say_text = ""
         self._echo_until = 0.0  # время (monotonic), до которого сверяем с эхом
+        # Адаптивный порог VAD: в тишине чуть снижаем (ловим тихую речь), в шуме — закреплённая
+        # база. Шумовой пол оцениваем по собственному потоку захвата (без второго аудиострима).
+        self._noise_floor = config.QUIET_THRESHOLD  # старт на границе → до замера тишины держим базу
+        self._vad_threshold = config.VAD_THRESHOLD  # текущий эффективный порог VAD
+        self._last_vad_switch = 0.0                 # rate-limit пересборки VAD (анти-дёрганье)
 
     def on_start(self):
         self._init_engines()
@@ -53,22 +61,33 @@ class SttModule(JarvisModule):
         self._audio_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._audio_thread.start()
 
+    def _build_vad(self, threshold: float):
+        """Построить детектор голоса (silero-VAD) с заданным порогом.
+
+        Вынесено отдельно, чтобы адаптивно ПЕРЕСОБИРАТЬ VAD под обстановку: порог задаётся при
+        конструировании (живой правки порога в sherpa-onnx нет), а silero крошечный — пересборка
+        дешёвая и редкая (только при смене полосы тишина/шум). Прочие пороги (тишина/речь/буфер) —
+        ЗАКРЕПЛЁННЫЕ из config, не трогаем."""
+        import sherpa_onnx
+
+        vad_config = sherpa_onnx.VadModelConfig()
+        vad_config.silero_vad.model = config.VAD_MODEL
+        vad_config.silero_vad.threshold = threshold
+        vad_config.silero_vad.min_silence_duration = config.VAD_MIN_SILENCE
+        vad_config.silero_vad.min_speech_duration = config.VAD_MIN_SPEECH
+        vad_config.sample_rate = config.SAMPLE_RATE
+        # Один поток на N100 (сверено: VadModelConfig.num_threads поддержан).
+        vad_config.num_threads = config.STT_NUM_THREADS
+        # Буфер VAD короче (команды короткие) — меньше RAM, чем прежние 30с.
+        return sherpa_onnx.VoiceActivityDetector(
+            vad_config, buffer_size_in_seconds=config.VAD_BUFFER_SECONDS
+        )
+
     def _init_engines(self):
         try:
             import sherpa_onnx
 
-            vad_config = sherpa_onnx.VadModelConfig()
-            vad_config.silero_vad.model = config.VAD_MODEL
-            vad_config.silero_vad.threshold = config.VAD_THRESHOLD
-            vad_config.silero_vad.min_silence_duration = config.VAD_MIN_SILENCE
-            vad_config.silero_vad.min_speech_duration = config.VAD_MIN_SPEECH
-            vad_config.sample_rate = config.SAMPLE_RATE
-            # Один поток на N100 (сверено: VadModelConfig.num_threads поддержан).
-            vad_config.num_threads = config.STT_NUM_THREADS
-            # Буфер VAD короче (команды короткие) — меньше RAM, чем прежние 30с.
-            self._vad = sherpa_onnx.VoiceActivityDetector(
-                vad_config, buffer_size_in_seconds=config.VAD_BUFFER_SECONDS
-            )
+            self._vad = self._build_vad(self._vad_threshold)
 
             # zipformer-ru — offline transducer с BPE-словарём. num_threads=1 — меньше
             # потоковой возни на крошечной модели (сверено: параметр поддержан).
@@ -164,6 +183,9 @@ class SttModule(JarvisModule):
                 # со следующей фразой пользователя.
                 self._need_vad_reset = True
                 continue
+            # Адаптация порога VAD под обстановку. Пересборка детектора — в ЭТОМ же потоке
+            # (нет гонки с accept_waveform) и ДО reset/accept, чтобы свежий VAD начал с чистого листа.
+            self._maybe_adapt_threshold(time.monotonic())
             # Возобновились — сбрасываем VAD ОДИН раз на границе muted→активен.
             if self._need_vad_reset:
                 self._vad.reset()
@@ -171,10 +193,60 @@ class SttModule(JarvisModule):
                 self.log.debug("VAD сброшен при возобновлении слушания")
             samples = np.asarray(data, dtype=np.float32).reshape(-1)
             self._vad.accept_waveform(samples)
+            # Оценка шумового пола — ТОЛЬКО когда речь не детектируется (фон, не голос пользователя):
+            # иначе тихая речь не снижала бы порог. Та же RMS-формула, что у audio_env.
+            if not self._vad.is_speech_detected():
+                self._update_noise_floor(samples)
             while not self._vad.empty():
                 segment = np.asarray(self._vad.front.samples, dtype=np.float32)
                 self._vad.pop()
                 self._transcribe(segment)
+
+    def _update_noise_floor(self, samples: np.ndarray) -> None:
+        """Оценка шумового пола по фоновым (не-речевым) окнам захвата.
+
+        Асимметричная EMA: быстро вниз / очень медленно вверх → следим за фоном, всплески речи
+        почти не задирают пол. RMS-формула как в audio_env (единые единицы с адаптивной громкостью)."""
+        try:
+            rms = float(np.sqrt(np.mean(np.square(samples)) + 1e-12))
+            if rms < self._noise_floor:
+                self._noise_floor = 0.9 * self._noise_floor + 0.1 * rms
+            else:
+                self._noise_floor = 0.995 * self._noise_floor + 0.005 * rms
+        except Exception:
+            self.log.debug("Не удалось обновить шумовой пол", exc_info=True)
+
+    def _maybe_adapt_threshold(self, now: float) -> None:
+        """Сместить порог VAD под обстановку: в ТИШИНЕ чуть ниже базы (ловим негромкую речь сразу),
+        в шуме — строго закреплённая база VAD_THRESHOLD (базовое поведение не ломаем, см. CLAUDE.md).
+
+        Полосу «тишина/шум» разделяем гистерезисом вокруг QUIET_THRESHOLD (того же, что у адаптивной
+        громкости), пересобираем VAD не чаще _VAD_SWITCH_MIN_INTERVAL — чтобы не дёргать модель."""
+        if not config.VAD_ADAPTIVE:
+            return
+        if now - self._last_vad_switch < _VAD_SWITCH_MIN_INTERVAL:
+            return
+        base = config.VAD_THRESHOLD
+        quiet = max(config.VAD_QUIET_FLOOR, base - config.VAD_QUIET_OFFSET)
+        qt = config.QUIET_THRESHOLD
+        if self._vad_threshold > quiet:
+            # Сейчас на базе → опускаем порог ТОЛЬКО в явной тишине (пол ниже порога «тихо вокруг»).
+            target = quiet if self._noise_floor < qt else base
+        else:
+            # Сейчас опущен → возвращаем базу при заметном шуме (гистерезис ×1.5, без дребезга).
+            target = base if self._noise_floor > qt * 1.5 else quiet
+        if abs(target - self._vad_threshold) < 1e-3:
+            return
+        try:
+            self._vad = self._build_vad(target)
+            self._vad_threshold = target
+            self._need_vad_reset = True  # свежий VAD — сбросить на границе (ниже в цикле)
+            self._last_vad_switch = now
+            self.log.info("Порог VAD → %.2f (шумовой пол %.4f, база %.2f)",
+                          target, self._noise_floor, base)
+        except Exception:
+            self.log_exc(logging.WARNING,
+                         "Не удалось пересобрать VAD под обстановку — остаюсь на текущем пороге")
 
     def _is_muted(self) -> bool:
         """True, пока Джарвис говорит или ещё не истёк «хвост» после речи."""

@@ -137,6 +137,13 @@ VAD_MIN_SILENCE = _get("hearing", "vad_min_silence", 0.8, "JARVIS_VAD_MIN_SILENC
 VAD_MIN_SPEECH = _get("hearing", "vad_min_speech", 0.25, "JARVIS_VAD_MIN_SPEECH")
 VAD_BUFFER_SECONDS = _get("hearing", "vad_buffer_seconds", 10, "JARVIS_VAD_BUFFER_SECONDS")
 STT_NUM_THREADS = _get("hearing", "stt_num_threads", 1, "JARVIS_STT_NUM_THREADS")
+# Адаптивный порог VAD: в ТИШИНЕ чуть снижаем порог (негромкая команда ловится сразу), при росте
+# шума — возврат к закреплённой базе VAD_THRESHOLD. Базовое поведение в норме/шуме НЕ меняется.
+VAD_ADAPTIVE = _get("hearing", "vad_adaptive", True, "JARVIS_VAD_ADAPTIVE")
+# На сколько опустить порог в тишине (смещение ОТ базы вниз): 0.3 − 0.08 = 0.22.
+VAD_QUIET_OFFSET = _get("hearing", "vad_quiet_offset", 0.08, "JARVIS_VAD_QUIET_OFFSET")
+# Нижняя граница порога в тишине (ниже не опускаем — страховка от ловли шорохов).
+VAD_QUIET_FLOOR = _get("hearing", "vad_quiet_floor", 0.20, "JARVIS_VAD_QUIET_FLOOR")
 # Источник захвата: пусто = системный default-микрофон; имя echo-cancel source → шумоподавление.
 STT_SOURCE = str(_get("hearing", "stt_source", "", "JARVIS_STT_SOURCE")).strip()
 
@@ -187,6 +194,11 @@ VOICE_VOLUME_MIN = _get("voice", "volume_min", 0.35, "JARVIS_VOICE_VOLUME_MIN")
 VOICE_VOLUME_MAX = _get("voice", "volume_max", 1.0, "JARVIS_VOICE_VOLUME_MAX")
 # Макс программное усиление PCM при сильном шуме (>1.0 = громче нормы; на пиках возможен клиппинг).
 VOICE_GAIN_MAX = _get("voice", "gain_max", 1.5, "JARVIS_VOICE_GAIN_MAX")
+# Скорость речи (length_scale Piper): >1 медленнее, <1 быстрее. Чуть медленнее = разборчивее.
+VOICE_LENGTH_SCALE = _get("voice", "length_scale", 1.12, "JARVIS_VOICE_LENGTH_SCALE")
+# Высота тона (1.0 норма, <1 ниже): подмена частоты pw-cat + компенсация темпа (независимо от
+# length_scale). Не формант-сохраняющий — разумный диапазон 0.88–1.0 (лёгкое понижение тона).
+VOICE_PITCH = _get("voice", "pitch", 0.95, "JARVIS_VOICE_PITCH")
 
 # === Адаптивная громкость: реальные уровни сигнала RMS (секция adaptive_audio) ===
 ADAPTIVE_VOLUME = _get("adaptive_audio", "enabled", True, "JARVIS_ADAPTIVE_VOLUME")
@@ -205,6 +217,24 @@ USER_TO_VOLUME = _get("adaptive_audio", "user_to_volume", 4.0, "JARVIS_USER_TO_V
 VOLUME_RAMP = _get("adaptive_audio", "volume_ramp", 0.25, "JARVIS_VOLUME_RAMP")
 # Окно/период замера RMS фоновыми замерщиками (с) — короткое, лёгкое по CPU.
 NOISE_WINDOW = _get("adaptive_audio", "noise_window", 0.1, "JARVIS_NOISE_WINDOW")
+
+# === Стартовое объявление: фирменная фраза при `jarvis start` (секция startup) ===
+# Дефолтные паки (полные — фича работает и без settings.yaml). Авторитетная копия — в settings.yaml.
+STARTUP_ANNOUNCE = _get("startup", "announce", True, "JARVIS_STARTUP_ANNOUNCE")
+_DEFAULT_STARTUP_SUCCESS = [
+    "Системы в норме, сэр. Рад снова быть в вашем распоряжении.",
+    "Запуск завершён успешно, сэр. Готов к работе.",
+    "Доброго дня, сэр. Все системы активны, жду ваших команд.",
+    "Я в сети, сэр. Всё работает как часы.",
+    "Запуск прошёл гладко, сэр. К вашим услугам.",
+]
+_DEFAULT_STARTUP_PROBLEM = [
+    "Сэр, я запустился, но не всё гладко — часть систем требует внимания.",
+    "Я в сети, сэр, однако замечу: некоторые компоненты работают не в полную силу.",
+    "Запуск завершён с оговорками, сэр. Рекомендую заглянуть в состояние систем.",
+]
+STARTUP_SUCCESS_PHRASES = _get("startup", "success_phrases", _DEFAULT_STARTUP_SUCCESS, None)
+STARTUP_PROBLEM_PHRASES = _get("startup", "problem_phrases", _DEFAULT_STARTUP_PROBLEM, None)
 
 # === Напоминания о перерыве: детектор активности (секция break_reminders) ===
 # Дефолтные фразы (полные списки — чтобы фича работала даже без settings.yaml).

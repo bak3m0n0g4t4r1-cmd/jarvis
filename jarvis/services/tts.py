@@ -137,8 +137,24 @@ class TtsModule(JarvisModule):
 
     def _synth_and_play(self, text: str, volume: float, gain: float) -> None:
         """ПОТОКОВЫЙ синтез+воспроизведение: чанки Piper пишем в stdin pw-cat по мере готовности
-        (время до первого звука ↓). Громкость — pw-cat --volume; усиление >1 — gain PCM."""
-        rate = int(self._voice.config.sample_rate)
+        (время до первого звука ↓). Громкость — pw-cat --volume; усиление >1 — gain PCM.
+
+        Скорость и тон НЕЗАВИСИМЫ: темп задаёт length_scale Piper, тон — подмена частоты pw-cat
+        (--rate = частота_модели·pitch). length_scale домножаем на pitch, чтобы компенсировать
+        растяжение времени от ресэмплинга → net-темп = length_scale, net-тон = pitch. Pitch не
+        формант-сохраняющий: для МАЛОГО сдвига звучит чисто, без доп. зависимостей и заметного CPU
+        (pw-cat и так ресэмплит к частоте устройства)."""
+        from piper import SynthesisConfig
+
+        # Защита от мусора в settings.yaml: вне разумных границ → клиппинг (битое значение не должно
+        # давать немоту/нулевую частоту). length_scale и pitch — положительные множители.
+        pitch = min(2.0, max(0.5, float(config.VOICE_PITCH)))
+        length = min(2.0, max(0.5, float(config.VOICE_LENGTH_SCALE)))
+        model_rate = int(self._voice.config.sample_rate)
+        # Подмена частоты воспроизведения сдвигает тон (ниже при pitch<1) и растягивает время в
+        # 1/pitch раз; length_scale·pitch компенсирует растяжение → темп зависит ТОЛЬКО от length.
+        rate = max(8000, round(model_rate * pitch))
+        syn = SynthesisConfig(length_scale=length * pitch)
         cmd = ["pw-cat", "-p", "--raw", "--rate", str(rate), "--channels", "1", "--format", "s16",
                "--volume", f"{max(0.0, volume):.3f}", "--latency", f"{config.TTS_LATENCY_MS}ms", "-"]
         if config.TTS_SINK:
@@ -148,7 +164,7 @@ class TtsModule(JarvisModule):
         self._play_proc = proc
         err = b""
         try:
-            for chunk in self._voice.synthesize(text):
+            for chunk in self._voice.synthesize(text, syn_config=syn):
                 pcm = chunk.audio_int16_bytes
                 if gain > 1.0:
                     pcm = AudioEnv.apply_gain(pcm, gain)

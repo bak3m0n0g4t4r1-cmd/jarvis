@@ -1,11 +1,11 @@
 """Общие хелперы фичи «Напоминания о перерыве» — без тяжёлых зависимостей.
 
-Здесь живёт распознавание стоп-фразы (по списку из settings.yaml) и выбор случайной
-фразы без немедленного повтора. Модуль импортируют И core (чтобы не отвечать «не
-разобрал» на стоп-фразу), И сервис activity_monitor (чтобы на неё ответить) — поэтому
-он намеренно лёгкий: только stdlib + config (без MQTT/потоков/циклов импорта).
+Здесь живёт распознавание стоп-фразы (по списку из settings.yaml). Модуль импортируют
+И core (чтобы не отвечать «не разобрал» на стоп-фразу), И сервис activity_monitor (чтобы
+на неё ответить) — поэтому он намеренно лёгкий: только stdlib + config (без MQTT/потоков/
+циклов импорта). Выбор вариативных фраз без повторов вынесен в общий модуль
+`jarvis.phrases` (единый механизм для всех паков проекта).
 """
-import random
 import re
 from difflib import SequenceMatcher
 
@@ -49,20 +49,3 @@ def is_stop_phrase(text: str) -> bool:
     except Exception:
         return False
     return False
-
-
-def pick_phrase(phrases: list, last_index: int = -1) -> tuple[int, str]:
-    """Случайная фраза из списка, по возможности НЕ повторяя предыдущую. Возвращает
-    (индекс, фраза). Пустой список → (-1, "")."""
-    try:
-        n = len(phrases)
-        if n == 0:
-            return -1, ""
-        if n == 1:
-            return 0, str(phrases[0])
-        idx = random.randrange(n)
-        if idx == last_index:
-            idx = (idx + 1) % n
-        return idx, str(phrases[idx])
-    except Exception:
-        return (-1, "") if not phrases else (0, str(phrases[0]))
