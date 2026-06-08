@@ -262,7 +262,10 @@ class AudioEnv:
     def _ramp(self, items: dict[str, tuple[float, float]]) -> None:
         """Плавно (несколько шагов) подвести громкость sink-inputs от a к b."""
         try:
-            steps = 5
+            # Число шагов рампы из VOLUME_RAMP («доля приближения к цели за шаг», 0..1):
+            # steps ≈ 1/ramp (дефолт 0.25 → 4 шага). Битый/нулевой параметр → безопасные 5.
+            vr = config.VOLUME_RAMP
+            steps = max(1, round(1.0 / vr)) if isinstance(vr, (int, float)) and vr > 0 else 5
             for i in range(1, steps + 1):
                 frac = i / steps
                 for sid, (a, b) in items.items():

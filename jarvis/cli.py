@@ -64,6 +64,10 @@ def _render_unit(svc, bin_dir: Path) -> str:
         "StartLimitBurst=10\n\n"
         "[Service]\n"
         "Type=simple\n"
+        # Рабочая директория = корень проекта. Страховка: относительные пути (если попадут
+        # в конфиг) резолвятся верно даже помимо абсолютизации в config.py. Без неё systemd
+        # стартует из $HOME → FileNotFoundError на моделях/commands.yaml (регрессия Этапа 7).
+        f"WorkingDirectory={config.BASE_DIR}\n"
         # Учёт памяти (без лимита): видно потребление в `systemctl --user status`.
         # Жёсткий MemoryMax не ставим — на 8 ГБ впритык это грозит OOM-kill голосового
         # конвейера; лёгкость достигается урезанием футпринта в коде (ленивые загрузки).

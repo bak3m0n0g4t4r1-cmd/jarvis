@@ -9,6 +9,8 @@ StartLimitBurst=10
 Type=simple
 # ПРИМЕР. Реальные юниты с верными путями ставит `jarvis start` (в ~/.config/systemd/user/).
 # Здесь %h/jarvis/.venv — лишь образец, если проект лежит в ~/jarvis.
+# Рабочая директория — корень проекта (страховка для относительных путей).
+WorkingDirectory=%h/jarvis
 ExecStart=%h/jarvis/.venv/bin/jarvis-os-agent
 Restart=always
 RestartSec=3

@@ -11,6 +11,8 @@ Type=simple
 # Здесь %h/jarvis/.venv — лишь образец, если проект лежит в ~/jarvis.
 # Необязательные JARVIS_*-оверрайды берутся из .env проекта (дефис — не падать, если файла
 # нет; все параметры имеют дефолты). Секретов в .env больше нет — облако удалено.
+# Рабочая директория — корень проекта (страховка для относительных путей).
+WorkingDirectory=%h/jarvis
 EnvironmentFile=-%h/jarvis/.env
 ExecStart=%h/jarvis/.venv/bin/jarvis-core
 Restart=always

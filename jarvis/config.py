@@ -18,8 +18,24 @@ import yaml
 # Корень проекта (jarvis/config.py -> на уровень выше пакета)
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Единый файл настроек (можно переопределить путь через JARVIS_SETTINGS).
-SETTINGS_FILE = os.getenv("JARVIS_SETTINGS", str(BASE_DIR / "settings.yaml"))
+
+def _resolve(value) -> str:
+    """Привести путь к АБСОЛЮТНОМУ: абсолютный — как есть, относительный — от BASE_DIR.
+
+    Зачем: под systemd рабочая директория ≠ корень проекта (юниты стартуют из $HOME),
+    поэтому относительный путь из settings.yaml/env иначе не находится — FileNotFoundError
+    на моделях и commands.yaml. Любой сбой приведения → строка как есть (сервис не падает).
+    """
+    try:
+        p = Path(str(value)).expanduser()
+        return str(p if p.is_absolute() else (BASE_DIR / p))
+    except Exception:
+        return str(value)
+
+
+# Единый файл настроек (можно переопределить путь через JARVIS_SETTINGS). Резолвим в
+# абсолютный — на случай относительного JARVIS_SETTINGS при запуске не из корня проекта.
+SETTINGS_FILE = _resolve(os.getenv("JARVIS_SETTINGS", str(BASE_DIR / "settings.yaml")))
 
 _SETTINGS: dict = {}
 try:
@@ -71,10 +87,19 @@ def _get(section: str, key: str, default, env: str | None = None):
     return default
 
 
+def _get_path(section: str, key: str, default, env: str | None = None) -> str:
+    """Как _get, но результат — ГАРАНТИРОВАННО абсолютный путь (резолв относительных от
+    BASE_DIR). Для всех путей-ресурсов (модели, commands.yaml, логи): сервис под systemd
+    обязан находить их независимо от рабочей директории."""
+    return _resolve(_get(section, key, default, env))
+
+
 # === Пути и модели (секция models) ===
-MODELS_DIR = Path(_get("models", "models_dir", str(BASE_DIR / "models"), "JARVIS_MODELS_DIR"))
-LOGS_DIR = Path(_get("models", "logs_dir", str(BASE_DIR / "logs"), "JARVIS_LOGS_DIR"))
-COMMANDS_FILE = _get("models", "commands_file", str(BASE_DIR / "commands.yaml"), "JARVIS_COMMANDS_FILE")
+# ВСЕ пути читаются через _get_path → абсолютны: относительные значения из settings.yaml/env
+# разрешаются от BASE_DIR. (Секция "models" в config — исключительно пути, прочее в др. секциях.)
+MODELS_DIR = Path(_get_path("models", "models_dir", str(BASE_DIR / "models"), "JARVIS_MODELS_DIR"))
+LOGS_DIR = Path(_get_path("models", "logs_dir", str(BASE_DIR / "logs"), "JARVIS_LOGS_DIR"))
+COMMANDS_FILE = _get_path("models", "commands_file", str(BASE_DIR / "commands.yaml"), "JARVIS_COMMANDS_FILE")
 
 # === Система: MQTT, логи, heartbeat (секция system) ===
 MQTT_HOST = _get("system", "mqtt_host", "localhost", "JARVIS_MQTT_HOST")
@@ -116,27 +141,27 @@ STT_NUM_THREADS = _get("hearing", "stt_num_threads", 1, "JARVIS_STT_NUM_THREADS"
 STT_SOURCE = str(_get("hearing", "stt_source", "", "JARVIS_STT_SOURCE")).strip()
 
 # Пути моделей STT (выводятся из models_dir; обычно не трогают — можно задать явно).
-VAD_MODEL = _get("models", "vad_model", str(MODELS_DIR / "silero_vad.onnx"), "JARVIS_VAD_MODEL")
+VAD_MODEL = _get_path("models", "vad_model", str(MODELS_DIR / "silero_vad.onnx"), "JARVIS_VAD_MODEL")
 _ZIPFORMER_DIR = MODELS_DIR / "sherpa-onnx-small-zipformer-ru-2024-09-18"
-ZIPFORMER_ENCODER = _get("models", "zipformer_encoder", str(_ZIPFORMER_DIR / "encoder.int8.onnx"),
+ZIPFORMER_ENCODER = _get_path("models", "zipformer_encoder", str(_ZIPFORMER_DIR / "encoder.int8.onnx"),
                          "JARVIS_ZIPFORMER_ENCODER")
-ZIPFORMER_DECODER = _get("models", "zipformer_decoder", str(_ZIPFORMER_DIR / "decoder.int8.onnx"),
+ZIPFORMER_DECODER = _get_path("models", "zipformer_decoder", str(_ZIPFORMER_DIR / "decoder.int8.onnx"),
                          "JARVIS_ZIPFORMER_DECODER")
-ZIPFORMER_JOINER = _get("models", "zipformer_joiner", str(_ZIPFORMER_DIR / "joiner.int8.onnx"),
+ZIPFORMER_JOINER = _get_path("models", "zipformer_joiner", str(_ZIPFORMER_DIR / "joiner.int8.onnx"),
                         "JARVIS_ZIPFORMER_JOINER")
-ZIPFORMER_TOKENS = _get("models", "zipformer_tokens", str(_ZIPFORMER_DIR / "tokens.txt"),
+ZIPFORMER_TOKENS = _get_path("models", "zipformer_tokens", str(_ZIPFORMER_DIR / "tokens.txt"),
                         "JARVIS_ZIPFORMER_TOKENS")
-ZIPFORMER_BPE = _get("models", "zipformer_bpe", str(_ZIPFORMER_DIR / "bpe.model"),
+ZIPFORMER_BPE = _get_path("models", "zipformer_bpe", str(_ZIPFORMER_DIR / "bpe.model"),
                      "JARVIS_ZIPFORMER_BPE")
 
 # === Распознавание команд: матчер (секция recognition) ===
-EMBEDDER_DIR = Path(_get("models", "embedder_dir", str(MODELS_DIR / "rubert-tiny2-onnx"),
+EMBEDDER_DIR = Path(_get_path("models", "embedder_dir", str(MODELS_DIR / "rubert-tiny2-onnx"),
                          "JARVIS_EMBEDDER_DIR"))
-EMBEDDER_MODEL = _get("models", "embedder_model", str(EMBEDDER_DIR / "model_optimized.onnx"),
+EMBEDDER_MODEL = _get_path("models", "embedder_model", str(EMBEDDER_DIR / "model_optimized.onnx"),
                       "JARVIS_EMBEDDER_MODEL")
-EMBEDDER_TOKENIZER = _get("models", "embedder_tokenizer", str(EMBEDDER_DIR / "tokenizer.json"),
+EMBEDDER_TOKENIZER = _get_path("models", "embedder_tokenizer", str(EMBEDDER_DIR / "tokenizer.json"),
                           "JARVIS_EMBEDDER_TOKENIZER")
-MATCHER_CACHE = _get("models", "matcher_cache", str(EMBEDDER_DIR / "cmd_emb_cache.npz"),
+MATCHER_CACHE = _get_path("models", "matcher_cache", str(EMBEDDER_DIR / "cmd_emb_cache.npz"),
                      "JARVIS_MATCHER_CACHE")
 # Порог слоя ПРАВИЛ (difflib 0–1): ниже — фраза не считается совпавшей с синонимом.
 MATCHER_FUZZY_THRESHOLD = _get("recognition", "fuzzy_threshold", 0.7, "JARVIS_MATCHER_FUZZY_THRESHOLD")
@@ -146,9 +171,9 @@ MATCHER_EMB_THRESHOLD = _get("recognition", "emb_threshold", 0.6, "JARVIS_MATCHE
 MATCHER_EMB_MARGIN = _get("recognition", "emb_margin", 0.04, "JARVIS_MATCHER_EMB_MARGIN")
 
 # === Голос (TTS): Piper + громкость (секция voice) ===
-PIPER_MODEL = _get("models", "piper_model", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx"),
+PIPER_MODEL = _get_path("models", "piper_model", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx"),
                    "JARVIS_PIPER_MODEL")
-PIPER_CONFIG = _get("models", "piper_config", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx.json"),
+PIPER_CONFIG = _get_path("models", "piper_config", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx.json"),
                     "JARVIS_PIPER_CONFIG")
 # Sink PipeWire для воспроизведения (pw-cat --target). Пусто = системный default sink.
 TTS_SINK = str(_get("voice", "tts_sink", "", "JARVIS_TTS_SINK")).strip()

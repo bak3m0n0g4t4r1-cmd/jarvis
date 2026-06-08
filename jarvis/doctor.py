@@ -245,7 +245,15 @@ def check_config_paths() -> list[CheckResult]:
     }
     results = []
     for label, path in paths.items():
-        if path.exists():
+        if not path.is_absolute():
+            # Относительный путь под systemd (CWD=$HOME) не найдётся. Ловим ЯВНО: иначе из
+            # корня проекта exists() ложно зеленеет — так и пропустили регрессию Этапа 7.
+            results.append(CheckResult(
+                FAIL, f"путь: {label}",
+                reason=f"путь относительный ({path}) — под systemd не найдётся.",
+                fix="config.py обязан резолвить пути от BASE_DIR (_get_path); проверьте settings.yaml",
+            ))
+        elif path.exists():
             results.append(CheckResult(OK, f"путь: {label}"))
         else:
             is_model = config.MODELS_DIR in path.parents
