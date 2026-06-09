@@ -210,6 +210,29 @@ class JarvisModule:
             qos=contracts.QOS_STATE,
         )
 
+    def notify(self, title: str, body: str, *, module: str | None = None,
+               urgency: str = "normal", replace_id: int = 0) -> int:
+        """Показать системное уведомление (D-Bus через jarvis.notify). Возвращает id или 0.
+
+        Единый вход для всех сервисов: режим тишины (дубль речи), проблемы звука, сбои.
+        Сбой уведомления не роняет вызывающего (всё в try-except внутри notify)."""
+        try:
+            from jarvis import notify as _notify
+            return _notify.notify(title, body, module=module, urgency=urgency, replace_id=replace_id)
+        except Exception:
+            self.log.debug("Не удалось показать уведомление", exc_info=True)
+            return 0
+
+    def notify_failure(self, human: str, reason: str | None = None) -> None:
+        """ЭЛЕГАНТНОЕ уведомление о сбое: человеческий текст (БЕЗ сырых трейсов) + кнопка «Открыть
+        логи» → kitty с логом ИМЕННО этого модуля. reason — короткое уточнение (тоже человеческое)."""
+        try:
+            title = getattr(config, "NOTIFY_FAILURE_TITLE", "Джарвис — неполадка")
+            body = f"{human}\n{reason}" if reason else human
+            self.notify(title, body, module=self.name, urgency="critical")
+        except Exception:
+            self.log.debug("Не удалось показать уведомление о сбое", exc_info=True)
+
     # ------------------------------------------------------------------ #
     # Жизненный цикл
     # ------------------------------------------------------------------ #
@@ -229,6 +252,9 @@ class JarvisModule:
         self.log.critical(
             "%s — сервис не может продолжать, сигналю systemd о перезапуске", reason
         )
+        # Элегантное уведомление пользователю (человеческий текст + кнопка к логу модуля).
+        self.notify_failure(
+            f"Модуль «{self.name}» перезапускается из-за неполадки.", reason)
         self._exit_code = 1
         self._stop_event.set()
 

@@ -4,7 +4,10 @@
 аргументов. Пользовательский текст в команду НЕ подставляется — только
 lookup тега в карте. Неизвестный тег → лог + предупреждение в jarvis/say.
 """
+import logging
 import os
+import re
+import shutil
 import subprocess
 import threading
 from datetime import datetime
@@ -12,20 +15,75 @@ from pathlib import Path
 
 import yaml
 
-from jarvis import config, contracts
+from jarvis import config, contracts, notify, services_map
 from jarvis.bus import JarvisModule
+
+# Парсер сигнала ActionInvoked из `gdbus monitor`: «… ActionInvoked (uint32 50, 'logs:jarvis-tts')».
+_ACTION_RE = re.compile(r"ActionInvoked \(uint32 \d+, '([^']*)'\)")
+# Whitelist юнитов (без .service) — кнопка открывает лог ТОЛЬКО наших сервисов, не произвольное.
+_ALLOWED_UNITS = frozenset(s.unit.removesuffix(".service") for s in services_map.SERVICES)
 
 
 class OsAgentModule(JarvisModule):
-    """«Руки»: запускает системные команды по тегу из jarvis/execute."""
+    """«Руки»: запускает системные команды по тегу из jarvis/execute.
+
+    Плюс (ТЗ-6): слушает сигнал ActionInvoked уведомлений — по кнопке «Открыть логи» открывает
+    kitty с логом проблемного модуля. Запуск процессов — профиль «Рук», поэтому слушатель здесь."""
 
     def __init__(self):
         super().__init__("jarvis-os-agent")
         self._commands: dict = {}
+        self._notif_proc: subprocess.Popen | None = None
+        self._notif_thread = None
 
     def on_start(self):
         self._load_commands()
         self.subscribe(contracts.TOPIC_EXECUTE, self.on_execute)
+        # Слушатель кнопки уведомлений (ActionInvoked → открыть лог модуля в kitty).
+        if shutil.which("gdbus") and shutil.which("kitty"):
+            self._notif_thread = threading.Thread(
+                target=self._notif_action_loop, daemon=True, name="notif-actions")
+            self._notif_thread.start()
+        else:
+            self.log.info("gdbus/kitty не найдены — кнопка «Открыть логи» в уведомлениях недоступна")
+
+    def _notif_action_loop(self):
+        """Читает `gdbus monitor` и на ActionInvoked с ключом logs:<unit> открывает лог в kitty.
+
+        Один gdbus-monitor на сервис; ловит клики по ЛЮБЫМ нашим уведомлениям (ключ кодирует модуль).
+        Сбой/выход монитора — на WARNING, сервис продолжает исполнять команды."""
+        try:
+            self._notif_proc = subprocess.Popen(
+                ["gdbus", "monitor", "--session", "--dest", "org.freedesktop.Notifications"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            self.log.info("Слушатель кнопок уведомлений запущен (ActionInvoked → kitty)")
+            for line in self._notif_proc.stdout:
+                if self._stop_event.is_set():
+                    break
+                m = _ACTION_RE.search(line)
+                if not m:
+                    continue
+                key = m.group(1)
+                if key.startswith(notify.ACTION_PREFIX):
+                    self._open_logs(key[len(notify.ACTION_PREFIX):])
+        except Exception:
+            self.log_exc(logging.WARNING, "Слушатель кнопок уведомлений остановлен")
+
+    def _open_logs(self, unit: str):
+        """Открыть лог юнита в kitty (journalctl --user). Только наши юниты (whitelist)."""
+        name = (unit or "").removesuffix(".service")
+        if name not in _ALLOWED_UNITS:
+            self.log.warning("Кнопка уведомления: неизвестный юнит %r — игнор", unit)
+            return
+        cmd = ["kitty", "-e", "bash", "-lc",
+               f"journalctl --user -u {name}.service -n 300 -f"]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # kitty — долгоживущее GUI; дожинаем в фоне, чтобы не плодить зомби (как fire-and-forget).
+            threading.Thread(target=self._reap, args=(f"kitty-logs:{name}", proc), daemon=True).start()
+            self.log.info("Открываю лог %s в kitty по кнопке уведомления", name)
+        except Exception:
+            self.log_exc(logging.WARNING, "Не удалось открыть лог в kitty")
 
     def _load_commands(self):
         try:
@@ -123,6 +181,15 @@ class OsAgentModule(JarvisModule):
         except Exception:
             self.log.exception("Ошибка ожидания команды %s", tag)
             self.say(f"Сэр, при выполнении «{tag}» произошёл сбой.")
+
+    def on_stop(self):
+        """Погасить слушатель уведомлений (gdbus monitor) при остановке сервиса."""
+        proc = self._notif_proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                self.log.debug("Не удалось прервать gdbus monitor", exc_info=True)
 
 
 def main():

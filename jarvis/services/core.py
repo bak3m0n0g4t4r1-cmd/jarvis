@@ -16,7 +16,7 @@ from datetime import datetime
 
 import yaml
 
-from jarvis import chains, config, contracts, phrases, worldtime
+from jarvis import chains, config, contracts, phrases, silence, worldtime
 from jarvis.breaks import is_stop_phrase
 from jarvis.bus import JarvisModule
 from jarvis.matcher import NOT_RECOGNIZED, Matcher
@@ -78,6 +78,11 @@ class CoreModule(JarvisModule):
         # Громкость речи пользователя (от STT) пробрасываем в ответ — для адаптивной громкости TTS.
         level = payload.get("user_level")
         user_level = level if isinstance(level, (int, float)) else None
+        # Команда РЕЖИМА ТИШИНЫ ловится из эфира ВСЕГДА (с wake и без — как стоп-фраза перерыва).
+        if silence.is_silence_on(text) or silence.is_silence_off(text):
+            threading.Thread(target=self._toggle_silence,
+                             args=(text, user_level), daemon=True).start()
+            return
         # wake — было ли обращение «Джарвис»/PTT. Нет поля = true (обратная совместимость).
         wake = payload.get("wake", True)
         if not wake:
@@ -99,6 +104,24 @@ class CoreModule(JarvisModule):
             return
         # Обработку выносим в поток, чтобы не блокировать MQTT-loop.
         threading.Thread(target=self._process_wake, args=(text, user_level), daemon=True).start()
+
+    def _toggle_silence(self, text: str, user_level: float | None) -> None:
+        """Включить/выключить режим тишины + ответ в характере.
+
+        ON: сперва ставим тишину → ack уйдёт в УВЕДОМЛЕНИЕ (TTS уже молчит). OFF: сперва снимаем
+        тишину → ack ОЗВУЧИТСЯ голосом («теперь уже голосом»). Состояние переживает рестарт."""
+        with self._lock:
+            try:
+                if silence.is_silence_off(text):
+                    silence.set_silent(False)
+                    self.log.info("Режим тишины ВЫКЛЮЧЕН: %s", text)
+                    self._say(phrases.pick("silence.off_ack", config.SILENCE_OFF_ACK), user_level)
+                else:
+                    silence.set_silent(True)
+                    self.log.info("Режим тишины ВКЛЮЧЁН: %s", text)
+                    self._say(phrases.pick("silence.on_ack", config.SILENCE_ON_ACK), user_level)
+            except Exception:
+                self.log_exc(logging.ERROR, "Сбой переключения режима тишины")
 
     def _process_wake(self, text: str, user_level: float | None = None):
         """Полноценная команда (с wake-word/PTT): повтор/отмена → info → комбо → матчер.

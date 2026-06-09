@@ -11,10 +11,12 @@ import logging
 import queue
 import subprocess
 import threading
+import time
 
-from jarvis import config, contracts
+from jarvis import config, contracts, phrases, silence
 from jarvis.audio_env import AudioEnv
 from jarvis.bus import JarvisModule
+from jarvis.sysinfo import read_volume
 
 # Сколько фраз подряд не озвучилось, чтобы крикнуть CRITICAL (синтез/вывод недоступен).
 _TTS_FAILS_CRITICAL = 3
@@ -49,16 +51,21 @@ class TtsModule(JarvisModule):
 
     def __init__(self):
         super().__init__("jarvis-tts")
-        # Очередь хранит (текст, громкость_речи, нижний_предел_громкости, чайм).
+        # Очередь хранит (текст, громкость_речи, нижний_предел_громкости, чайм, критично).
         # Уровень — от STT для адаптации; нижний предел — будильник/таймер (обход «тихо→тихо»);
-        # чайм — короткий сигнал перед фразой (таймер).
-        self._queue: "queue.Queue[tuple[str, float | None, float | None, bool]]" = queue.Queue()
+        # чайм — короткий сигнал перед фразой (таймер); критично — озвучить даже в режиме тишины.
+        self._queue: "queue.Queue[tuple[str, float | None, float | None, bool, bool]]" = queue.Queue()
         self._voice = None
         self._voice_tried = False
         self._voice_lock = threading.Lock()
         self._worker = None
         self._play_proc: subprocess.Popen | None = None
         self._env = AudioEnv()  # замер обстановки + ducking + расчёт громкости
+        # Режим тишины / дубль речи: id «речевого» уведомления (заменяем, чтобы не копились) + кэш
+        # проверки звука перед фразой (не дёргать wpctl на каждую реплику в очереди).
+        self._speech_notif_id = 0
+        self._audio_state_cache: tuple[str, str] | None = None
+        self._audio_check_at = 0.0
 
     def on_start(self):
         self.subscribe(contracts.TOPIC_SAY, self.on_say)
@@ -99,11 +106,15 @@ class TtsModule(JarvisModule):
             # Нижний предел громкости (будильник/таймер): озвучить НЕ тише — обходит «тихо→тихо».
             mv = payload.get("min_volume")
             chime = bool(payload.get("chime"))  # короткий сигнал перед фразой (таймер)
+            # Критично = срабатывание (будильник/таймер/напоминание): звучит даже в режиме тишины.
+            # Сигнал — явный флаг ИЛИ наличие min_volume (его ставят только срабатывания).
+            critical = bool(payload.get("critical")) or isinstance(mv, (int, float))
             self._queue.put((
                 text,
                 level if isinstance(level, (int, float)) else None,
                 float(mv) if isinstance(mv, (int, float)) else None,
                 chime,
+                critical,
             ))
 
     def _run_worker(self):
@@ -114,10 +125,10 @@ class TtsModule(JarvisModule):
         while not self._stop_event.is_set():
             try:
                 try:
-                    text, level, min_volume, chime = self._queue.get(timeout=0.5)
+                    text, level, min_volume, chime, critical = self._queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                if self._speak(text, level, min_volume, chime):
+                if self._speak(text, level, min_volume, chime, critical):
                     if announced_critical:
                         self.log.info("Озвучка восстановлена — звук снова работает")
                     fails = 0
@@ -129,22 +140,41 @@ class TtsModule(JarvisModule):
                             "Озвучка не работает уже %d фраз подряд (синтез или вывод звука) — "
                             "продолжаю пытаться, но голос сейчас недоступен", fails,
                         )
+                        # Элегантное уведомление (без трейса) + кнопка к логу голоса.
+                        self.notify_failure(
+                            "Голос сейчас недоступен, сэр.",
+                            "Синтез речи или вывод звука не отвечает несколько фраз подряд.")
                         announced_critical = True
             except Exception:
                 self.log_exc(logging.WARNING, "Сбой в цикле озвучки — продолжаю работу")
 
     def _speak(self, text: str, user_level: float | None, min_volume: float | None = None,
-               chime: bool = False) -> bool:
-        """Озвучить фразу с адаптивной громкостью. True — успех; False — пропуск (нет голоса/сбой).
+               chime: bool = False, critical: bool = False) -> bool:
+        """Озвучить фразу с адаптивной громкостью. True — успех/обработано; False — сбой озвучки.
 
-        speaking держится РЕАЛЬНО пока играет звук (корректный тайминг анти-эхо). Перед речью:
-        приглушаем музыку (ducking) если она реально звучит, и считаем громкость голоса под
-        внешний шум + громкость речи пользователя. После речи — возвращаем музыку плавно.
-        min_volume (будильник) — гарантированный нижний предел громкости (обход «тихо→тихо»).
-        """
+        Перед озвучкой: (1) РЕЖИМ ТИШИНЫ — некритичное уходит в УВЕДОМЛЕНИЕ (голос молчит),
+        критическое (будильник/таймер/напоминание) звучит всегда; (2) ПРОВЕРКА ЗВУКА — громкость 0
+        или сбой устройства → дубль фразы в уведомление с пометкой ПРИЧИНЫ (две разные).
+        speaking держится РЕАЛЬНО пока играет звук (тайминг анти-эхо); ducking музыки; min_volume
+        (будильник) — гарантированный нижний предел громкости (обход «тихо→тихо»)."""
+        # (1) Режим тишины: обычные фразы — в уведомление; критическое — озвучиваем как обычно.
+        if silence.is_silent() and not critical:
+            self._notify_speech(text)
+            return True
+        # (2) Доступность звука перед озвучкой (быстро, с кэшем): «ноль» и «сбой» — РАЗНЫЕ пометки.
+        state, reason = self._audio_state()
+        if state == "zero":
+            self._notify_speech(text, phrases.pick("notif.audio_zero", config.AUDIO_ZERO_PREFIX))
+            return True  # на нуле голос немой — доставили текстом
+        if state == "fail":
+            pref = phrases.pick("notif.audio_fail", config.AUDIO_FAIL_PREFIX)
+            self._notify_speech(text, f"{pref} {reason}".strip())
+            return True
         self._ensure_voice()
         if self._voice is None:
             self.log.warning("Голос Piper не загружен — не могу озвучить фразу: %r", text[:60])
+            self._notify_speech(text, phrases.pick("notif.audio_fail", config.AUDIO_FAIL_PREFIX)
+                                + " синтез речи не загрузился.")
             return False
         ducked = False
         try:
@@ -167,12 +197,57 @@ class TtsModule(JarvisModule):
                 text[:60], type(exc).__name__, exc,
             )
             self.log.debug("Трасса сбоя озвучки", exc_info=True)
+            # Не теряем фразу: дублируем в уведомление с технической пометкой (без сырого трейса).
+            self._audio_state_cache = None  # сбросить кэш — звук явно проблемный
+            pref = phrases.pick("notif.audio_fail", config.AUDIO_FAIL_PREFIX)
+            self._notify_speech(text, f"{pref} поток воспроизведения не открылся.")
             return False
         finally:
             self.set_state(contracts.STATE_IDLE)
             self._env.set_speaking(False)
             if ducked:
                 self._env.restore()  # плавно вернуть музыку к исходной громкости
+
+    def _notify_speech(self, text: str, prefix: str | None = None) -> None:
+        """Показать фразу в системном уведомлении (дубль речи: режим тишины или проблемы звука).
+
+        Без кнопки (это не сбой Джарвиса). Заменяем прежнее «речевое» уведомление (replace_id),
+        чтобы они не копились пачкой при череде ответов."""
+        try:
+            body = f"{prefix}\n{text}" if prefix else text
+            nid = self.notify(config.NOTIFY_SPEECH_TITLE, body, urgency="normal",
+                              replace_id=self._speech_notif_id)
+            if nid:
+                self._speech_notif_id = nid
+        except Exception:
+            self.log.debug("Не удалось продублировать фразу в уведомление", exc_info=True)
+
+    def _audio_state(self) -> tuple[str, str]:
+        """Состояние звука перед фразой: ('ok'|'zero'|'fail', причина). Кэш ~AUDIO_CHECK_TTL с —
+        чтобы не дёргать wpctl на каждую реплику в очереди (быстро, не тормозит озвучку)."""
+        now = time.monotonic()
+        if self._audio_state_cache is not None and (now - self._audio_check_at) < config.AUDIO_CHECK_TTL:
+            return self._audio_state_cache
+        self._audio_state_cache = self._classify_audio()
+        self._audio_check_at = now
+        return self._audio_state_cache
+
+    @staticmethod
+    def _classify_audio() -> tuple[str, str]:
+        """Различить «громкость на нуле» (пользователь убавил) и ТЕХНИЧЕСКИЙ сбой (устройство/
+        PipeWire недоступны). Через sysinfo.read_volume (wpctl, read-only). Сбой пробы → 'fail'."""
+        try:
+            data = read_volume()
+            if "ошибка" in data:
+                return ("fail", "аудиосистема не отвечает.")
+            if data.get("выключен"):
+                return ("zero", "")
+            vol = data.get("громкость_процент")
+            if isinstance(vol, (int, float)) and vol <= 0:
+                return ("zero", "")
+            return ("ok", "")
+        except Exception:
+            return ("fail", "не удалось проверить звук.")
 
     def _synth_and_play(self, text: str, volume: float, gain: float, chime: bool = False) -> None:
         """ПОТОКОВЫЙ синтез+воспроизведение: чанки Piper пишем в stdin pw-cat по мере готовности

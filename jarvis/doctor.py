@@ -1277,6 +1277,55 @@ def check_push_to_talk():
         fix="sudo usermod -aG input $USER, затем ПЕРЕЛОГИН (та же группа нужна ydotool)")
 
 
+def check_notifications() -> list[CheckResult]:
+    """Уведомления (ТЗ-6): gdbus есть, D-Bus-сервер с actions (кнопки), kitty для кнопки, состояние
+    тишины читается. Нет графической сессии (headless/cron) → WARN, не FAIL (фича вспомогательная)."""
+    import shutil as _shutil
+    import subprocess as _sp
+
+    if not config.NOTIFICATIONS_ENABLED:
+        return [CheckResult(OK, "уведомления выключены (notifications.enabled=false)")]
+    results = []
+    if not _shutil.which("gdbus"):
+        results.append(CheckResult(
+            WARN, "уведомления: gdbus не найден",
+            reason="без gdbus системные уведомления недоступны (режим тишины/дубль/сбои не покажутся).",
+            fix="sudo apt install libglib2.0-bin"))
+    else:
+        try:
+            out = _sp.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                           "--object-path", "/org/freedesktop/Notifications",
+                           "--method", "org.freedesktop.Notifications.GetCapabilities"],
+                          capture_output=True, text=True, timeout=4)
+            if out.returncode == 0 and "actions" in out.stdout:
+                results.append(CheckResult(OK, "уведомления: D-Bus-сервер с actions (кнопки) на месте"))
+            elif out.returncode == 0:
+                results.append(CheckResult(
+                    WARN, "уведомления: сервер без поддержки actions",
+                    reason="кнопка «Открыть логи» может не отображаться этим сервером уведомлений."))
+            else:
+                results.append(CheckResult(
+                    WARN, "уведомления: сервер не отвечает",
+                    reason="org.freedesktop.Notifications недоступен (нет графической сессии?).",
+                    fix="запускайте в активной сессии рабочего стола"))
+        except Exception as exc:
+            results.append(CheckResult(WARN, "уведомления: проба сервера", reason=str(exc)))
+    if _shutil.which("kitty"):
+        results.append(CheckResult(OK, "уведомления: kitty есть — кнопка откроет лог модуля"))
+    else:
+        results.append(CheckResult(
+            WARN, "уведомления: kitty не найден",
+            reason="кнопка «Открыть логи» не сможет открыть терминал с логом.",
+            fix="sudo apt install kitty"))
+    try:
+        from jarvis import silence
+        cur = "тишина" if silence.is_silent() else "голос"
+        results.append(CheckResult(OK, f"режим тишины: состояние читается (сейчас — {cur})"))
+    except Exception as exc:
+        results.append(CheckResult(WARN, "режим тишины: состояние", reason=str(exc)))
+    return results
+
+
 def check_chains() -> list[CheckResult]:
     """Цепочки (ТЗ-5): ветки продолжений валидны, обратимость валидна, фильтр/комбо-split/гейты живы."""
     results = []
@@ -1538,6 +1587,7 @@ def run(quick: bool = False) -> bool:
     _safe(reporter, check_input_access)
     _safe(reporter, check_brightness)
     _safe(reporter, check_push_to_talk)
+    _safe(reporter, check_notifications)
 
     reporter.section("Слой 4. Модели и распознавание")
     reporter.note("загружаю модели движком…")

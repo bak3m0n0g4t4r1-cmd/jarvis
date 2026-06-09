@@ -837,3 +837,53 @@ UNDO_IRREVERSIBLE = _chains_pack("undo_irreversible", [
     "Боюсь, откатить такое не выйдет, сэр.",
     "Увы, сэр, это необратимо.",
 ])
+
+# === Уведомления (D-Bus org.freedesktop.Notifications через gdbus) + режим тишины (ТЗ-6) ===
+NOTIFICATIONS_ENABLED = _get("notifications", "enabled", True, "JARVIS_NOTIFICATIONS")
+NOTIFY_LOGS_BUTTON = _get("notifications", "logs_button", "Открыть логи", None)
+NOTIFY_FAILURE_TITLE = _get("notifications", "failure_title", "Джарвис — неполадка", None)
+NOTIFY_SPEECH_TITLE = _get("notifications", "speech_title", "Джарвис", None)
+# Кэш проверки звука перед фразой (с): не дёргать wpctl на каждую фразу в очереди.
+AUDIO_CHECK_TTL = _get("notifications", "audio_check_ttl", 1.5, None)
+
+def _notif_pack(key, default):
+    return _get("notifications", key, default, None)
+
+# Пометка-приставка перед фразой, когда громкость вывода НА НУЛЕ (не поломка — пользователь убавил).
+AUDIO_ZERO_PREFIX = _notif_pack("audio_zero", [
+    "Сэр, звук на динамиках на нуле — дублирую в уведомления.",
+    "Громкость на нуле, сэр, отвечаю текстом.",
+    "Динамики приглушены до нуля, сэр — вот текстом.",
+])
+# Пометка-приставка перед фразой при ТЕХНИЧЕСКОМ сбое звука (устройство/PipeWire/поток). К ней
+# добавляется конкретная причина. Иная по смыслу, чем «ноль».
+AUDIO_FAIL_PREFIX = _notif_pack("audio_fail", [
+    "Сэр, со звуком неполадка — дублирую в уведомления.",
+    "Не удаётся вывести голос, сэр — вот текстом.",
+    "Звук сейчас недоступен, сэр, дублирую текстом.",
+])
+
+# === Режим тишины ===
+SILENCE_ENABLED = _get("silence", "enabled", True, "JARVIS_SILENCE_ENABLED")
+SILENCE_ON_PHRASES = _get("silence", "on_phrases",
+    ["без звука", "режим тишины", "тихий режим", "беззвучный режим", "помолчи", "замолчи",
+     "не говори", "молчи"], None)
+SILENCE_OFF_PHRASES = _get("silence", "off_phrases",
+    ["включи звук", "можешь говорить", "выйди из режима тишины", "отмени тишину", "говори",
+     "верни голос", "громкий режим"], None)
+
+def _sil_pack(key, default):
+    return _get("silence", key, default, None)
+
+# Ответ на «без звука» (уходит в УВЕДОМЛЕНИЕ — Джарвис уже в тишине).
+SILENCE_ON_ACK = _sil_pack("on_ack", [
+    "Перехожу в режим тишины, сэр.",
+    "Молчу, сэр — отвечаю текстом.",
+    "Хорошо, сэр, дальше без голоса.",
+])
+# Ответ на «включи звук» (теперь уже ГОЛОСОМ).
+SILENCE_OFF_ACK = _sil_pack("off_ack", [
+    "Снова на связи, сэр.",
+    "Голос вернулся, сэр.",
+    "Рад снова говорить, сэр.",
+])

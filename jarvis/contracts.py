@@ -11,9 +11,11 @@ TOPIC_INPUT = "jarvis/input"      # {"text","user_level"?:float,"wake"?:bool}
 #                                 # wake — было ли обращение «Джарвис»/PTT (true) или фраза без него
 #                                 # (false → core примет ТОЛЬКО как продолжение активной ветки). Нет поля = true.
 TOPIC_EXECUTE = "jarvis/execute"  # {"command_tag": "..."}
-TOPIC_SAY = "jarvis/say"          # {"text","source","user_level"?:float,"min_volume"?:float,"chime"?:bool}
+TOPIC_SAY = "jarvis/say"          # {"text","source","user_level"?,"min_volume"?,"chime"?,"critical"?}
 #                                 # min_volume — нижний предел громкости (будильник/таймер: обход «тихо→тихо»)
 #                                 # chime — короткий сигнал перед фразой (срабатывание таймера)
+#                                 # critical — срабатывание (будильник/таймер/напоминание): ОЗВУЧИТЬ даже в
+#                                 #   режиме тишины. Наличие min_volume тоже трактуется как critical (ТЗ-6).
 TOPIC_STATE = "jarvis/state"      # {"state": "...", "source": "..."}
 
 # --- Уровни QoS (см. таблицу контрактов в CLAUDE.md) ---
