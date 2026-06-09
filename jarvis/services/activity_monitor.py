@@ -378,9 +378,12 @@ class ActivityMonitorModule(JarvisModule):
         text = (payload.get("text") or "").strip()
         if not text:
             return
-        # Любая распознанная реплика = активность: диктовка команд без касания мыши не должна
-        # уводить в ложный простой.
-        self._last_input = time.monotonic()
+        # НАМЕРЕННАЯ команда (обращение «Джарвис»/PTT, wake=true) = активность: диктовка команд без
+        # касания мыши не должна уводить в ложный простой. А вот ФОНОВУЮ речь (фильм/ТВ — wake=false,
+        # ТЗ-5) активностью НЕ считаем: иначе фильм со звуком не давал бы расти простою (нарушение ТЗ-9
+        # «фильм=простой»). Нет поля wake = true (обратная совместимость).
+        if payload.get("wake", True):
+            self._last_input = time.monotonic()
         if is_stop_phrase(text):
             self._handle_stop_phrase()
 

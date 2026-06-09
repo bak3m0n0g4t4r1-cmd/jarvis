@@ -120,13 +120,20 @@ class SchedulerModule(JarvisModule):
                 return
             level = payload.get("user_level")
             user_level = level if isinstance(level, (int, float)) else None
+            # wake — было ли обращение «Джарвис»/PTT (ТЗ-5). Нет поля = true (обратная совместимость).
+            wake = payload.get("wake", True)
             with self._lock:
                 # Идёт диалог дозапроса напоминания → следующая реплика = ответ (если не истёк).
+                # Ответ может прийти БЕЗ wake-word (продолжение разговора) — это нормально, обрабатываем.
                 if self._dialog is not None:
                     if self._dialog.get("deadline", 0) >= _time.monotonic():
                         self._handle_dialog_answer(text, user_level)
                         return
                     self._end_dialog()  # таймаут — снимаем и трактуем как обычную команду
+                # Без wake-word и вне диалога — это ФОНОВАЯ речь (кандидат-продолжение для core), а НЕ
+                # команда планировщика: иначе «поставь будильник» из ТВ ставило бы будильники. Игнор.
+                if not wake:
+                    return
                 # Маршрутизация по гейтам (порядок: будильник→напоминание→задача→таймер→секундомер).
                 if alarms.is_alarm_command(text):
                     self._handle_command(text, user_level)

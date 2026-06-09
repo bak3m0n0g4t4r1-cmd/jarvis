@@ -16,7 +16,7 @@ from datetime import datetime
 
 import yaml
 
-from jarvis import config, contracts, phrases, worldtime
+from jarvis import chains, config, contracts, phrases, worldtime
 from jarvis.breaks import is_stop_phrase
 from jarvis.bus import JarvisModule
 from jarvis.matcher import NOT_RECOGNIZED, Matcher
@@ -57,8 +57,14 @@ class CoreModule(JarvisModule):
     def __init__(self):
         super().__init__("jarvis-core")
         commands = _load_commands()
+        self._commands = commands
         # Матчер: правила (мгновенно) + эмбеддинги (лениво, при промахе правил).
         self._matcher = Matcher(commands)
+        # Цепочки команд (ТЗ-5): ветки продолжений + история + активная ветка.
+        self._branches, self._primary = chains.build_branches(commands)
+        self._active_branch = None          # ветка, чьи продолжения принимаем без wake-word
+        self._history = chains.History()     # история выполненных команд (повтор/отмена)
+        self._last_command = None            # последний выполненный тег
         # Один разбор за раз: на N100 нет смысла молотить эмбеддинги в несколько потоков.
         self._lock = threading.Lock()
 
@@ -69,31 +75,46 @@ class CoreModule(JarvisModule):
         text = (payload.get("text") or "").strip()
         if not text:
             return
-        # Стоп-фразу перерыва («не сейчас», «я работаю» и т.п.) обрабатывает сервис
-        # activity_monitor (он же ответит и сбросит цикл). Здесь молчим, чтобы не было
-        # двойного ответа — иначе поверх ответа на стоп прозвучало бы «не разобрал».
+        # Громкость речи пользователя (от STT) пробрасываем в ответ — для адаптивной громкости TTS.
+        level = payload.get("user_level")
+        user_level = level if isinstance(level, (int, float)) else None
+        # wake — было ли обращение «Джарвис»/PTT. Нет поля = true (обратная совместимость).
+        wake = payload.get("wake", True)
+        if not wake:
+            # Без wake-word — кандидат-ПРОДОЛЖЕНИЕ активной ветки (без гейтов scheduler/stop: «тише»/
+            # «следующий» к ним не относятся). core примет, ТОЛЬКО если фраза — продолжение ветки.
+            threading.Thread(target=self._process_continuation,
+                             args=(text, user_level), daemon=True).start()
+            return
+        # Дальше — полноценная команда (с обращением). Стоп-фразу перерыва обрабатывает
+        # activity_monitor (он ответит и сбросит цикл) — здесь молчим, чтобы не было двойного ответа.
         if is_stop_phrase(text):
             self.log.info("Стоп-фраза перерыва — обработает монитор активности: %s", text)
             return
-        # Команда планировщика (будильник/таймер/секундомер/напоминание/задача) — обработает сервис
-        # scheduler. ИЛИ идёт диалог дозапроса напоминания (scheduler ждёт ответ «о чём/когда») —
-        # тогда молчим на ЛЮБОЙ ввод, чтобы ответ-продолжение ушёл планировщику, а не «не разобрал».
+        # Команда планировщика (будильник/таймер/секундомер/напоминание/задача) — обработает scheduler.
+        # ИЛИ идёт диалог дозапроса напоминания → молчим на ЛЮБОЙ ввод (ответ уйдёт планировщику).
         # Мировое время/монетка — НЕ команды планировщика, идут ниже.
         if is_scheduler_command(text) or is_dialog_pending():
             self.log.info("Команда планировщика/диалог — обработает scheduler: %s", text)
             return
-        # Громкость речи пользователя (от STT) пробрасываем в ответ — для адаптивной громкости TTS.
-        level = payload.get("user_level")
-        user_level = level if isinstance(level, (int, float)) else None
         # Обработку выносим в поток, чтобы не блокировать MQTT-loop.
-        threading.Thread(target=self._process, args=(text, user_level), daemon=True).start()
+        threading.Thread(target=self._process_wake, args=(text, user_level), daemon=True).start()
 
-    def _process(self, text: str, user_level: float | None = None):
-        # Весь обработчик под защитой: непредвиденный сбой не должен убить рабочий поток
-        # и не должен оставить шину висеть в состоянии thinking.
+    def _process_wake(self, text: str, user_level: float | None = None):
+        """Полноценная команда (с wake-word/PTT): повтор/отмена → info → комбо → матчер.
+
+        Под защитой: непредвиденный сбой не должен убить поток и оставить шину в thinking."""
         with self._lock:
             try:
                 self.set_state(contracts.STATE_THINKING)
+
+                # 0) История: «повтори последнее» / «отмени».
+                if chains.is_repeat(text):
+                    self._do_repeat(user_level)
+                    return
+                if chains.is_undo(text):
+                    self._do_undo(user_level)
+                    return
 
                 # 1) Встроенные info-ответы (офлайн, без матчера).
                 info = self._local_info_answer(text)
@@ -101,25 +122,120 @@ class CoreModule(JarvisModule):
                     self._say(info, user_level)
                     return
 
-                # 2) Распознавание команды матчером.
-                match = self._matcher.match(text)
-                if match is not None:
-                    speech = self._matcher.confirmation(match.tag)
-                    self.log.info("Команда распознана: %s (%s, %.3f) — %s",
-                                  match.tag, match.layer, match.score, text)
-                    self._say(speech, user_level)
-                    self._execute_command(match.tag)
+                # 2) КОМБО: несколько действий через «и/потом» — если распозналось ≥2 команды.
+                if self._try_combo(text, user_level):
                     return
 
-                # 3) Не распознано — переспрос в характере (не падаем).
+                # 3) Одиночная команда матчером.
+                match = self._matcher.match(text)
+                if match is not None:
+                    self.log.info("Команда распознана: %s (%s, %.3f) — %s",
+                                  match.tag, match.layer, match.score, text)
+                    self._execute_matched(match.tag, user_level)
+                    return
+
+                # 4) Не распознано — переспрос в характере (не падаем).
                 self.log.info("Не распознано: %s", text)
                 self._say(NOT_RECOGNIZED, user_level)
             except Exception:
-                # Подстраховка: любой непредвиденный сбой — в лог по-человечески,
-                # состояние сбрасываем в idle, поток продолжает жить.
                 self.log_exc(logging.ERROR,
                              "Непредвиденный сбой обработки реплики — сбрасываю состояние")
                 self.set_state(contracts.STATE_IDLE)
+
+    def _process_continuation(self, text: str, user_level: float | None = None):
+        """Фраза без wake-word: принять, ТОЛЬКО если это продолжение АКТИВНОЙ ветки (иначе молчим).
+
+        Матчим строго по правилам в подмножестве ветки (в малом наборе эмбеддинги «перематчивают»).
+        Ветку при этом НЕ меняем (контекст сохраняется: музыка→тише остаётся музыкой)."""
+        with self._lock:
+            try:
+                if not self._active_branch:
+                    return  # нет активной ветки — продолжения не ждём, молчим
+                tags = self._branches.get(self._active_branch)
+                if not tags:
+                    return
+                match = self._matcher.match(text, allowed_tags=tags, use_embeddings=False)
+                if match is None:
+                    return  # не продолжение этой ветки — тихо игнорируем (никаких «не разобрал»)
+                self.log.info("Продолжение ветки «%s»: %s — %s",
+                              self._active_branch, match.tag, text)
+                self.set_state(contracts.STATE_THINKING)
+                self._execute_matched(match.tag, user_level, set_branch=False)
+            except Exception:
+                self.log_exc(logging.WARNING, "Сбой обработки продолжения — игнорирую")
+                self.set_state(contracts.STATE_IDLE)
+
+    # ------------------------------------------------------------------ #
+    # Выполнение команд, ветки, комбо, история
+    # ------------------------------------------------------------------ #
+    def _execute_matched(self, tag: str, user_level, set_branch: bool = True) -> None:
+        """Озвучить подтверждение, выполнить тег, обновить активную ветку (опц.) и историю."""
+        self._say(self._matcher.confirmation(tag), user_level)
+        self._execute_command(tag)
+        if set_branch:
+            self._active_branch = self._primary.get(tag)  # None для команд без ветки
+        self._history.record(tag)
+        self._last_command = tag
+
+    def _try_combo(self, text: str, user_level) -> bool:
+        """Комбо «выключи блютуз и вай-фай»: разбить, распознать каждое, выполнить по порядку.
+
+        ≥2 распознанных действия → True (выполнено). Иначе False (пусть обработает одиночный путь).
+        Опущенный глагол второго действия («…и вай-фай») восстанавливаем из первой части."""
+        parts = chains.split_combo(text)
+        if not parts:
+            return False
+        first_words = parts[0].split()
+        verb = first_words[0] if first_words else ""
+        matched, unmatched = [], []
+        for i, part in enumerate(parts):
+            m = self._matcher.match(part)
+            if m is None and verb and i > 0:
+                m = self._matcher.match(f"{verb} {part}")  # подставить глагол первой части
+            if m is not None:
+                matched.append(m.tag)
+            else:
+                unmatched.append(part)
+        if len(matched) < 2:
+            return False  # не настоящее комбо — «и» было частью одной команды
+        self.log.info("Комбо из %d действий: %s%s", len(matched), matched,
+                      f" (не понял: {unmatched})" if unmatched else "")
+        for tag in matched:
+            # Каждое действие: своё подтверждение + исполнение + история. Ветку зададим по последнему.
+            self._execute_matched(tag, user_level, set_branch=False)
+        self._active_branch = self._primary.get(matched[-1])
+        if unmatched:
+            self._say(phrases.pick("chains.combo_partial", config.COMBO_PARTIAL), user_level)
+        return True
+
+    def _do_repeat(self, user_level) -> None:
+        """«Повтори последнее» — выполнить последнюю команду заново (из истории)."""
+        last = self._last_command or self._history.last_tag()
+        if not last:
+            self._say(phrases.pick("chains.repeat_nothing", config.REPEAT_NOTHING), user_level)
+            return
+        self.log.info("Повтор последней команды: %s", last)
+        self._say(phrases.pick("chains.repeat_done", config.REPEAT_DONE), user_level)
+        self._execute_command(last)
+        self._history.record(last)
+
+    def _do_undo(self, user_level) -> None:
+        """«Отмени» — выполнить обратную команду (карта обратимость). Необратимо/нечего → в характере."""
+        last = self._last_command or self._history.last_tag()
+        if not last:
+            self._say(phrases.pick("chains.undo_nothing", config.UNDO_NOTHING), user_level)
+            return
+        inv = chains.inverse_tag(self._commands, last)
+        if not inv:
+            self.log.info("Отмена невозможна: %s необратима", last)
+            self._say(phrases.pick("chains.undo_irreversible", config.UNDO_IRREVERSIBLE), user_level)
+            return
+        self.log.info("Отмена %s → обратная %s", last, inv)
+        self._say(phrases.pick("chains.undo_done", config.UNDO_DONE), user_level)
+        self._execute_command(inv)
+        self._history.record(inv)
+        self._last_command = inv
+        self._active_branch = self._primary.get(inv)
 
     def _say(self, text: str, user_level: float | None = None) -> None:
         """Реплика в jarvis/say с опц. громкостью речи пользователя (для адаптивной громкости TTS)."""

@@ -297,8 +297,13 @@ def check_commands_yaml() -> list[CheckResult]:
     if not commands:
         return [CheckResult(WARN, "commands.yaml", reason="карта команд пуста.",
                             fix="добавьте хотя бы одну команду в commands.yaml")]
+    from jarvis.matcher import _RESERVED_KEYS
+
     results = []
     for tag, spec in commands.items():
+        # Служебные top-level ключи (ветки/обратимость, ТЗ-5) — НЕ команды, пропускаем.
+        if tag in _RESERVED_KEYS:
+            continue
         args = (spec or {}).get("команда")
         if not isinstance(args, list) or not args:
             results.append(CheckResult(
@@ -569,9 +574,11 @@ def check_matcher() -> CheckResult:
                            fix="добавьте команды в commands.yaml")
     # Только правила: эмбеддер не трогаем (его проверяет check_embedder отдельно).
     m = matcher_mod.Matcher(commands, embedder=_DisabledEmbedder())
-    no_synonyms = [t for t, s in commands.items() if not (s or {}).get("синонимы")]
+    # Служебные top-level ключи (ветки/обратимость, ТЗ-5) — НЕ команды, исключаем из проверки.
+    real = {t: s for t, s in commands.items() if t not in matcher_mod._RESERVED_KEYS}
+    no_synonyms = [t for t, s in real.items() if not (s or {}).get("синонимы")]
     wrong = []
-    for tag, spec in commands.items():
+    for tag, spec in real.items():
         synonyms = (spec or {}).get("синонимы") or []
         if not synonyms:
             continue
@@ -591,7 +598,7 @@ def check_matcher() -> CheckResult:
             fix="добавьте поле «синонимы» этим командам в commands.yaml",
         )
     return CheckResult(
-        OK, f"Матчер: {len(commands)} команд распознаются по синонимам (правила)")
+        OK, f"Матчер: {len(real)} команд распознаются по синонимам (правила)")
 
 
 def check_audio() -> list[CheckResult]:
@@ -1270,6 +1277,82 @@ def check_push_to_talk():
         fix="sudo usermod -aG input $USER, затем ПЕРЕЛОГИН (та же группа нужна ydotool)")
 
 
+def check_chains() -> list[CheckResult]:
+    """Цепочки (ТЗ-5): ветки продолжений валидны, обратимость валидна, фильтр/комбо-split/гейты живы."""
+    results = []
+    try:
+        import yaml
+
+        from jarvis import chains
+        from jarvis.matcher import Matcher
+        with open(config.COMMANDS_FILE, encoding="utf-8") as f:
+            commands = yaml.safe_load(f) or {}
+    except Exception as exc:
+        return [CheckResult(FAIL, "цепочки: загрузка", reason=str(exc),
+                            fix="см. commands.yaml / jarvis/chains.py")]
+
+    # 1) Ветки: все перечисленные теги существуют как команды.
+    try:
+        branches, _primary = chains.build_branches(commands)
+        missing = []
+        for name, members in (commands.get("ветки") or {}).items():
+            for t in (members or []):
+                if not isinstance(commands.get(t), dict):
+                    missing.append(f"{name}:{t}")
+        if missing:
+            results.append(CheckResult(
+                FAIL, "цепочки: ветки ссылаются на несуществующие теги",
+                reason=", ".join(missing[:8]), fix="поправьте список в commands.yaml → ветки"))
+        else:
+            results.append(CheckResult(
+                OK, f"ветки продолжений: {len(branches)} ({', '.join(branches)}) — теги валидны"))
+    except Exception as exc:
+        results.append(CheckResult(FAIL, "цепочки: ветки", reason=str(exc)))
+
+    # 2) Обратимость («отмени»): ключи и значения — реальные команды.
+    try:
+        inv_map = commands.get("обратимость") or {}
+        bad = [f"{k}->{v}" for k, v in inv_map.items()
+               if not (isinstance(commands.get(k), dict) and isinstance(commands.get(v), dict))]
+        if bad:
+            results.append(CheckResult(
+                FAIL, "цепочки: обратимость ссылается на несуществующие теги",
+                reason=", ".join(bad[:8]), fix="поправьте commands.yaml → обратимость"))
+        else:
+            results.append(CheckResult(OK, f"обратимость («отмени»): {len(inv_map)} пар — валидны"))
+    except Exception as exc:
+        results.append(CheckResult(FAIL, "цепочки: обратимость", reason=str(exc)))
+
+    # 3) Логика: фильтр продолжений по ветке + комбо-split + гейты повтор/отмена (на эталонах).
+    try:
+        m = Matcher(commands)
+        branches, _ = chains.build_branches(commands)
+        music = branches.get("музыка", set())
+        ok_cont = m.match("тише", allowed_tags=music, use_embeddings=False)        # должно совпасть
+        no_cont = m.match("открой браузер", allowed_tags=music, use_embeddings=False)  # не должно
+        combo = chains.split_combo("выключи блютуз и вай-фай")  # ≥2 части
+        single = chains.split_combo("сделай тише")             # None
+        problems = []
+        if not (ok_cont and ok_cont.tag in music):
+            problems.append("продолжение «тише» не сматчилось в ветке")
+        if no_cont is not None:
+            problems.append("«открой браузер» ложно принято как продолжение")
+        if not (combo and len(combo) >= 2):
+            problems.append("split_combo не разбил комбо")
+        if single is not None:
+            problems.append("split_combo ложно разбил одиночную команду")
+        if not (chains.is_repeat("повтори последнее") and chains.is_undo("отмени")):
+            problems.append("гейты повтор/отмена не сработали")
+        if problems:
+            results.append(CheckResult(FAIL, "цепочки: логика", reason="; ".join(problems)))
+        else:
+            results.append(CheckResult(
+                OK, "цепочки: фильтр ветки/комбо-split/повтор-отмена — распознаются"))
+    except Exception as exc:
+        results.append(CheckResult(FAIL, "цепочки: логика", reason=str(exc)))
+    return results
+
+
 def check_alarms() -> list[CheckResult]:
     """Будильники: расписание читается, парсер времени/команд жив, погода доступна (или офлайн).
 
@@ -1465,6 +1548,7 @@ def run(quick: bool = False) -> bool:
     _safe(reporter, check_embedder)
     _safe(reporter, check_matcher)
     _safe(reporter, check_alarms)
+    _safe(reporter, check_chains)
     if not quick:
         reporter.note("синтез тестового сэмпла Piper…")
         _safe(reporter, check_piper_synthesis)

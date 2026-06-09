@@ -804,3 +804,36 @@ TASK_NEED_TEXT = _rem_pack("task_need_text", [
     "Какую задачу добавить, сэр?",
     "Что записать в задачи, сэр?",
 ])
+
+# === Цепочки команд: продолжения без wake-word, комбо, повтор/отмена (секция chains) ===
+# Принимать продолжения активной ветки БЕЗ обращения «Джарвис» (true). false — только с wake-word.
+CONTINUATIONS_ENABLED = _get("chains", "continuations_enabled", True, "JARVIS_CONTINUATIONS")
+
+def _chains_pack(key, default):
+    return _get("chains", key, default, None)
+
+# Комбо: часть фразы не распознана (понятое выполнено, об остальном — честно).
+COMBO_PARTIAL = _chains_pack("combo_partial", [
+    "Остальное не разобрал, сэр.",
+    "Часть команды я не понял, сэр.",
+    "Сэр, остальное выполнить не смог — не расслышал.",
+])
+# «Повтори последнее».
+REPEAT_DONE = _chains_pack("repeat_done", [
+    "Повторяю, сэр.", "Ещё раз, сэр.", "Снова, сэр.",
+])
+REPEAT_NOTHING = _chains_pack("repeat_nothing", [
+    "Сэр, мне нечего повторить.", "Пока нечего повторять, сэр.",
+])
+# «Отмени» — обратимое / нечего / необратимое.
+UNDO_DONE = _chains_pack("undo_done", [
+    "Отменяю, сэр.", "Возвращаю как было, сэр.", "Откатываю, сэр.",
+])
+UNDO_NOTHING = _chains_pack("undo_nothing", [
+    "Сэр, отменять нечего.", "Пока нечего отменять, сэр.",
+])
+UNDO_IRREVERSIBLE = _chains_pack("undo_irreversible", [
+    "Сэр, это действие отменить нельзя.",
+    "Боюсь, откатить такое не выйдет, сэр.",
+    "Увы, сэр, это необратимо.",
+])

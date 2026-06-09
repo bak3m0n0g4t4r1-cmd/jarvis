@@ -348,14 +348,25 @@ class SttModule(JarvisModule):
             return
         self.log.info("Распознано: %s", text)
         command = self._match_wake_word(text)
+        user_level = self._rms(samples)
         if command:
-            # Громкость речи пользователя (RMS сегмента) — для адаптивной громкости ответа TTS.
-            user_level = self._rms(samples)
-            payload = {"text": command}
-            if user_level is not None:
-                payload["user_level"] = user_level
-            self.publish_json(contracts.TOPIC_INPUT, payload, qos=contracts.QOS_INPUT)
-            self.log.info("Команда в шину: %s (громкость речи %.4f)", command, user_level or 0.0)
+            # Wake-word есть → полноценная команда (core обработает обычным путём, задаст ветку).
+            self._publish_input(command, wake=True, user_level=user_level)
+            self.log.info("Команда в шину: %s (wake, громкость речи %.4f)", command, user_level or 0.0)
+        elif config.CONTINUATIONS_ENABLED:
+            # Без wake-word → отправляем ВСЮ фразу как кандидат-ПРОДОЛЖЕНИЕ активной ветки. Решает
+            # core (примет, только если фраза — продолжение текущей ветки; иначе молча игнор).
+            full = self._normalize(text)
+            if full:
+                self._publish_input(full, wake=False, user_level=user_level)
+                self.log.debug("Без wake — кандидат-продолжение: %s", full)
+
+    def _publish_input(self, text: str, wake: bool, user_level):
+        """Опубликовать распознанное в jarvis/input с флагом wake (есть/нет обращения «Джарвис»)."""
+        payload = {"text": text, "wake": bool(wake)}
+        if user_level is not None:
+            payload["user_level"] = user_level
+        self.publish_json(contracts.TOPIC_INPUT, payload, qos=contracts.QOS_INPUT)
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -514,11 +525,9 @@ class SttModule(JarvisModule):
         if not text:
             self.log.info("PTT: команда не распознана")
             return
+        # PTT — намеренная команда: wake=true (полноценная, как с обращением «Джарвис»).
         user_level = self._rms(audio)
-        payload = {"text": text}
-        if user_level is not None:
-            payload["user_level"] = user_level
-        self.publish_json(contracts.TOPIC_INPUT, payload, qos=contracts.QOS_INPUT)
+        self._publish_input(text, wake=True, user_level=user_level)
         self.log.info("PTT команда в шину: %s (громкость речи %.4f)", text, user_level or 0.0)
 
     def on_stop(self):

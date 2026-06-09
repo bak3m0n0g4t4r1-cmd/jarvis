@@ -46,6 +46,9 @@ _GENERIC_CONFIRMATIONS = (
 # Реплика на нераспознанное — в характере, без падения.
 NOT_RECOGNIZED = "Боюсь, не разобрал, сэр. Повторите?"
 
+# Служебные top-level ключи commands.yaml (НЕ команды): карты продолжений и обратимости.
+_RESERVED_KEYS = {"ветки", "обратимость"}
+
 _PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _SPACE_RE = re.compile(r"\s+")
 
@@ -170,7 +173,9 @@ class Matcher:
     def _build_index(self) -> None:
         """Собрать индексы правил и фраз для эмбеддингов из commands.yaml."""
         for tag, spec in self._commands.items():
-            spec = spec or {}
+            # Пропускаем СЛУЖЕБНЫЕ top-level ключи (карты продолжений/обратимости), а не команды.
+            if tag in _RESERVED_KEYS or not isinstance(spec, dict):
+                continue
             synonyms = [normalize(s) for s in (spec.get("синонимы") or []) if s]
             # Предпосчёт для быстрых проверок без difflib: (синоним, множество слов,
             # многословный?) + индекс точных синонимов для O(1)-распознавания.
@@ -195,15 +200,22 @@ class Matcher:
     # ------------------------------------------------------------------ #
     # Публичный вход
     # ------------------------------------------------------------------ #
-    def match(self, text: str) -> Optional[Match]:
-        """Распознать команду: сперва правила, затем эмбеддинги. None — не разобрал."""
+    def match(self, text: str, allowed_tags=None, use_embeddings: bool = True) -> Optional[Match]:
+        """Распознать команду: сперва правила, затем эмбеддинги. None — не разобрал.
+
+        allowed_tags (множество тегов) — ОГРАНИЧИТЬ распознавание подмножеством команд: нужно для
+        продолжений активной ветки без wake-word (матчим только её команды). None — все команды.
+        use_embeddings=False — ТОЛЬКО правила (для продолжений: в малом подмножестве эмбеддинги
+        «перематчивают» неродственные фразы, поэтому продолжение требует точного синонима)."""
         query = normalize(text)
         if not query:
             return None
-        rule = self._match_rules(query)
+        rule = self._match_rules(query, allowed_tags)
         if rule is not None:
             return rule
-        return self._match_embeddings(query)
+        if not use_embeddings:
+            return None
+        return self._match_embeddings(query, allowed_tags)
 
     def confirmation(self, tag: str) -> str:
         """Подтверждение в характере для тега: свой пак из commands.yaml или общий пул.
@@ -225,22 +237,24 @@ class Matcher:
     # ------------------------------------------------------------------ #
     # Слой 1: правила
     # ------------------------------------------------------------------ #
-    def _match_rules(self, query: str) -> Optional[Match]:
+    def _match_rules(self, query: str, allowed_tags=None) -> Optional[Match]:
         """Лучшее совпадение по синонимам. Горячий путь — БЕЗ difflib: точное совпадение
         (O(1) по индексу), вхождение фразы, все слова синонима во фразе. Нечёткое (difflib)
         — только fallback, когда быстрые проверки не дали сильного сигнала (искажения STT).
         Так частые/точные команды распознаются за <1 мс вместо ~24 мс (difflib по всем).
         Приоритеты совпадения сохранены: точное 1.0, вхождение 0.96, все слова 0.94, слово 0.92.
-        """
-        # 1) Точное совпадение — мгновенно, по индексу.
+        allowed_tags — ограничить подмножеством (продолжения активной ветки)."""
+        # 1) Точное совпадение — мгновенно, по индексу (если тег в разрешённых).
         tag = self._exact.get(query)
-        if tag is not None:
+        if tag is not None and (allowed_tags is None or tag in allowed_tags):
             return Match(tag, 1.0, "rules")
         # 2) Быстрые проверки (вхождение / все слова / однословное ключевое) — без difflib.
         q_tokens = query.split()
         q_set = set(q_tokens)
         best_tag, best_score = None, 0.0
         for tag, rules in self._rules.items():
+            if allowed_tags is not None and tag not in allowed_tags:
+                continue
             score = 0.0
             for s, s_words, is_multi in rules:
                 if is_multi:
@@ -256,13 +270,15 @@ class Matcher:
         if best_tag is not None and best_score >= 0.92:
             return Match(best_tag, round(best_score, 3), "rules")
         # 3) Fallback: нечёткое сравнение difflib — редкий путь (быстрые промахнулись).
-        return self._match_rules_fuzzy(query, q_tokens, best_tag, best_score)
+        return self._match_rules_fuzzy(query, q_tokens, best_tag, best_score, allowed_tags)
 
     def _match_rules_fuzzy(self, query: str, q_tokens: list[str],
-                           best_tag, best_score) -> Optional[Match]:
+                           best_tag, best_score, allowed_tags=None) -> Optional[Match]:
         """Нечёткое (difflib) сравнение — ловит искажения STT, когда точных совпадений нет.
         Стартует от лучшего быстрого результата, difflib может его только улучшить."""
         for tag, rules in self._rules.items():
+            if allowed_tags is not None and tag not in allowed_tags:
+                continue
             score = 0.0
             for s, _s_words, is_multi in rules:
                 if is_multi:
@@ -349,8 +365,9 @@ class Matcher:
         except Exception as exc:
             _log.debug("Не удалось сохранить кеш эмбеддингов (%s) — не критично", exc)
 
-    def _match_embeddings(self, query: str) -> Optional[Match]:
-        """Семантический поиск с порогом и защитой по отрыву (margin)."""
+    def _match_embeddings(self, query: str, allowed_tags=None) -> Optional[Match]:
+        """Семантический поиск с порогом и защитой по отрыву (margin).
+        allowed_tags — ограничить подмножеством (продолжения активной ветки)."""
         if not self._ensure_embeddings():
             return None
         qv = self._embedder.encode([query])
@@ -360,9 +377,11 @@ class Matcher:
             import numpy as np
 
             sims = self._emb_matrix @ qv[0]  # косинус (векторы уже нормированы)
-            # Лучшая близость на КОМАНДУ (max по её фразам).
+            # Лучшая близость на КОМАНДУ (max по её фразам), только разрешённые теги.
             best: dict[str, float] = {}
             for tag, sim in zip(self._emb_tags, sims):
+                if allowed_tags is not None and tag not in allowed_tags:
+                    continue
                 if sim > best.get(tag, -1.0):
                     best[tag] = float(sim)
             ranked = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
