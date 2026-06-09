@@ -25,8 +25,9 @@ class TtsModule(JarvisModule):
 
     def __init__(self):
         super().__init__("jarvis-tts")
-        # Очередь хранит (текст, громкость_речи_пользователя) — уровень от STT для адаптации.
-        self._queue: "queue.Queue[tuple[str, float | None]]" = queue.Queue()
+        # Очередь хранит (текст, громкость_речи_пользователя, нижний_предел_громкости).
+        # Уровень — от STT для адаптации; нижний предел — для будильника (обход «тихо→тихо»).
+        self._queue: "queue.Queue[tuple[str, float | None, float | None]]" = queue.Queue()
         self._voice = None
         self._voice_tried = False
         self._voice_lock = threading.Lock()
@@ -70,7 +71,13 @@ class TtsModule(JarvisModule):
         if text:
             # Уровень громкости речи пользователя (от STT через core) — для адаптации громкости.
             level = payload.get("user_level")
-            self._queue.put((text, level if isinstance(level, (int, float)) else None))
+            # Нижний предел громкости (будильник): озвучить НЕ тише — обходит «тихо вокруг → тихо».
+            mv = payload.get("min_volume")
+            self._queue.put((
+                text,
+                level if isinstance(level, (int, float)) else None,
+                float(mv) if isinstance(mv, (int, float)) else None,
+            ))
 
     def _run_worker(self):
         """Очередь озвучки по одной фразе. Воркер не умирает от единичного сбоя; стойкий сбой
@@ -80,10 +87,10 @@ class TtsModule(JarvisModule):
         while not self._stop_event.is_set():
             try:
                 try:
-                    text, level = self._queue.get(timeout=0.5)
+                    text, level, min_volume = self._queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                if self._speak(text, level):
+                if self._speak(text, level, min_volume):
                     if announced_critical:
                         self.log.info("Озвучка восстановлена — звук снова работает")
                     fails = 0
@@ -99,12 +106,13 @@ class TtsModule(JarvisModule):
             except Exception:
                 self.log_exc(logging.WARNING, "Сбой в цикле озвучки — продолжаю работу")
 
-    def _speak(self, text: str, user_level: float | None) -> bool:
+    def _speak(self, text: str, user_level: float | None, min_volume: float | None = None) -> bool:
         """Озвучить фразу с адаптивной громкостью. True — успех; False — пропуск (нет голоса/сбой).
 
         speaking держится РЕАЛЬНО пока играет звук (корректный тайминг анти-эхо). Перед речью:
         приглушаем музыку (ducking) если она реально звучит, и считаем громкость голоса под
         внешний шум + громкость речи пользователя. После речи — возвращаем музыку плавно.
+        min_volume (будильник) — гарантированный нижний предел громкости (обход «тихо→тихо»).
         """
         self._ensure_voice()
         if self._voice is None:
@@ -119,6 +127,9 @@ class TtsModule(JarvisModule):
                 self._env.duck()
                 ducked = True
             volume, gain = self._env.target_voice(user_level)
+            # Будильник: поднять громкость до нижнего предела, если адаптив дал тише (будит надёжно).
+            if min_volume is not None and min_volume > 0:
+                volume = max(volume, min(1.0, float(min_volume)))
             self.log.debug("Громкость голоса %.2f (gain %.2f), ducking=%s", volume, gain, ducked)
             self._synth_and_play(text, volume, gain)
             return True

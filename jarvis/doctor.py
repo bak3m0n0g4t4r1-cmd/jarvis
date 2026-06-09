@@ -1234,6 +1234,77 @@ def check_brightness():
         )
 
 
+def check_alarms() -> list[CheckResult]:
+    """Будильники: расписание читается, парсер времени/команд жив, погода доступна (или офлайн).
+
+    Парсер и расписание — офлайн (поломка → FAIL). Погода сетевая → офлайн = WARN, не FAIL
+    (будильник просто без погоды)."""
+    import os as _os
+
+    results = []
+    if not config.ALARMS_ENABLED:
+        return [CheckResult(OK, "будильники выключены (alarms.enabled=false)")]
+    try:
+        from jarvis import alarms
+    except Exception as exc:
+        return [CheckResult(FAIL, "будильники: импорт", reason=str(exc), fix="см. jarvis/alarms.py")]
+
+    # 1) Расписание читается и валидно (нет файла — это норма, пустое расписание).
+    try:
+        sched = alarms.read_schedule()
+        n = len(sched.get("будильники", []))
+        results.append(CheckResult(
+            OK, f"расписание будильников читается ({n} шт., {_os.path.basename(config.SCHEDULE_FILE)})"))
+    except Exception as exc:
+        results.append(CheckResult(FAIL, "расписание будильников", reason=str(exc),
+                                   fix="проверьте schedule.yaml (валидный YAML)"))
+
+    # 2) Парсер времени/команд жив (эталонные фразы → ожидаемый разбор).
+    try:
+        expected = [
+            ("поставь утренний будильник на 7 утра", "set", "morning", 7, 0, None),
+            ("перенеси утренний на полвосьмого", "move", "morning", 7, 30, None),
+            ("поставь будильник на 7 вечера с пометкой ужин", "set", "regular", 19, 0, "ужин"),
+            ("убери все будильники", "delete_all", "regular", None, None, None),
+        ]
+        bad = []
+        for text, act, typ, h, m, lbl in expected:
+            c = alarms.parse_command(text)
+            if (not c or c["действие"] != act or c["тип"] != typ or c["час"] != h
+                    or c["минута"] != m or (c.get("метка") or None) != lbl):
+                bad.append(text)
+        if bad:
+            results.append(CheckResult(
+                FAIL, "парсер будильников",
+                reason=f"эталонные фразы разобраны неверно: {'; '.join(bad)}.",
+                fix="см. jarvis/alarms.py (parse_time/parse_command)"))
+        else:
+            results.append(CheckResult(OK, "парсер будильников: время/тип/метка/«все» распознаются"))
+    except Exception as exc:
+        results.append(CheckResult(FAIL, "парсер будильников", reason=str(exc),
+                                   fix="см. jarvis/alarms.py"))
+
+    # 3) Погода — сетевая, поэтому офлайн/ошибка = WARN (не FAIL): будильник звонит без погоды.
+    if not config.ALARM_WEATHER_ENABLED:
+        results.append(CheckResult(OK, "погода в будильнике выключена (alarms.weather_enabled=false)"))
+    else:
+        try:
+            from jarvis import weather
+            geo = weather.geocode(config.REGION)
+            if geo:
+                results.append(CheckResult(
+                    OK, f"погода: регион «{config.REGION}» определён ({geo[0]:.2f}, {geo[1]:.2f})"))
+            else:
+                results.append(CheckResult(
+                    WARN, "погода: регион/сеть",
+                    reason=f"не удалось определить регион «{config.REGION}» (нет сети или опечатка).",
+                    fix="проверьте интернет и поле «регион» в settings.yaml — пока будильник без погоды"))
+        except Exception as exc:
+            results.append(CheckResult(WARN, "погода", reason=str(exc),
+                                       fix="будильник будет звонить без погоды"))
+    return results
+
+
 # --------------------------------------------------------------------------- #
 # Оркестрация
 # --------------------------------------------------------------------------- #
@@ -1274,6 +1345,7 @@ def run(quick: bool = False) -> bool:
     reporter.note("проверяю эмбеддер команд (rubert-tiny2)…")
     _safe(reporter, check_embedder)
     _safe(reporter, check_matcher)
+    _safe(reporter, check_alarms)
     if not quick:
         reporter.note("синтез тестового сэмпла Piper…")
         _safe(reporter, check_piper_synthesis)

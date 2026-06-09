@@ -319,3 +319,175 @@ BREAK_OFFER_PHRASES = _get("break_reminders", "offer_phrases", _DEFAULT_OFFER_PH
 BREAK_PRAISE_PHRASES = _get("break_reminders", "praise_phrases", _DEFAULT_PRAISE_PHRASES, None)
 BREAK_STOP_REPLIES = _get("break_reminders", "stop_replies", _DEFAULT_STOP_REPLIES, None)
 BREAK_STOP_PHRASES = _get("break_reminders", "stop_phrases", _DEFAULT_STOP_PHRASES, None)
+
+# === Геолокация (секция «местоположение») — для погоды и будущего мирового времени ===
+# Регион кириллицей (город[, страна]); геокодинг Open-Meteo берёт часть до запятой.
+REGION = _get("местоположение", "регион", "Москва, Россия", "JARVIS_REGION")
+
+# === Будильники (секции alarms + путь в models) ===
+# Файл расписания — через _get_path (абсолютный для systemd, см. грабли Этапа 7). Человекочитаемый
+# YAML в корне проекта; правится и голосом, и вручную.
+SCHEDULE_FILE = _get_path("models", "schedule_file", str(BASE_DIR / "schedule.yaml"),
+                          "JARVIS_SCHEDULE_FILE")
+# Включить будильники (false — сервис scheduler работает «вхолостую», молчит).
+ALARMS_ENABLED = _get("alarms", "enabled", True, "JARVIS_ALARMS_ENABLED")
+# Период тика планировщика (с). 15с — минутной точности достаточно, между тиками ~0% CPU.
+ALARM_TICK = _get("alarms", "tick_seconds", 15.0, "JARVIS_ALARM_TICK")
+# Окно «опоздавшего» срабатывания (мин): пропущенное время (сон ноутбука) не дольше — сработать
+# с опозданием; дольше — пропустить до следующего раза (не будить среди дня за вчерашнее).
+ALARM_GRACE_MINUTES = _get("alarms", "grace_minutes", 10, "JARVIS_ALARM_GRACE")
+# Утренний по умолчанию ежедневный (true) — срабатывает каждый день, пока не отменю. false — разовый.
+ALARM_MORNING_DAILY = _get("alarms", "morning_daily", True, "JARVIS_ALARM_MORNING_DAILY")
+# Громкость пробуждения (0..1): будильник звучит НЕ тише этого — обходит «тихо вокруг → тихо».
+ALARM_WAKE_VOLUME = _get("alarms", "wake_volume", 0.95, "JARVIS_ALARM_WAKE_VOLUME")
+# Нарастающая громкость утреннего пробуждения: короткие реплики тихо→громко перед богатой фразой.
+ALARM_WAKE_RISING = _get("alarms", "wake_rising", True, "JARVIS_ALARM_WAKE_RISING")
+# Стартовая громкость нарастания (0..1) и число ступеней до wake_volume.
+ALARM_WAKE_RISING_START = _get("alarms", "wake_rising_start", 0.4, "JARVIS_ALARM_WAKE_START")
+ALARM_WAKE_RISING_STEPS = _get("alarms", "wake_rising_steps", 3, "JARVIS_ALARM_WAKE_STEPS")
+# Погода в утренней фразе из Open-Meteo (true) или фраза без погоды (false). Без сети — без погоды.
+ALARM_WEATHER_ENABLED = _get("alarms", "weather_enabled", True, "JARVIS_ALARM_WEATHER")
+# Таймаут сетевых запросов погоды/геокодинга (с) — без сети/при сбое не виснем, будим без погоды.
+ALARM_WEATHER_TIMEOUT = _get("alarms", "weather_timeout", 5.0, "JARVIS_ALARM_WEATHER_TIMEOUT")
+
+# --- Паки фраз будильника (плейсхолдеры: {время} {темп_макс} {темп_мин} {погода} {метка}) ---
+# Дефолты полные (фича работает без settings.yaml). Авторитетная редактируемая копия — в settings.yaml.
+_DEF_MORNING_FIRE_WEATHER = [
+    "Доброе утро, сэр. Сейчас {время}. За окном {погода}, днём до {темп_макс}, "
+    "ночью около {темп_мин}. Прекрасное начало дня.",
+    "С добрым утром, сэр. Время — {время}. Погода сегодня: {погода}, "
+    "максимум {темп_макс}, минимум {темп_мин}.",
+    "Доброе утро, сэр. {время}. По прогнозу {погода}, от {темп_мин} до {темп_макс}. "
+    "Пора начинать день.",
+    "Подъём, сэр. Сейчас {время}. На улице {погода}, ожидается до {темп_макс}. "
+    "Желаю продуктивного дня.",
+]
+_DEF_MORNING_FIRE_PLAIN = [
+    "Доброе утро, сэр. Сейчас {время}. Пора просыпаться.",
+    "С добрым утром, сэр. Время — {время}. Новый день ждёт вас.",
+    "Подъём, сэр. Сейчас {время}. Желаю бодрого утра.",
+]
+_DEF_WAKE_PRELUDE = ["Сэр.", "Сэр, пора вставать.", "Доброе утро, сэр."]
+_DEF_MORNING_SET = [
+    "Утренний будильник установлен на {время}, сэр.",
+    "Поставил утренний будильник на {время}, сэр. Разбужу вовремя.",
+    "Готово, сэр. Утренний будильник на {время}.",
+]
+_DEF_MORNING_MOVE = [
+    "Перенёс утренний будильник на {время}, сэр.",
+    "Утренний будильник теперь на {время}, сэр.",
+    "Готово, сэр. Утренний переставлен на {время}.",
+]
+_DEF_MORNING_ALREADY = [
+    "Утренний будильник уже стоит на {время}, сэр.",
+    "Он уже заведён на {время}, сэр — ничего не меняю.",
+    "Сэр, утренний уже на {время}. Всё в силе.",
+]
+_DEF_MORNING_ALREADY_MOVE = [
+    "Утренний и так на {время}, сэр — переносить некуда.",
+    "Сэр, он уже на нужном времени, {время}.",
+    "Время и так {время}, сэр. Оставляю как есть.",
+]
+_DEF_MORNING_CANCEL = [
+    "Утренний будильник отменён, сэр.",
+    "Снял утренний будильник, сэр.",
+    "Готово, сэр. Утреннего больше нет.",
+]
+_DEF_MORNING_NONE = [
+    "Сэр, утренний будильник не задан.",
+    "У вас нет утреннего будильника, сэр.",
+    "Отменять нечего, сэр — утренний не установлен.",
+]
+_DEF_REGULAR_SET = [
+    "Будильник на {время} установлен, сэр.",
+    "Поставил будильник на {время}, сэр.",
+    "Готово, сэр. Будильник на {время}.",
+]
+_DEF_REGULAR_SET_LABEL = [
+    "Будильник на {время} с пометкой «{метка}» установлен, сэр.",
+    "Поставил будильник «{метка}» на {время}, сэр.",
+    "Готово, сэр. «{метка}» — на {время}.",
+]
+_DEF_REGULAR_ALREADY = [
+    "Такой будильник уже стоит на {время}, сэр.",
+    "Сэр, будильник на {время} уже заведён.",
+    "Он уже на {время}, сэр — дубль не создаю.",
+]
+_DEF_REGULAR_MOVE = [
+    "Перенёс будильник на {время}, сэр.",
+    "Будильник теперь на {время}, сэр.",
+    "Готово, сэр. Время изменено на {время}.",
+]
+_DEF_REGULAR_ALREADY_MOVE = [
+    "Будильник и так на {время}, сэр.",
+    "Сэр, он уже на нужном времени, {время}.",
+    "Менять нечего — уже {время}, сэр.",
+]
+_DEF_REGULAR_CANCEL_LABEL = [
+    "Будильник «{метка}» удалён, сэр.",
+    "Снял будильник «{метка}», сэр.",
+    "Готово, сэр. «{метка}» больше не сработает.",
+]
+_DEF_REGULAR_CANCEL = [
+    "Будильник удалён, сэр.",
+    "Снял будильник, сэр.",
+    "Готово, сэр. Будильник убран.",
+]
+_DEF_REGULAR_DELETE_ALL = [
+    "Все обычные будильники удалены, сэр. Утренний не тронут.",
+    "Снял все будильники, сэр. Утренний оставил.",
+    "Готово, сэр. Обычных будильников больше нет.",
+]
+_DEF_REGULAR_NONE_FOUND = [
+    "Сэр, не нашёл такого будильника.",
+    "Будильника с такой пометкой нет, сэр.",
+    "Сэр, у вас нет подходящего будильника для этого.",
+]
+_DEF_SUGGEST_LABEL = [
+    "Сэр, у вас теперь несколько будильников. Советую дать им пометки — так я смогу "
+    "различать их по названию.",
+    "Будильник поставлен, сэр. Рекомендую добавить пометку, например «с пометкой ужин» — "
+    "иначе их легко перепутать.",
+    "Готово, сэр. Чтобы потом менять нужный, дайте будильникам пометки.",
+]
+_DEF_REGULAR_FIRE = [
+    "Сэр, будильник. Сейчас {время}.",
+    "Внимание, сэр — сработал будильник. Время {время}.",
+    "Сэр, напоминаю о будильнике. {время}.",
+]
+_DEF_REGULAR_FIRE_LABEL = [
+    "Сэр, напоминаю — {метка}. Сейчас {время}.",
+    "Будильник «{метка}», сэр. Время {время}.",
+    "Сэр, пора — {метка}. {время}.",
+]
+_DEF_NEED_TIME = [
+    "Сэр, на какое время поставить будильник?",
+    "Уточните время, сэр — я не разобрал.",
+    "Простите, сэр, не расслышал время. Повторите?",
+]
+
+def _alarm_pack(key, default):
+    return _get("alarms", key, default, None)
+
+ALARM_MORNING_FIRE_WEATHER = _alarm_pack("morning_fire_weather", _DEF_MORNING_FIRE_WEATHER)
+ALARM_MORNING_FIRE_PLAIN = _alarm_pack("morning_fire_plain", _DEF_MORNING_FIRE_PLAIN)
+ALARM_WAKE_PRELUDE = _alarm_pack("wake_prelude_phrases", _DEF_WAKE_PRELUDE)
+ALARM_MORNING_SET = _alarm_pack("morning_set", _DEF_MORNING_SET)
+ALARM_MORNING_MOVE = _alarm_pack("morning_move", _DEF_MORNING_MOVE)
+ALARM_MORNING_ALREADY = _alarm_pack("morning_already", _DEF_MORNING_ALREADY)
+ALARM_MORNING_ALREADY_MOVE = _alarm_pack("morning_already_move", _DEF_MORNING_ALREADY_MOVE)
+ALARM_MORNING_CANCEL = _alarm_pack("morning_cancel", _DEF_MORNING_CANCEL)
+ALARM_MORNING_NONE = _alarm_pack("morning_none", _DEF_MORNING_NONE)
+ALARM_REGULAR_SET = _alarm_pack("regular_set", _DEF_REGULAR_SET)
+ALARM_REGULAR_SET_LABEL = _alarm_pack("regular_set_label", _DEF_REGULAR_SET_LABEL)
+ALARM_REGULAR_ALREADY = _alarm_pack("regular_already", _DEF_REGULAR_ALREADY)
+ALARM_REGULAR_MOVE = _alarm_pack("regular_move", _DEF_REGULAR_MOVE)
+ALARM_REGULAR_ALREADY_MOVE = _alarm_pack("regular_already_move", _DEF_REGULAR_ALREADY_MOVE)
+ALARM_REGULAR_CANCEL_LABEL = _alarm_pack("regular_cancel_label", _DEF_REGULAR_CANCEL_LABEL)
+ALARM_REGULAR_CANCEL = _alarm_pack("regular_cancel", _DEF_REGULAR_CANCEL)
+ALARM_REGULAR_DELETE_ALL = _alarm_pack("regular_delete_all", _DEF_REGULAR_DELETE_ALL)
+ALARM_REGULAR_NONE_FOUND = _alarm_pack("regular_none_found", _DEF_REGULAR_NONE_FOUND)
+ALARM_SUGGEST_LABEL = _alarm_pack("suggest_label", _DEF_SUGGEST_LABEL)
+ALARM_REGULAR_FIRE = _alarm_pack("regular_fire", _DEF_REGULAR_FIRE)
+ALARM_REGULAR_FIRE_LABEL = _alarm_pack("regular_fire_label", _DEF_REGULAR_FIRE_LABEL)
+ALARM_NEED_TIME = _alarm_pack("need_time", _DEF_NEED_TIME)

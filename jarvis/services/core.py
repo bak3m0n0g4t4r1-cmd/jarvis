@@ -16,6 +16,7 @@ from datetime import datetime
 import yaml
 
 from jarvis import config, contracts
+from jarvis.alarms import is_alarm_command
 from jarvis.breaks import is_stop_phrase
 from jarvis.bus import JarvisModule
 from jarvis.matcher import NOT_RECOGNIZED, Matcher
@@ -72,6 +73,11 @@ class CoreModule(JarvisModule):
         # двойного ответа — иначе поверх ответа на стоп прозвучало бы «не разобрал».
         if is_stop_phrase(text):
             self.log.info("Стоп-фраза перерыва — обработает монитор активности: %s", text)
+            return
+        # Команда будильника — обработает сервис scheduler (он сам слушает jarvis/input и ответит).
+        # Здесь молчим, чтобы не сказать «не разобрал» поверх ответа планировщика (как со стоп-фразой).
+        if is_alarm_command(text):
+            self.log.info("Команда будильника — обработает планировщик: %s", text)
             return
         # Громкость речи пользователя (от STT) пробрасываем в ответ — для адаптивной громкости TTS.
         level = payload.get("user_level")

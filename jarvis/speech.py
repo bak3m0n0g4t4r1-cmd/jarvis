@@ -94,6 +94,50 @@ def say_time(h: int, m: int) -> str:
     return f"{hh} {mm}"
 
 
+def say_time_of_day(h: int) -> str:
+    """Период суток по часу (0..23): «ночи»/«утра»/«дня»/«вечера» — для естественной речи."""
+    try:
+        h = int(h) % 24
+    except (TypeError, ValueError):
+        return ""
+    if 0 <= h <= 4:
+        return "ночи"
+    if 5 <= h <= 11:
+        return "утра"
+    if 12 <= h <= 16:
+        return "дня"
+    return "вечера"
+
+
+def say_clock(h: int, m: int) -> str:
+    """Время будильника естественно (12-часовой стиль + период суток), НЕ «07:00».
+
+    «7, 0» → «семь часов утра»; «19, 30» → «семь часов тридцать минут вечера»;
+    «0, 0» → «двенадцать часов ночи»; «13, 5» → «час дня пять минут».
+    """
+    try:
+        h, m = int(h) % 24, int(m) % 60
+    except (TypeError, ValueError):
+        return say_time(h, m)
+    period = say_time_of_day(h)
+    h12 = h % 12 or 12  # 0/12 → 12, 13 → 1
+    hh = f"{cardinal(h12)} {plural_ru(h12, 'час', 'часа', 'часов')}"
+    if m == 0:
+        return f"{hh} {period}"
+    mm = f"{cardinal(m, 'f')} {plural_ru(m, 'минута', 'минуты', 'минут')}"
+    return f"{hh} {mm} {period}"
+
+
+def say_temperature(t) -> str:
+    """Температура естественно: -3 → «минус три градуса», 25 → «двадцать пять градусов»,
+    0 → «ноль градусов». Дробное округляется до целого. На странном входе — str(t)."""
+    try:
+        t = int(round(float(t)))
+    except (TypeError, ValueError):
+        return str(t)
+    return f"{cardinal(t)} {plural_ru(abs(t), 'градус', 'градуса', 'градусов')}"
+
+
 def _ordinal_neuter(n: int) -> str:
     """Порядковое ср. рода 1..31 (день месяца)."""
     if n in _ORD_NEUTER:

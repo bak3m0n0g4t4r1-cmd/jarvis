@@ -45,4 +45,10 @@ SERVICES = [
         "«Внимание» — детектор активности и напоминания о перерыве",
         needs_audio=False,
     ),
+    ServiceDef(
+        "scheduler", "jarvis-scheduler.service", "jarvis-scheduler",
+        "jarvis.services.scheduler", "SchedulerModule",
+        "«Планировщик» — будильники (утренний и обычные)",
+        needs_audio=False,
+    ),
 ]
