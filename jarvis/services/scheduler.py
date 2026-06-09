@@ -11,16 +11,18 @@ logs/scheduler_state.json — анти-двойное срабатывание).
 """
 import json
 import logging
+import random
 import threading
+import time as _time
 from datetime import datetime, time as dtime, timedelta
 from difflib import SequenceMatcher
 
-from jarvis import alarms, config, contracts, phrases, timers, weather
+from jarvis import alarms, config, contracts, phrases, reminders, timers, weather
 from jarvis.bus import JarvisModule
-from jarvis.speech import say_clock, say_duration, say_temperature
+from jarvis.speech import say_clock, say_duration, say_temperature, say_when
 
 _PLACEHOLDERS = ("{время}", "{метка}", "{погода}", "{темп_макс}", "{темп_мин}",
-                 "{длительность}", "{остаток}", "{прошло}")
+                 "{длительность}", "{остаток}", "{прошло}", "{текст}", "{когда}", "{список}")
 
 
 def _fmt(template: str, **kw) -> str:
@@ -43,6 +45,7 @@ class SchedulerModule(JarvisModule):
         self._state_file = config.LOGS_DIR / "scheduler_state.json"
         self._weather_cache = None                 # (дата_iso, погода|None) — кэш погоды на день
         self._thread = None
+        self._dialog = None                         # диалог дозапроса напоминания (см. reminders)
 
     # ------------------------------------------------------------------ #
     # Жизненный цикл
@@ -117,10 +120,20 @@ class SchedulerModule(JarvisModule):
                 return
             level = payload.get("user_level")
             user_level = level if isinstance(level, (int, float)) else None
-            # Маршрутизация: будильник → таймер → секундомер (гейты разводят по ключевым словам).
             with self._lock:
+                # Идёт диалог дозапроса напоминания → следующая реплика = ответ (если не истёк).
+                if self._dialog is not None:
+                    if self._dialog.get("deadline", 0) >= _time.monotonic():
+                        self._handle_dialog_answer(text, user_level)
+                        return
+                    self._end_dialog()  # таймаут — снимаем и трактуем как обычную команду
+                # Маршрутизация по гейтам (порядок: будильник→напоминание→задача→таймер→секундомер).
                 if alarms.is_alarm_command(text):
                     self._handle_command(text, user_level)
+                elif reminders.is_reminder_command(text):
+                    self._handle_reminder(text, user_level)
+                elif reminders.is_task_command(text):
+                    self._handle_task(text, user_level)
                 elif timers.is_timer_command(text):
                     self._handle_timer(text, user_level)
                 elif timers.is_stopwatch_command(text):
@@ -554,6 +567,295 @@ class SchedulerModule(JarvisModule):
             return None
 
     # ------------------------------------------------------------------ #
+    # НАПОМИНАНИЯ
+    # ------------------------------------------------------------------ #
+    def _handle_reminder(self, text, user_level):
+        cmd = reminders.parse_reminder_command(text)
+        if not cmd:
+            return
+        action = cmd["действие"]
+        self.log.info("Напоминание: команда %s текст=%s дата=%s время=%s (%s)",
+                      action, cmd.get("текст"), cmd.get("дата"), cmd.get("время"), text)
+        if action == "list":
+            self._reminder_list(text, user_level)
+            return
+        sched = alarms.read_schedule()
+        if action == "delete_all":
+            active = [r for r in sched["напоминания"] if r.get("активен")]
+            if not active:
+                self._reply("reminder.none_found", config.REMINDER_NONE_FOUND, user_level)
+                return
+            sched["напоминания"] = [r for r in sched["напоминания"] if not r.get("активен")]
+            self._reply("reminder.delete_all", config.REMINDER_DELETE_ALL, user_level)
+            alarms.write_schedule(sched)
+            return
+        if action == "cancel":
+            target = self._find_reminder(sched["напоминания"], cmd.get("метка") or cmd.get("текст"))
+            if not target:
+                self._reply("reminder.none_found", config.REMINDER_NONE_FOUND, user_level)
+                return
+            sched["напоминания"].remove(target)
+            self._reply("reminder.cancel", config.REMINDER_CANCEL, user_level, текст=target.get("текст"))
+            alarms.write_schedule(sched)
+            return
+        if action == "move":
+            target = self._find_reminder(sched["напоминания"], cmd.get("метка") or cmd.get("текст"))
+            if not target:
+                self._reply("reminder.none_found", config.REMINDER_NONE_FOUND, user_level)
+                return
+            fire, точное, _m = self._compute_fire(cmd.get("дата"), cmd.get("время"), cmd.get("точное"))
+            target["срабатывание"] = self._iso(fire)
+            target["точное"] = точное
+            target["сработал"] = False
+            target["активен"] = True
+            self._reply("reminder.move", config.REMINDER_MOVE, user_level,
+                        текст=target.get("текст"), когда=say_when(fire, точное))
+            alarms.write_schedule(sched)
+            return
+        # action == "set"
+        self._reminder_set(cmd, sched, user_level)
+
+    def _reminder_set(self, cmd, sched, user_level):
+        текст = (cmd.get("текст") or "").strip() or None
+        d, t = cmd.get("дата"), cmd.get("время")
+        has_when = bool(d) or bool(t)
+        if текст and has_when:
+            self._create_reminder(текст, d, t, cmd.get("точное"), cmd.get("повтор", "нет"),
+                                   cmd.get("метка"), sched, user_level)
+        elif текст and not has_when:
+            self._start_dialog("когда", {"текст": текст, "повтор": cmd.get("повтор", "нет"),
+                                         "метка": cmd.get("метка")}, user_level)
+        elif (not текст) and has_when:
+            self._start_dialog("что", {"дата": d, "время": t, "точное": cmd.get("точное"),
+                                       "повтор": cmd.get("повтор", "нет"), "метка": cmd.get("метка")},
+                               user_level)
+        else:
+            self._start_dialog("что", {"повтор": cmd.get("повтор", "нет")}, user_level)
+
+    def _create_reminder(self, текст, d, t, точное, повтор, метка, sched, user_level):
+        fire, точное2, mode = self._compute_fire(d, t, точное)
+        sched["напоминания"].append(self._make_reminder(текст, fire, точное2, повтор, метка))
+        alarms.write_schedule(sched)
+        if mode == "today_random":
+            self._reply("reminder.set_random", config.REMINDER_SET_RANDOM, user_level, текст=текст)
+        else:
+            self._reply("reminder.set", config.REMINDER_SET, user_level,
+                        текст=текст, когда=say_when(fire, точное2))
+
+    def _compute_fire(self, d, t, точное):
+        """Вычислить datetime срабатывания + режим: exact|today_random|future_window."""
+        now = datetime.now()
+        if t is not None:
+            day = d or now.date()
+            fire = datetime.combine(day, dtime(int(t[0]), int(t[1])))
+            if d is None and fire <= now:
+                fire += timedelta(days=1)  # время сегодня прошло, дата не задана → завтра
+            return fire, True, "exact"
+        if d is None or d == now.date():
+            secs = random.uniform(config.REMINDER_RANDOM_MIN, config.REMINDER_RANDOM_MAX)
+            return now + timedelta(seconds=secs), False, "today_random"
+        start = int(config.REMINDER_DAY_START)
+        end = max(start + 1, int(config.REMINDER_DAY_END))
+        fire = datetime.combine(d, dtime(random.randint(start, end - 1), random.randint(0, 59)))
+        return fire, False, "future_window"
+
+    @staticmethod
+    def _make_reminder(текст, fire, точное, повтор, метка):
+        rid = "rem:" + (alarms._norm(метка or текст) or "x")[:24] + ":" + fire.strftime("%m%d%H%M")
+        return {"текст": текст, "срабатывание": fire.isoformat(timespec="seconds"),
+                "точное": bool(точное), "повтор": повтор or "нет", "метка": метка,
+                "активен": True, "сработал": False, "id": rid}
+
+    @staticmethod
+    def _find_reminder(rems, needle):
+        """Активное напоминание по метке/тексту (вхождение/нечётко) или единственное."""
+        active = [r for r in rems if r.get("активен")]
+        if needle:
+            n = alarms._norm(needle)
+            for r in active:
+                hay = alarms._norm((r.get("метка") or "") + " " + (r.get("текст") or ""))
+                if n and (n in hay or SequenceMatcher(None, n, hay).ratio() >= 0.6):
+                    return r
+            return None
+        return active[0] if len(active) == 1 else None
+
+    def _reminder_list(self, text, user_level):
+        sched = alarms.read_schedule()
+        today_only = reminders.is_list_query(text)  # «что у меня на сегодня»
+        now = datetime.now()
+        items = []
+        for r in sched.get("напоминания", []):
+            if not r.get("активен"):
+                continue
+            fire = self._parse_iso(r.get("срабатывание"))
+            if today_only and (not fire or fire.date() != now.date()):
+                continue
+            когда = say_when(fire, r.get("точное", True)) if fire else ""
+            items.append(f"{r.get('текст')} — {когда}".strip(" —"))
+        if today_only:  # на сегодня добавляем активные задачи
+            for tsk in sched.get("задачи", []):
+                if tsk.get("статус") == "активна" and tsk.get("текст"):
+                    items.append(tsk["текст"])
+        items = [i for i in items if i]
+        if not items:
+            if today_only:
+                self._reply("reminder.today_empty", config.TODAY_EMPTY, user_level)
+            else:
+                self._reply("reminder.list_empty", config.REMINDER_LIST_EMPTY, user_level)
+            return
+        список = "; ".join(items)
+        if today_only:
+            self._reply("reminder.today_list", config.TODAY_LIST, user_level, список=список)
+        else:
+            self._reply("reminder.list", config.REMINDER_LIST, user_level, список=список)
+
+    # ---- Диалог дозапроса (вар.3) ---- #
+    def _start_dialog(self, expecting, partial, user_level):
+        partial["expecting"] = expecting
+        partial["attempts"] = 0
+        partial["deadline"] = _time.monotonic() + float(config.REMINDER_DIALOG_TIMEOUT)
+        self._dialog = partial
+        reminders.arm_dialog(config.REMINDER_DIALOG_TIMEOUT)
+        key, pack = (("reminder.dialog_what", config.REMINDER_DIALOG_WHAT) if expecting == "что"
+                     else ("reminder.dialog_when", config.REMINDER_DIALOG_WHEN))
+        self._reply(key, pack, user_level)
+
+    def _end_dialog(self):
+        self._dialog = None
+        reminders.clear_dialog()
+
+    def _rearm_dialog(self):
+        self._dialog["deadline"] = _time.monotonic() + float(config.REMINDER_DIALOG_TIMEOUT)
+        reminders.arm_dialog(config.REMINDER_DIALOG_TIMEOUT)
+
+    def _handle_dialog_answer(self, text, user_level):
+        if reminders.is_cancel(text):
+            self._end_dialog()
+            self._reply("reminder.dialog_cancel", config.REMINDER_DIALOG_CANCEL, user_level)
+            return
+        dlg = self._dialog
+        if dlg.get("expecting") == "что":
+            dlg["текст"] = reminders.extract_text(text) or text.strip()
+            d, t, exact = reminders.parse_when(text)
+            if d or t:
+                dlg["дата"], dlg["время"], dlg["точное"] = d, t, exact
+            if dlg.get("дата") or dlg.get("время"):
+                self._finalize_dialog(user_level)
+            else:
+                dlg["expecting"] = "когда"
+                self._rearm_dialog()
+                self._reply("reminder.dialog_when", config.REMINDER_DIALOG_WHEN, user_level)
+            return
+        # expecting == "когда"
+        d, t, exact = reminders.parse_when(text)
+        if not (d or t):
+            dlg["attempts"] = dlg.get("attempts", 0) + 1
+            if dlg["attempts"] >= 2:
+                self._end_dialog()
+                self._reply("reminder.dialog_cancel", config.REMINDER_DIALOG_CANCEL, user_level)
+                return
+            self._rearm_dialog()
+            self._reply("reminder.dialog_cant_when", config.REMINDER_DIALOG_CANT_WHEN, user_level)
+            return
+        dlg["дата"], dlg["время"], dlg["точное"] = d, t, exact
+        self._finalize_dialog(user_level)
+
+    def _finalize_dialog(self, user_level):
+        dlg = self._dialog
+        self._end_dialog()
+        sched = alarms.read_schedule()
+        self._create_reminder(dlg.get("текст"), dlg.get("дата"), dlg.get("время"),
+                              dlg.get("точное"), dlg.get("повтор", "нет"), dlg.get("метка"),
+                              sched, user_level)
+
+    # ------------------------------------------------------------------ #
+    # ЗАДАЧИ
+    # ------------------------------------------------------------------ #
+    def _handle_task(self, text, user_level):
+        cmd = reminders.parse_task_command(text)
+        if not cmd:
+            return
+        action = cmd["действие"]
+        self.log.info("Задача: команда %s текст=%s (%s)", action, cmd.get("текст"), text)
+        if action == "list":
+            self._task_list(user_level)
+            return
+        sched = alarms.read_schedule()
+        if action == "delete_all":
+            if not sched["задачи"]:
+                self._reply("task.none_found", config.TASK_NONE_FOUND, user_level)
+                return
+            sched["задачи"] = []
+            self._reply("task.delete_all", config.TASK_DELETE_ALL, user_level)
+            alarms.write_schedule(sched)
+            return
+        if action in ("done", "delete"):
+            target = self._find_task(sched["задачи"], cmd.get("метка") or cmd.get("текст"))
+            if not target:
+                self._reply("task.none_found", config.TASK_NONE_FOUND, user_level)
+                return
+            if action == "done":
+                target["статус"] = "выполнена"
+                self._reply("task.done", config.TASK_DONE, user_level, текст=target.get("текст"))
+            else:
+                sched["задачи"].remove(target)
+                self._reply("task.delete", config.TASK_DELETE, user_level, текст=target.get("текст"))
+            alarms.write_schedule(sched)
+            return
+        # action == "add"
+        текст = (cmd.get("текст") or "").strip()
+        if not текст:
+            self._reply("task.need_text", config.TASK_NEED_TEXT, user_level)
+            return
+        дедлайн = None
+        if cmd.get("дата") or cmd.get("время"):
+            fire, _e, _m = self._compute_fire(cmd.get("дата"), cmd.get("время"), cmd.get("точное"))
+            дедлайн = self._iso(fire)
+        sched["задачи"].append(self._make_task(текст, дедлайн, cmd.get("метка")))
+        self._reply("task.add", config.TASK_ADD, user_level, текст=текст)
+        alarms.write_schedule(sched)
+
+    @staticmethod
+    def _make_task(текст, дедлайн, метка):
+        tid = "task:" + (alarms._norm(метка or текст) or "x")[:24]
+        return {"текст": текст, "дедлайн": дедлайн, "статус": "активна", "метка": метка,
+                "сработал": False, "id": tid}
+
+    @staticmethod
+    def _find_task(tasks, needle):
+        active = [t for t in tasks if t.get("статус") == "активна"]
+        if needle:
+            n = alarms._norm(needle)
+            for t in active:
+                hay = alarms._norm((t.get("метка") or "") + " " + (t.get("текст") or ""))
+                if n and (n in hay or SequenceMatcher(None, n, hay).ratio() >= 0.6):
+                    return t
+            return None
+        return active[0] if len(active) == 1 else None
+
+    def _task_list(self, user_level):
+        sched = alarms.read_schedule()
+        active = [t for t in sched.get("задачи", []) if t.get("статус") == "активна"]
+        if not active:
+            self._reply("task.list_empty", config.TASK_LIST_EMPTY, user_level)
+            return
+        список = "; ".join(t.get("текст") for t in active if t.get("текст"))
+        self._reply("task.list", config.TASK_LIST, user_level, список=список)
+
+    def _fire_reminder(self, r):
+        """Срабатывание напоминания/дедлайна задачи: чайм (опц.) + фраза на заметной громкости."""
+        try:
+            текст = r.get("текст") or ""
+            exact = r.get("точное", True)
+            key, pack = (("reminder.fire", config.REMINDER_FIRE) if exact
+                         else ("reminder.fire_random", config.REMINDER_FIRE_RANDOM))
+            self._say(_fmt(phrases.pick(key, pack), текст=текст),
+                      min_volume=float(config.REMINDER_VOLUME), chime=bool(config.REMINDER_CHIME))
+            self.log.info("Напоминание сработало: %s", текст)
+        except Exception:
+            self.log_exc(logging.ERROR, "Сбой озвучки напоминания")
+
+    # ------------------------------------------------------------------ #
     # Тик-цикл и срабатывание
     # ------------------------------------------------------------------ #
     def _tick_loop(self):
@@ -565,7 +867,7 @@ class SchedulerModule(JarvisModule):
 
     def _tick(self):
         now = datetime.now()
-        fire_alarms, fire_timers = [], []
+        fire_alarms, fire_timers, fire_reminders = [], [], []
         with self._lock:
             sched = alarms.read_schedule()
             before_fired = dict(self._fired)
@@ -582,6 +884,31 @@ class SchedulerModule(JarvisModule):
                 if self._timer_due(t, now):  # помечает сработал/активен=false (персист ниже)
                     fire_timers.append(dict(t))
                     changed = True
+            # Напоминания: срабатывание <= now. Повтор ежедневный → следующее наступление (не гасим).
+            for r in sched.get("напоминания", []):
+                if not r.get("активен") or r.get("сработал"):
+                    continue
+                fire_dt = self._parse_iso(r.get("срабатывание"))
+                if fire_dt and now >= fire_dt:
+                    fire_reminders.append(dict(r))
+                    if r.get("повтор") == "ежедневный":
+                        nxt = fire_dt
+                        while nxt <= now:
+                            nxt += timedelta(days=1)
+                        r["срабатывание"] = self._iso(nxt)
+                    else:
+                        r["сработал"] = True
+                        r["активен"] = False
+                    changed = True
+            # Задачи с дедлайном (срабатывают как напоминание один раз).
+            for tsk in sched.get("задачи", []):
+                if tsk.get("статус") != "активна" or tsk.get("сработал"):
+                    continue
+                dl = self._parse_iso(tsk.get("дедлайн")) if tsk.get("дедлайн") else None
+                if dl and now >= dl:
+                    fire_reminders.append({"текст": tsk.get("текст"), "точное": True})
+                    tsk["сработал"] = True
+                    changed = True
             if changed:
                 alarms.write_schedule(sched)
             if self._fired != before_fired:
@@ -591,6 +918,8 @@ class SchedulerModule(JarvisModule):
             self._fire_alarm(a, now)
         for t in fire_timers:
             self._fire_timer(t)
+        for r in fire_reminders:
+            self._fire_reminder(r)
 
     def _timer_due(self, t, now) -> bool:
         """Таймер истёк? Срабатывает и при пропуске во время простоя (now ≫ окончание) — один раз.

@@ -20,8 +20,8 @@ from jarvis import config, contracts, phrases, worldtime
 from jarvis.breaks import is_stop_phrase
 from jarvis.bus import JarvisModule
 from jarvis.matcher import NOT_RECOGNIZED, Matcher
+from jarvis.reminders import is_dialog_pending, is_scheduler_command
 from jarvis.sysinfo import read_battery, read_system_load, read_volume
-from jarvis.timers import is_scheduler_command
 from jarvis.speech import say_date, say_percent, say_time
 
 # Ключевые слова встроенных info-ответов (срабатывают на явный вопрос).
@@ -75,11 +75,12 @@ class CoreModule(JarvisModule):
         if is_stop_phrase(text):
             self.log.info("Стоп-фраза перерыва — обработает монитор активности: %s", text)
             return
-        # Команда планировщика (будильник/таймер/секундомер) — обработает сервис scheduler (он сам
-        # слушает jarvis/input и ответит). Здесь молчим, чтобы не сказать «не разобрал» поверх его
-        # ответа (как со стоп-фразой). Мировое время/монетка — НЕ команды планировщика, идут ниже.
-        if is_scheduler_command(text):
-            self.log.info("Команда планировщика — обработает scheduler: %s", text)
+        # Команда планировщика (будильник/таймер/секундомер/напоминание/задача) — обработает сервис
+        # scheduler. ИЛИ идёт диалог дозапроса напоминания (scheduler ждёт ответ «о чём/когда») —
+        # тогда молчим на ЛЮБОЙ ввод, чтобы ответ-продолжение ушёл планировщику, а не «не разобрал».
+        # Мировое время/монетка — НЕ команды планировщика, идут ниже.
+        if is_scheduler_command(text) or is_dialog_pending():
+            self.log.info("Команда планировщика/диалог — обработает scheduler: %s", text)
             return
         # Громкость речи пользователя (от STT) пробрасываем в ответ — для адаптивной громкости TTS.
         level = payload.get("user_level")

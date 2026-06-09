@@ -1353,6 +1353,37 @@ def check_alarms() -> list[CheckResult]:
                                        fix="заполните coin.heads/coin.tails в settings.yaml"))
     except Exception:
         pass
+
+    # 7) Парсер дат и команд напоминаний/задач (офлайн → FAIL при поломке).
+    try:
+        from datetime import date as _d, timedelta as _td
+
+        from jarvis import reminders
+        base = _d(2026, 6, 9)
+        ok_date = (reminders.parse_date("завтра", base) == base + _td(days=1)
+                   and reminders.parse_date("через неделю", base) == base + _td(weeks=1)
+                   and reminders.parse_date("15 июня", base) == _d(2026, 6, 15)
+                   and reminders.parse_date("в пятницу", base) == _d(2026, 6, 12)
+                   and reminders.parse_date("пятнадцатого июня", base) == _d(2026, 6, 15))
+        rc = reminders.parse_reminder_command("напомни про стирку сегодня в 12")
+        tc = reminders.parse_task_command("добавь задачу починить кран")
+        ok_cmd = (rc and rc.get("действие") == "set" and rc.get("текст") == "стирку"
+                  and rc.get("время") == (12, 0)
+                  and tc and tc.get("действие") == "add" and tc.get("текст") == "починить кран")
+        _s = alarms.read_schedule()
+        nr = len(_s.get("напоминания", []))
+        ntk = len(_s.get("задачи", []))
+        if ok_date and ok_cmd:
+            results.append(CheckResult(
+                OK, f"парсер напоминаний/задач: даты/команды распознаются "
+                    f"(в расписании: напоминаний {nr}, задач {ntk})"))
+        else:
+            results.append(CheckResult(FAIL, "парсер напоминаний/задач",
+                                       reason="эталонные формы разобраны неверно.",
+                                       fix="см. jarvis/reminders.py (parse_date/parse_*_command)"))
+    except Exception as exc:
+        results.append(CheckResult(FAIL, "парсер напоминаний/задач", reason=str(exc),
+                                   fix="см. jarvis/reminders.py"))
     return results
 
 

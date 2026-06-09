@@ -6,6 +6,7 @@ Piper читает «14:30», «07.06.2026», «45%» криво или неод
 минуты/проценты 0–100, дни 1–31, годы ~1900–2100) — полноценный num2words не нужен,
 без внешних зависимостей. Все функции чистые и НЕ бросают (на странном входе — str(n)).
 """
+from datetime import date as _date
 
 # Количественные единицы. Мужской род по умолчанию; женский — для «одна минута»,
 # «две тысячи» (род важен только для 1 и 2).
@@ -214,3 +215,52 @@ def say_date(day: int, month: int, year: int) -> str:
     """«7, 6, 2026» → «седьмое июня две тысячи двадцать шестого года»."""
     month_word = _MONTHS_GEN[month - 1] if 1 <= month <= 12 else str(month)
     return f"{_ordinal_neuter(day)} {month_word} {year_genitive(year)} года"
+
+
+# Дни недели в винительном с предлогом («во вторник», «в среду») — для естественных дат.
+_WEEKDAY_ACC = ("в понедельник", "во вторник", "в среду", "в четверг", "в пятницу",
+                "в субботу", "в воскресенье")
+
+
+def say_day_genitive(day: int) -> str:
+    """День месяца в родительном: 15 → «пятнадцатого», 21 → «двадцать первого» (для дат)."""
+    try:
+        return _ordinal_gen(int(day))
+    except Exception:
+        return str(day)
+
+
+def say_date_natural(d, today=None) -> str:
+    """Дата ЕСТЕСТВЕННО для напоминаний: сегодня/завтра/послезавтра → словом; ближайшая неделя →
+    «во вторник»; иначе «пятнадцатого июня» (+ год, если не текущий). На странном входе — str(d)."""
+    try:
+        if today is None:
+            today = _date.today()
+        delta = (d - today).days
+        if delta == 0:
+            return "сегодня"
+        if delta == 1:
+            return "завтра"
+        if delta == 2:
+            return "послезавтра"
+        if 3 <= delta <= 6:
+            return _WEEKDAY_ACC[d.weekday()]
+        month_word = _MONTHS_GEN[d.month - 1] if 1 <= d.month <= 12 else str(d.month)
+        base = f"{say_day_genitive(d.day)} {month_word}"
+        if d.year != today.year:
+            base += f" {year_genitive(d.year)} года"
+        return base
+    except Exception:
+        return str(d)
+
+
+def say_when(dt, точное: bool = True, today=None) -> str:
+    """Момент срабатывания словами: дата (say_date_natural) + (если точное) «в <время>».
+    «завтра в десять часов утра» / «во вторник» (без времени)."""
+    try:
+        date_part = say_date_natural(dt.date() if hasattr(dt, "date") else dt, today)
+        if точное and hasattr(dt, "hour"):
+            return f"{date_part} в {say_clock(dt.hour, dt.minute)}"
+        return date_part
+    except Exception:
+        return str(dt)
