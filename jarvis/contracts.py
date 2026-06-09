@@ -9,8 +9,9 @@ from typing import Literal
 # --- Имена топиков шины ---
 TOPIC_INPUT = "jarvis/input"      # {"text": "...", "user_level"?: float}  (опц. громкость речи)
 TOPIC_EXECUTE = "jarvis/execute"  # {"command_tag": "..."}
-TOPIC_SAY = "jarvis/say"          # {"text","source","user_level"?:float,"min_volume"?:float}
-#                                 # min_volume — нижний предел громкости (будильник: обход «тихо→тихо»)
+TOPIC_SAY = "jarvis/say"          # {"text","source","user_level"?:float,"min_volume"?:float,"chime"?:bool}
+#                                 # min_volume — нижний предел громкости (будильник/таймер: обход «тихо→тихо»)
+#                                 # chime — короткий сигнал перед фразой (срабатывание таймера)
 TOPIC_STATE = "jarvis/state"      # {"state": "...", "source": "..."}
 
 # --- Уровни QoS (см. таблицу контрактов в CLAUDE.md) ---

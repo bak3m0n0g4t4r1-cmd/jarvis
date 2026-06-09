@@ -138,6 +138,32 @@ def say_temperature(t) -> str:
     return f"{cardinal(t)} {plural_ru(abs(t), 'градус', 'градуса', 'градусов')}"
 
 
+def say_duration(seconds) -> str:
+    """Длительность словами с ВЕРНЫМИ склонениями, нулевые компоненты ОПУСКАЮТСЯ.
+
+    Час — мужской («один час/два часа/пять часов»), минута/секунда — женский («одна минута/
+    две минуты/двадцать одна секунда»). Примеры: 300→«пять минут», 90→«одна минута тридцать
+    секунд», 3725→«один час две минуты пять секунд», 0→«ноль секунд»."""
+    try:
+        total = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        return str(seconds)
+    if total < 0:
+        return "минус " + say_duration(-total)
+    h, rem = divmod(total, 3600)
+    m, sec = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{cardinal(h)} {plural_ru(h, 'час', 'часа', 'часов')}")
+    if m:
+        parts.append(f"{cardinal(m, 'f')} {plural_ru(m, 'минута', 'минуты', 'минут')}")
+    if sec:
+        parts.append(f"{cardinal(sec, 'f')} {plural_ru(sec, 'секунда', 'секунды', 'секунд')}")
+    if not parts:
+        return "ноль секунд"
+    return " ".join(parts)
+
+
 def _ordinal_neuter(n: int) -> str:
     """Порядковое ср. рода 1..31 (день месяца)."""
     if n in _ORD_NEUTER:

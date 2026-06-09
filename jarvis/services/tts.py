@@ -20,14 +20,39 @@ from jarvis.bus import JarvisModule
 _TTS_FAILS_CRITICAL = 3
 
 
+def _chime_pcm(rate: int) -> bytes:
+    """Короткий мягкий двухнотный сигнал (s16 PCM) перед фразой таймера. Генерится тоном
+    (numpy-синус) — без звуковых файлов и зависимостей; громкость задаёт pw-cat --volume."""
+    import math
+
+    import numpy as np
+
+    def beep(freq, dur):
+        n = int(rate * dur)
+        t = np.arange(n) / rate
+        wave = np.sin(2 * math.pi * freq * t)
+        # Плавные нарастание/спад (10 мс) — чтобы не было щелчков на стыках.
+        fade = max(1, int(rate * 0.01))
+        env = np.ones(n)
+        if n > 2 * fade:
+            env[:fade] = np.linspace(0, 1, fade)
+            env[-fade:] = np.linspace(1, 0, fade)
+        return wave * env * 0.5
+
+    gap = np.zeros(int(rate * 0.06))
+    seq = np.concatenate([beep(880.0, 0.12), gap, beep(1175.0, 0.14)])  # «ди-дии», восходящий
+    return np.clip(seq * 32767, -32768, 32767).astype(np.int16).tobytes()
+
+
 class TtsModule(JarvisModule):
     """«Голос»: озвучивает фразы из jarvis/say через Piper + PipeWire с адаптивной громкостью."""
 
     def __init__(self):
         super().__init__("jarvis-tts")
-        # Очередь хранит (текст, громкость_речи_пользователя, нижний_предел_громкости).
-        # Уровень — от STT для адаптации; нижний предел — для будильника (обход «тихо→тихо»).
-        self._queue: "queue.Queue[tuple[str, float | None, float | None]]" = queue.Queue()
+        # Очередь хранит (текст, громкость_речи, нижний_предел_громкости, чайм).
+        # Уровень — от STT для адаптации; нижний предел — будильник/таймер (обход «тихо→тихо»);
+        # чайм — короткий сигнал перед фразой (таймер).
+        self._queue: "queue.Queue[tuple[str, float | None, float | None, bool]]" = queue.Queue()
         self._voice = None
         self._voice_tried = False
         self._voice_lock = threading.Lock()
@@ -71,12 +96,14 @@ class TtsModule(JarvisModule):
         if text:
             # Уровень громкости речи пользователя (от STT через core) — для адаптации громкости.
             level = payload.get("user_level")
-            # Нижний предел громкости (будильник): озвучить НЕ тише — обходит «тихо вокруг → тихо».
+            # Нижний предел громкости (будильник/таймер): озвучить НЕ тише — обходит «тихо→тихо».
             mv = payload.get("min_volume")
+            chime = bool(payload.get("chime"))  # короткий сигнал перед фразой (таймер)
             self._queue.put((
                 text,
                 level if isinstance(level, (int, float)) else None,
                 float(mv) if isinstance(mv, (int, float)) else None,
+                chime,
             ))
 
     def _run_worker(self):
@@ -87,10 +114,10 @@ class TtsModule(JarvisModule):
         while not self._stop_event.is_set():
             try:
                 try:
-                    text, level, min_volume = self._queue.get(timeout=0.5)
+                    text, level, min_volume, chime = self._queue.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                if self._speak(text, level, min_volume):
+                if self._speak(text, level, min_volume, chime):
                     if announced_critical:
                         self.log.info("Озвучка восстановлена — звук снова работает")
                     fails = 0
@@ -106,7 +133,8 @@ class TtsModule(JarvisModule):
             except Exception:
                 self.log_exc(logging.WARNING, "Сбой в цикле озвучки — продолжаю работу")
 
-    def _speak(self, text: str, user_level: float | None, min_volume: float | None = None) -> bool:
+    def _speak(self, text: str, user_level: float | None, min_volume: float | None = None,
+               chime: bool = False) -> bool:
         """Озвучить фразу с адаптивной громкостью. True — успех; False — пропуск (нет голоса/сбой).
 
         speaking держится РЕАЛЬНО пока играет звук (корректный тайминг анти-эхо). Перед речью:
@@ -131,7 +159,7 @@ class TtsModule(JarvisModule):
             if min_volume is not None and min_volume > 0:
                 volume = max(volume, min(1.0, float(min_volume)))
             self.log.debug("Громкость голоса %.2f (gain %.2f), ducking=%s", volume, gain, ducked)
-            self._synth_and_play(text, volume, gain)
+            self._synth_and_play(text, volume, gain, chime)
             return True
         except Exception as exc:
             self.log.warning(
@@ -146,7 +174,7 @@ class TtsModule(JarvisModule):
             if ducked:
                 self._env.restore()  # плавно вернуть музыку к исходной громкости
 
-    def _synth_and_play(self, text: str, volume: float, gain: float) -> None:
+    def _synth_and_play(self, text: str, volume: float, gain: float, chime: bool = False) -> None:
         """ПОТОКОВЫЙ синтез+воспроизведение: чанки Piper пишем в stdin pw-cat по мере готовности
         (время до первого звука ↓). Громкость — pw-cat --volume; усиление >1 — gain PCM.
 
@@ -175,6 +203,11 @@ class TtsModule(JarvisModule):
         self._play_proc = proc
         err = b""
         try:
+            if chime:  # короткий сигнал перед фразой (таймер) — тем же потоком pw-cat
+                try:
+                    proc.stdin.write(_chime_pcm(rate))
+                except Exception:
+                    self.log.debug("Не удалось проиграть чайм", exc_info=True)
             for chunk in self._voice.synthesize(text, syn_config=syn):
                 pcm = chunk.audio_int16_bytes
                 if gain > 1.0:

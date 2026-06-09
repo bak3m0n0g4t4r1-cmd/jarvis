@@ -1249,14 +1249,17 @@ def check_alarms() -> list[CheckResult]:
     except Exception as exc:
         return [CheckResult(FAIL, "будильники: импорт", reason=str(exc), fix="см. jarvis/alarms.py")]
 
-    # 1) Расписание читается и валидно (нет файла — это норма, пустое расписание).
+    # 1) Расписание читается и валидно (нет файла — это норма, пустые списки).
     try:
         sched = alarms.read_schedule()
-        n = len(sched.get("будильники", []))
+        nb = len(sched.get("будильники", []))
+        nt = len(sched.get("таймеры", []))
+        ns = len(sched.get("секундомеры", []))
         results.append(CheckResult(
-            OK, f"расписание будильников читается ({n} шт., {_os.path.basename(config.SCHEDULE_FILE)})"))
+            OK, f"расписание читается ({_os.path.basename(config.SCHEDULE_FILE)}): "
+                f"будильников {nb}, таймеров {nt}, секундомеров {ns}"))
     except Exception as exc:
-        results.append(CheckResult(FAIL, "расписание будильников", reason=str(exc),
+        results.append(CheckResult(FAIL, "расписание", reason=str(exc),
                                    fix="проверьте schedule.yaml (валидный YAML)"))
 
     # 2) Парсер времени/команд жив (эталонные фразы → ожидаемый разбор).
@@ -1302,6 +1305,54 @@ def check_alarms() -> list[CheckResult]:
         except Exception as exc:
             results.append(CheckResult(WARN, "погода", reason=str(exc),
                                        fix="будильник будет звонить без погоды"))
+
+    # 4) Парсер таймеров/секундомеров и длительности (офлайн → FAIL при поломке).
+    try:
+        from jarvis import timers
+        ok_dur = (timers.parse_duration("на пять минут") == 300
+                  and timers.parse_duration("полтора часа") == 5400
+                  and timers.parse_duration("на 30 секунд") == 30)
+        tc = timers.parse_timer_command("поставь таймер на 10 минут с пометкой чай")
+        sc = timers.parse_stopwatch_command("засеки время с пометкой работа")
+        ok_cmd = (tc and tc["действие"] == "set" and tc["длительность"] == 600 and tc["метка"] == "чай"
+                  and sc and sc["действие"] == "start" and sc["метка"] == "работа")
+        if ok_dur and ok_cmd:
+            results.append(CheckResult(
+                OK, "парсер таймеров/секундомеров: длительность/команды/метки распознаются"))
+        else:
+            results.append(CheckResult(FAIL, "парсер таймеров/секундомеров",
+                                       reason="эталонные фразы разобраны неверно.",
+                                       fix="см. jarvis/timers.py"))
+    except Exception as exc:
+        results.append(CheckResult(FAIL, "парсер таймеров/секундомеров", reason=str(exc),
+                                   fix="см. jarvis/timers.py"))
+
+    # 5) Мировое время: zoneinfo + часовой пояс пробного города (сеть → WARN офлайн, не FAIL).
+    try:
+        from zoneinfo import ZoneInfo  # noqa: F401  — проверяем наличие tz-базы
+        from jarvis import worldtime
+        info = worldtime.geocode_city("париже")
+        if info and info.get("tz"):
+            results.append(CheckResult(
+                OK, f"мировое время: пробный город → {info['name']} ({info['tz']})"))
+        else:
+            results.append(CheckResult(
+                WARN, "мировое время: сеть",
+                reason="не удалось определить часовой пояс пробного города (нет сети?).",
+                fix="нужен интернет для геокодинга; офлайн — мировое время недоступно"))
+    except Exception as exc:
+        results.append(CheckResult(WARN, "мировое время", reason=str(exc),
+                                   fix="проверьте zoneinfo/tzdata и сеть"))
+
+    # 6) Монетка: паки фраз на месте.
+    try:
+        if config.COIN_HEADS and config.COIN_TAILS:
+            results.append(CheckResult(OK, "монетка: паки фраз на месте"))
+        else:
+            results.append(CheckResult(WARN, "монетка", reason="пустой пак фраз.",
+                                       fix="заполните coin.heads/coin.tails в settings.yaml"))
+    except Exception:
+        pass
     return results
 
 

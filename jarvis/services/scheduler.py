@@ -15,11 +15,12 @@ import threading
 from datetime import datetime, time as dtime, timedelta
 from difflib import SequenceMatcher
 
-from jarvis import alarms, config, contracts, phrases, weather
+from jarvis import alarms, config, contracts, phrases, timers, weather
 from jarvis.bus import JarvisModule
-from jarvis.speech import say_clock, say_temperature
+from jarvis.speech import say_clock, say_duration, say_temperature
 
-_PLACEHOLDERS = ("{время}", "{метка}", "{погода}", "{темп_макс}", "{темп_мин}")
+_PLACEHOLDERS = ("{время}", "{метка}", "{погода}", "{темп_макс}", "{темп_мин}",
+                 "{длительность}", "{остаток}", "{прошло}")
 
 
 def _fmt(template: str, **kw) -> str:
@@ -88,9 +89,9 @@ class SchedulerModule(JarvisModule):
     # ------------------------------------------------------------------ #
     # Озвучка
     # ------------------------------------------------------------------ #
-    def _say(self, text: str, user_level=None, min_volume=None):
+    def _say(self, text: str, user_level=None, min_volume=None, chime=False):
         """Реплика в jarvis/say с опц. адаптивной громкостью (user_level) или жёстким нижним
-        пределом (min_volume — для будильника, обходит «тихо→тихо»)."""
+        пределом (min_volume — будильник/таймер, обходит «тихо→тихо»); chime — сигнал перед фразой."""
         if not text:
             return
         payload = {"text": text, "source": self.name}
@@ -98,6 +99,8 @@ class SchedulerModule(JarvisModule):
             payload["user_level"] = user_level
         if min_volume is not None:
             payload["min_volume"] = min_volume
+        if chime:
+            payload["chime"] = True
         self.publish_json(contracts.TOPIC_SAY, payload, qos=contracts.QOS_SAY)
 
     def _reply(self, key, pack, user_level, **fmt):
@@ -110,14 +113,20 @@ class SchedulerModule(JarvisModule):
     def _on_input(self, payload: dict):
         try:
             text = (payload.get("text") or "").strip()
-            if not text or not alarms.is_alarm_command(text):
+            if not text:
                 return
             level = payload.get("user_level")
             user_level = level if isinstance(level, (int, float)) else None
+            # Маршрутизация: будильник → таймер → секундомер (гейты разводят по ключевым словам).
             with self._lock:
-                self._handle_command(text, user_level)
+                if alarms.is_alarm_command(text):
+                    self._handle_command(text, user_level)
+                elif timers.is_timer_command(text):
+                    self._handle_timer(text, user_level)
+                elif timers.is_stopwatch_command(text):
+                    self._handle_stopwatch(text, user_level)
         except Exception:
-            self.log_exc(logging.ERROR, "Сбой обработки команды будильника — продолжаю")
+            self.log_exc(logging.ERROR, "Сбой обработки команды планировщика — продолжаю")
 
     def _handle_command(self, text: str, user_level):
         cmd = alarms.parse_command(text)
@@ -303,6 +312,248 @@ class SchedulerModule(JarvisModule):
         return active[0] if len(active) == 1 else None
 
     # ------------------------------------------------------------------ #
+    # ТАЙМЕРЫ (обратный отсчёт)
+    # ------------------------------------------------------------------ #
+    def _handle_timer(self, text, user_level):
+        cmd = timers.parse_timer_command(text)
+        if not cmd:
+            self._reply("timer.need_duration", config.TIMER_NEED_DURATION, user_level)
+            return
+        self.log.info("Таймер: команда %s длит=%s метка=%s (%s)",
+                      cmd["действие"], cmd.get("длительность"), cmd.get("метка"), text)
+        sched = alarms.read_schedule()
+        if self._cmd_timer(cmd, sched, user_level):
+            alarms.write_schedule(sched)
+
+    def _cmd_timer(self, cmd, sched, user_level) -> bool:
+        lst = sched["таймеры"]
+        active = [t for t in lst if t.get("активен")]
+        action = cmd["действие"]
+        label = (cmd.get("метка") or "").strip() or None
+        dur = cmd.get("длительность")
+
+        if action == "delete_all":
+            if not active:
+                self._reply("timer.none_found", config.TIMER_NONE_FOUND, user_level)
+                return False
+            sched["таймеры"] = [t for t in lst if not t.get("активен")]
+            self._reply("timer.delete_all", config.TIMER_DELETE_ALL, user_level)
+            return True
+
+        if action == "query":
+            target = self._find_active(active, label)
+            if not target:
+                self._reply("timer.none_found", config.TIMER_NONE_FOUND, user_level)
+                return False
+            ост = say_duration(max(0, self._timer_remaining(target)))
+            if (target.get("метка") or "").strip():
+                self._reply("timer.remaining_label", config.TIMER_REMAINING_LABEL,
+                            user_level, остаток=ост, метка=target["метка"])
+            else:
+                self._reply("timer.remaining", config.TIMER_REMAINING, user_level, остаток=ост)
+            return False  # запрос не меняет файл
+
+        if action == "cancel":
+            target = self._find_active(active, label)
+            if not target:
+                self._reply("timer.none_found", config.TIMER_NONE_FOUND, user_level)
+                return False
+            lst.remove(target)
+            if (target.get("метка") or "").strip():
+                self._reply("timer.cancel_label", config.TIMER_CANCEL_LABEL,
+                            user_level, метка=target["метка"])
+            else:
+                self._reply("timer.cancel", config.TIMER_CANCEL, user_level)
+            return True
+
+        if action == "move":
+            target = self._find_active(active, label)
+            if not target:
+                self._reply("timer.none_found", config.TIMER_NONE_FOUND, user_level)
+                return False
+            if not dur:
+                self._reply("timer.need_duration", config.TIMER_NEED_DURATION, user_level)
+                return False
+            self._set_timer_end(target, dur)
+            self._reply_timer_change(target, dur, user_level)
+            return True
+
+        # action == "set"
+        if not dur:
+            self._reply("timer.need_duration", config.TIMER_NEED_DURATION, user_level)
+            return False
+        # Метка задана и активный таймер с такой меткой уже есть → перезаписать (как изменение).
+        if label:
+            existing = self._find_active(active, label)
+            if existing:
+                self._set_timer_end(existing, dur)
+                self._reply_timer_change(existing, dur, user_level)
+                return True
+        end = self._iso(datetime.now() + timedelta(seconds=dur))
+        lst.append(self._make_timer(dur, end, label))
+        дл = say_duration(dur)
+        if label:
+            self._reply("timer.set_label", config.TIMER_SET_LABEL, user_level, длительность=дл, метка=label)
+        else:
+            self._reply("timer.set", config.TIMER_SET, user_level, длительность=дл)
+        act_now = [t for t in lst if t.get("активен")]
+        if len(act_now) >= 2 and any(not (t.get("метка") or "").strip() for t in act_now):
+            self._reply("timer.suggest_label", config.TIMER_SUGGEST_LABEL, user_level)
+        return True
+
+    def _reply_timer_change(self, target, dur, user_level):
+        дл = say_duration(dur)
+        if (target.get("метка") or "").strip():
+            self._reply("timer.move_label", config.TIMER_MOVE_LABEL,
+                        user_level, длительность=дл, метка=target["метка"])
+        else:
+            self._reply("timer.move", config.TIMER_MOVE, user_level, длительность=дл)
+
+    def _set_timer_end(self, target, dur):
+        target["длительность_сек"] = int(dur)
+        target["окончание"] = self._iso(datetime.now() + timedelta(seconds=dur))
+        target["сработал"] = False
+        target["активен"] = True
+
+    def _timer_remaining(self, t) -> int:
+        end = self._parse_iso(t.get("окончание"))
+        return int((end - datetime.now()).total_seconds()) if end else 0
+
+    @staticmethod
+    def _make_timer(dur, end_iso, label):
+        tid = "timer:" + (alarms._norm(label) if label else end_iso[-8:])
+        return {"длительность_сек": int(dur), "окончание": end_iso, "метка": label,
+                "активен": True, "сработал": False, "id": tid}
+
+    # ------------------------------------------------------------------ #
+    # СЕКУНДОМЕРЫ (счёт вверх)
+    # ------------------------------------------------------------------ #
+    def _handle_stopwatch(self, text, user_level):
+        cmd = timers.parse_stopwatch_command(text)
+        if not cmd:
+            self._reply("stopwatch.none_found", config.SW_NONE_FOUND, user_level)
+            return
+        self.log.info("Секундомер: команда %s метка=%s (%s)",
+                      cmd["действие"], cmd.get("метка"), text)
+        sched = alarms.read_schedule()
+        if self._cmd_stopwatch(cmd, sched, user_level):
+            alarms.write_schedule(sched)
+
+    def _cmd_stopwatch(self, cmd, sched, user_level) -> bool:
+        lst = sched["секундомеры"]
+        action = cmd["действие"]
+        label = (cmd.get("метка") or "").strip() or None
+        running = [s for s in lst if s.get("активен")]
+
+        if action == "delete_all":
+            if not lst:
+                self._reply("stopwatch.none_found", config.SW_NONE_FOUND, user_level)
+                return False
+            sched["секундомеры"] = []
+            self._reply("stopwatch.delete_all", config.SW_DELETE_ALL, user_level)
+            return True
+
+        if action == "start":
+            lst.append(self._make_sw(label))
+            if label:
+                self._reply("stopwatch.start_label", config.SW_START_LABEL, user_level, метка=label)
+            else:
+                self._reply("stopwatch.start", config.SW_START, user_level)
+            run_now = [s for s in lst if s.get("активен")]
+            if len(run_now) >= 2 and any(not (s.get("метка") or "").strip() for s in run_now):
+                self._reply("stopwatch.suggest_label", config.SW_SUGGEST_LABEL, user_level)
+            return True
+
+        if action == "query":
+            target = self._find_one(lst, running, label)  # включая остановленные (queryable)
+            if not target:
+                self._reply("stopwatch.none_found", config.SW_NONE_FOUND, user_level)
+                return False
+            прош = say_duration(self._sw_elapsed(target))
+            if (target.get("метка") or "").strip():
+                self._reply("stopwatch.elapsed_label", config.SW_ELAPSED_LABEL,
+                            user_level, прошло=прош, метка=target["метка"])
+            else:
+                self._reply("stopwatch.elapsed", config.SW_ELAPSED, user_level, прошло=прош)
+            return False
+
+        if action == "stop":
+            target = self._find_active(running, label)
+            if not target:
+                self._reply("stopwatch.none_found", config.SW_NONE_FOUND, user_level)
+                return False
+            target["стоп"] = self._iso(datetime.now())
+            target["активен"] = False
+            прош = say_duration(self._sw_elapsed(target))
+            if (target.get("метка") or "").strip():
+                self._reply("stopwatch.stop_label", config.SW_STOP_LABEL,
+                            user_level, прошло=прош, метка=target["метка"])
+            else:
+                self._reply("stopwatch.stop", config.SW_STOP, user_level, прошло=прош)
+            return True
+
+        # action == "reset" (сброс/удаление)
+        target = self._find_one(lst, running, label)
+        if not target:
+            self._reply("stopwatch.none_found", config.SW_NONE_FOUND, user_level)
+            return False
+        lbl = (target.get("метка") or "").strip()
+        lst.remove(target)
+        if lbl:
+            self._reply("stopwatch.reset_label", config.SW_RESET_LABEL, user_level, метка=lbl)
+        else:
+            self._reply("stopwatch.reset", config.SW_RESET, user_level)
+        return True
+
+    def _sw_elapsed(self, sw) -> int:
+        start = self._parse_iso(sw.get("старт"))
+        if start is None:
+            return 0
+        stop = self._parse_iso(sw.get("стоп")) if sw.get("стоп") else datetime.now()
+        return int((stop - start).total_seconds())
+
+    @staticmethod
+    def _make_sw(label):
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        sid = "sw:" + (alarms._norm(label) if label else now_iso[-8:])
+        return {"старт": now_iso, "стоп": None, "метка": label, "активен": True, "id": sid}
+
+    # ------------------------------------------------------------------ #
+    # Поиск/время — общее для таймеров и секундомеров
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _find_active(items, label):
+        """По метке (точно/нечётко) среди items; без метки — единственный."""
+        if label:
+            ln = alarms._norm(label)
+            for it in items:
+                im = alarms._norm(it.get("метка") or "")
+                if im and (im == ln or SequenceMatcher(None, im, ln).ratio() >= 0.8):
+                    return it
+            return None
+        return items[0] if len(items) == 1 else None
+
+    def _find_one(self, all_items, active_items, label):
+        """Найти среди ВСЕХ (вкл. остановленные): по метке; без метки — единственный всего,
+        иначе единственный активный."""
+        if label:
+            return self._find_active(all_items, label)
+        if len(all_items) == 1:
+            return all_items[0]
+        return active_items[0] if len(active_items) == 1 else None
+
+    @staticmethod
+    def _iso(dt):
+        return dt.isoformat(timespec="seconds")
+
+    @staticmethod
+    def _parse_iso(s):
+        try:
+            return datetime.fromisoformat(str(s))
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------ #
     # Тик-цикл и срабатывание
     # ------------------------------------------------------------------ #
     def _tick_loop(self):
@@ -314,7 +565,7 @@ class SchedulerModule(JarvisModule):
 
     def _tick(self):
         now = datetime.now()
-        to_fire = []
+        fire_alarms, fire_timers = [], []
         with self._lock:
             sched = alarms.read_schedule()
             before_fired = dict(self._fired)
@@ -324,16 +575,34 @@ class SchedulerModule(JarvisModule):
                     continue
                 was_active = a.get("активен")
                 if self._evaluate(a, now):
-                    to_fire.append(dict(a))  # копия — озвучиваем ВНЕ лока (сеть/синтез)
+                    fire_alarms.append(dict(a))  # копия — озвучиваем ВНЕ лока (сеть/синтез)
                 if a.get("активен") != was_active:
+                    changed = True
+            for t in sched.get("таймеры", []):
+                if self._timer_due(t, now):  # помечает сработал/активен=false (персист ниже)
+                    fire_timers.append(dict(t))
                     changed = True
             if changed:
                 alarms.write_schedule(sched)
             if self._fired != before_fired:
                 self._save_state()
         # Озвучка вне лока: не держим команды/файл на время сетевого запроса погоды.
-        for a in to_fire:
+        for a in fire_alarms:
             self._fire_alarm(a, now)
+        for t in fire_timers:
+            self._fire_timer(t)
+
+    def _timer_due(self, t, now) -> bool:
+        """Таймер истёк? Срабатывает и при пропуске во время простоя (now ≫ окончание) — один раз.
+        Помечает сработал/активен=false (для персиста и анти-повтора)."""
+        if not t.get("активен") or t.get("сработал"):
+            return False
+        end = self._parse_iso(t.get("окончание"))
+        if end is not None and now >= end:
+            t["сработал"] = True
+            t["активен"] = False
+            return True
+        return False
 
     def _evaluate(self, alarm, now) -> bool:
         """Пора ли сработать? Обновляет _fired (анти-двойное) и активность (разовый → выкл).
@@ -428,6 +697,19 @@ class SchedulerModule(JarvisModule):
         else:
             text = _fmt(phrases.pick("alarm.regular_fire", config.ALARM_REGULAR_FIRE), время=время)
         self._say(text, min_volume=wake)
+
+    def _fire_timer(self, t):
+        """Срабатывание таймера: чайм (опц.) + фраза на заметной громкости (обходит «тихо→тихо»)."""
+        try:
+            label = (t.get("метка") or "").strip()
+            if label:
+                text = _fmt(phrases.pick("timer.fire_label", config.TIMER_FIRE_LABEL), метка=label)
+            else:
+                text = _fmt(phrases.pick("timer.fire", config.TIMER_FIRE))
+            self._say(text, min_volume=float(config.TIMER_VOLUME), chime=bool(config.TIMER_CHIME))
+            self.log.info("Таймер сработал: %sс (метка %s)", t.get("длительность_сек"), label or "—")
+        except Exception:
+            self.log_exc(logging.ERROR, "Сбой озвучки сработавшего таймера")
 
 
 def main():

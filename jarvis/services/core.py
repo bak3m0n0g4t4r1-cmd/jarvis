@@ -10,17 +10,18 @@
 N100/8 ГБ не тормозил. Команды звучат мгновенно и работают офлайн.
 """
 import logging
+import random
 import threading
 from datetime import datetime
 
 import yaml
 
-from jarvis import config, contracts
-from jarvis.alarms import is_alarm_command
+from jarvis import config, contracts, phrases, worldtime
 from jarvis.breaks import is_stop_phrase
 from jarvis.bus import JarvisModule
 from jarvis.matcher import NOT_RECOGNIZED, Matcher
 from jarvis.sysinfo import read_battery, read_system_load, read_volume
+from jarvis.timers import is_scheduler_command
 from jarvis.speech import say_date, say_percent, say_time
 
 # Ключевые слова встроенных info-ответов (срабатывают на явный вопрос).
@@ -74,10 +75,11 @@ class CoreModule(JarvisModule):
         if is_stop_phrase(text):
             self.log.info("Стоп-фраза перерыва — обработает монитор активности: %s", text)
             return
-        # Команда будильника — обработает сервис scheduler (он сам слушает jarvis/input и ответит).
-        # Здесь молчим, чтобы не сказать «не разобрал» поверх ответа планировщика (как со стоп-фразой).
-        if is_alarm_command(text):
-            self.log.info("Команда будильника — обработает планировщик: %s", text)
+        # Команда планировщика (будильник/таймер/секундомер) — обработает сервис scheduler (он сам
+        # слушает jarvis/input и ответит). Здесь молчим, чтобы не сказать «не разобрал» поверх его
+        # ответа (как со стоп-фразой). Мировое время/монетка — НЕ команды планировщика, идут ниже.
+        if is_scheduler_command(text):
+            self.log.info("Команда планировщика — обработает scheduler: %s", text)
             return
         # Громкость речи пользователя (от STT) пробрасываем в ответ — для адаптивной громкости TTS.
         level = payload.get("user_level")
@@ -137,8 +139,19 @@ class CoreModule(JarvisModule):
         )
 
     def _local_info_answer(self, text: str) -> str | None:
-        """Встроенные офлайн-ответы: время, дата, громкость, загрузка, заряд. Иначе None."""
+        """Встроенные ответы: монетка, мировое время, локальное время, дата, громкость, загрузка, заряд."""
         low = text.lower()
+        # Монетка («подкинь монетку», «орёл или решка»).
+        coin = self._coin_answer(low)
+        if coin is not None:
+            return coin
+        # Мировое время («сколько времени в <город>») — ПЕРЕД локальным (оно тоже ловит «сколько
+        # времени», но без города это локальное время). detect_city → None, если города нет.
+        city = worldtime.detect_city(text)
+        if city:
+            ans = worldtime.answer(city)
+            if ans:
+                return ans
         if any(k in low for k in _TIME_KEYS):
             now = datetime.now()
             return f"Сейчас {say_time(now.hour, now.minute)}, сэр."
@@ -150,6 +163,15 @@ class CoreModule(JarvisModule):
             return self._load_answer()
         if any(k in low for k in _BATTERY_KEYS):
             return self._battery_answer()
+        return None
+
+    def _coin_answer(self, low: str) -> str | None:
+        """Монетка: случайно орёл/решка, фраза паком без повторов. Иначе None."""
+        l = low.replace("ё", "е")
+        if "монет" in l or ("орел" in l and "решк" in l):
+            if random.random() < 0.5:
+                return phrases.pick("coin.heads", config.COIN_HEADS)
+            return phrases.pick("coin.tails", config.COIN_TAILS)
         return None
 
     def _date_answer(self) -> str:
