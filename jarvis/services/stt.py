@@ -8,7 +8,10 @@ wake-word «джарвис», остаток публикуется в jarvis/in
 """
 import difflib
 import logging
+import os
 import re
+import select
+import struct
 import threading
 import time
 
@@ -16,7 +19,16 @@ import numpy as np
 import sounddevice as sd
 
 from jarvis import config, contracts
+from jarvis.audio_env import AudioEnv
 from jarvis.bus import JarvisModule
+
+# Формат события /dev/input (struct input_event): timeval(2 long) + type(H) + code(H) + value(i) = 24 байта.
+_EVENT_FMT = "llHHi"
+_EVENT_SIZE = struct.calcsize(_EVENT_FMT)
+_EV_KEY = 1  # тип события — клавиша
+# Push-to-talk: не копим бесконечно (защита от зажатой/залипшей кнопки), потолок секунд.
+_PTT_MAX_SECONDS = 30
+_PROC_DEVICES = "/proc/bus/input/devices"  # карта устройств ввода (поиск клавиатур для PTT)
 
 # Самовосстановление аудио-входа: сколько раз подряд пытаться переоткрыть микрофон,
 # прежде чем признать сбой фатальным и сигналить systemd о рестарте. Между попытками —
@@ -51,6 +63,12 @@ class SttModule(JarvisModule):
         self._noise_floor = config.QUIET_THRESHOLD  # старт на границе → до замера тишины держим базу
         self._vad_threshold = config.VAD_THRESHOLD  # текущий эффективный порог VAD
         self._last_vad_switch = 0.0                 # rate-limit пересборки VAD (анти-дёрганье)
+        # Push-to-talk: пока кнопка зажата — копим аудио (без wake-word). Флаг пишет поток-читатель
+        # клавиатуры, буфер ведёт ТОЛЬКО поток захвата (нет гонки). Ducking — через AudioEnv (pactl).
+        self._ptt = False
+        self._ptt_buf: list[np.ndarray] = []
+        self._ptt_thread = None
+        self._env = AudioEnv()  # для duck/restore музыки на время прослушивания (без замерных потоков)
 
     def on_start(self):
         self._init_engines()
@@ -60,6 +78,10 @@ class SttModule(JarvisModule):
         self.subscribe(contracts.TOPIC_SAY, self.on_say)
         self._audio_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._audio_thread.start()
+        # Push-to-talk: отдельный поток-читатель клавиатуры (/dev/input). Опционально.
+        if config.PTT_ENABLED:
+            self._ptt_thread = threading.Thread(target=self._ptt_loop, daemon=True, name="stt-ptt")
+            self._ptt_thread.start()
 
     def _build_vad(self, threshold: float):
         """Построить детектор голоса (silero-VAD) с заданным порогом.
@@ -177,6 +199,16 @@ class SttModule(JarvisModule):
             # но пока Джарвис говорит/идёт хвост — VAD не кормим, иначе
             # словим эхо из колонок и зациклимся.
             data, _ = self._stream.read(window)
+            # PUSH-TO-TALK имеет приоритет: пока кнопка зажата — копим сырое аудио, минуя wake-word/VAD.
+            if self._ptt:
+                total = sum(len(b) for b in self._ptt_buf)
+                if total < _PTT_MAX_SECONDS * config.SAMPLE_RATE:
+                    self._ptt_buf.append(np.asarray(data, dtype=np.float32).reshape(-1))
+                self._need_vad_reset = True  # после PTT — чистый VAD
+                continue
+            if self._ptt_buf:  # кнопку только что отпустили → обработать накопленное (без wake-word)
+                self._process_ptt_buffer()
+                continue
             if self._is_muted():
                 # Помечаем, что при возобновлении нужен чистый сброс — чтобы
                 # частичный сегмент, накопленный на границе, не склеился
@@ -276,36 +308,38 @@ class SttModule(JarvisModule):
         if text:
             self._last_say_text = text  # source не важен — подойдёт любая say
 
-    def _transcribe(self, samples: np.ndarray):
-        # Слишком короткий сегмент — zipformer падает с RuntimeError на Reshape.
-        # Фильтруем здесь, а не в VAD-порогах, потому что после паузы speaking
-        # хвост может дать обрывок меньше минимальной длины.
+    def _asr(self, samples: np.ndarray) -> str:
+        """Распознать сегмент → текст (или ""). Общий для wake-word-пути и push-to-talk.
+
+        Слишком короткий сегмент zipformer отвергает (RuntimeError Reshape) — это ОЖИДАЕМО
+        (тишина/шум/обрывок), пропускаем тихо. Любой иной сбой — WARN, конвейер живёт."""
         if len(samples) < config.MIN_SEGMENT_SAMPLES:
             self.log.debug("Пропуск короткого сегмента (%d семплов)", len(samples))
-            return
+            return ""
         try:
             stream = self._recognizer.create_stream()
             stream.accept_waveform(config.SAMPLE_RATE, samples)
-            # decode_stream — самая хрупкая часть: падает на некорректной форме
-            # входа. Ловим отдельно, чтобы единичный сбой не сломал конвейер.
             try:
                 self._recognizer.decode_stream(stream)
             except RuntimeError as exc:
-                # zipformer не переваривает короткий/вырожденный сегмент (ошибка Reshape) —
-                # это ЧАСТЫЙ ОЖИДАЕМЫЙ случай (тишина, шум, обрывок речи), а не сбой сервиса.
-                # Пропускаем фрагмент тихо: причина — на DEBUG, без стек-трасс в обычном
-                # логе (иначе сотни трасс на ровном месте, как было раньше).
-                self.log.debug(
-                    "Фрагмент пропущен: модель отвергла короткий/искажённый сегмент (%s)",
-                    exc.__class__.__name__,
-                )
-                return
-            text = stream.result.text.strip()
+                self.log.debug("Фрагмент пропущен: короткий/искажённый сегмент (%s)",
+                               exc.__class__.__name__)
+                return ""
+            return stream.result.text.strip()
         except Exception:
-            # Непредвиденный сбой на одном фрагменте — не валим конвейер, слушаем дальше.
             self.log_exc(logging.WARNING,
                          "Не удалось распознать фрагмент — пропускаю, продолжаю слушать")
-            return
+            return ""
+
+    @staticmethod
+    def _rms(samples: np.ndarray):
+        try:
+            return round(float(np.sqrt(np.mean(np.square(samples)) + 1e-12)), 5)
+        except Exception:
+            return None
+
+    def _transcribe(self, samples: np.ndarray):
+        text = self._asr(samples)
         if not text:
             return
         # Страховка от эхо-петли: если в окне после речи распознали почти то же,
@@ -316,10 +350,7 @@ class SttModule(JarvisModule):
         command = self._match_wake_word(text)
         if command:
             # Громкость речи пользователя (RMS сегмента) — для адаптивной громкости ответа TTS.
-            try:
-                user_level = round(float(np.sqrt(np.mean(np.square(samples)) + 1e-12)), 5)
-            except Exception:
-                user_level = None
+            user_level = self._rms(samples)
             payload = {"text": command}
             if user_level is not None:
                 payload["user_level"] = user_level
@@ -380,6 +411,116 @@ class SttModule(JarvisModule):
 
         return None
 
+    # ------------------------------------------------------------------ #
+    # Push-to-talk (зажатие клавиши → команда без wake-word)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _keyboard_event_paths():
+        """Пути /dev/input/event* клавиатур (Handlers содержит kbd). Power/Sleep тоже kbd, но они
+        не шлют нужный код — безвредно. Сбой → пусто (PTT просто не активируется)."""
+        paths = []
+        try:
+            with open(_PROC_DEVICES, encoding="utf-8", errors="replace") as f:
+                txt = f.read()
+            for block in txt.split("\n\n"):
+                if "kbd" in block:
+                    m = re.search(r"event(\d+)", block)
+                    if m:
+                        paths.append(f"/dev/input/event{m.group(1)}")
+        except Exception:
+            pass
+        return paths
+
+    def _ptt_loop(self):
+        """Поток-читатель клавиатуры: следит за зажатием/отпусканием PTT-кнопки (/dev/input).
+
+        Читаем сырые input_event, фильтруем EV_KEY + код кнопки. value 1=нажата, 0=отпущена,
+        2=автоповтор (игнорируем). Нет доступа (нет группы input) → WARN и тихо выходим (wake-word
+        продолжает работать)."""
+        paths = self._keyboard_event_paths()
+        fds = {}
+        for p in paths:
+            try:
+                fds[os.open(p, os.O_RDONLY | os.O_NONBLOCK)] = p
+            except OSError:
+                continue
+        if not fds:
+            self.log.warning(
+                "Push-to-talk не активен: нет доступа к /dev/input (нужна группа input: "
+                "`sudo usermod -aG input $USER` + перелогин) или клавиатура не найдена")
+            return
+        self.log.info("Push-to-talk активен: кнопка код %d (%s)", config.PTT_KEYCODE, config.PTT_KEY)
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    r, _, _ = select.select(list(fds), [], [], 0.5)
+                except Exception:
+                    break
+                for fd in r:
+                    try:
+                        data = os.read(fd, _EVENT_SIZE * 64)
+                    except OSError:
+                        continue
+                    for off in range(0, len(data) - _EVENT_SIZE + 1, _EVENT_SIZE):
+                        _s, _us, etype, code, val = struct.unpack(
+                            _EVENT_FMT, data[off:off + _EVENT_SIZE])
+                        if etype == _EV_KEY and code == config.PTT_KEYCODE:
+                            if val == 1:
+                                self._ptt_press()
+                            elif val == 0:
+                                self._ptt_release()
+        finally:
+            for fd in fds:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+
+    def _ptt_press(self):
+        """Кнопка зажата → режим прослушивания команды без wake-word + приглушить музыку."""
+        if self._ptt:
+            return
+        self._ptt = True
+        self._ptt_buf = []
+        self.log.info("PTT: слушаю команду (кнопка зажата)")
+        if config.DUCK_WHILE_LISTENING:
+            try:
+                self._env.duck()
+            except Exception:
+                self.log.debug("PTT: ducking не удался", exc_info=True)
+
+    def _ptt_release(self):
+        """Кнопка отпущена → поток захвата обработает накопленный буфер; вернуть музыку."""
+        if not self._ptt:
+            return
+        self._ptt = False  # _capture_until_stop увидит непустой буфер и распознает (без wake-word)
+        self.log.info("PTT: отпущено — распознаю команду")
+        if config.DUCK_WHILE_LISTENING:
+            try:
+                self._env.restore()
+            except Exception:
+                self.log.debug("PTT: restore не удался", exc_info=True)
+
+    def _process_ptt_buffer(self):
+        """Распознать накопленное по PTT аудио и опубликовать в jarvis/input БЕЗ wake-word."""
+        buf, self._ptt_buf = self._ptt_buf, []
+        if not buf:
+            return
+        try:
+            audio = np.concatenate(buf)
+        except Exception:
+            return
+        text = self._asr(audio)
+        if not text:
+            self.log.info("PTT: команда не распознана")
+            return
+        user_level = self._rms(audio)
+        payload = {"text": text}
+        if user_level is not None:
+            payload["user_level"] = user_level
+        self.publish_json(contracts.TOPIC_INPUT, payload, qos=contracts.QOS_INPUT)
+        self.log.info("PTT команда в шину: %s (громкость речи %.4f)", text, user_level or 0.0)
+
     def on_stop(self):
         """Корректно гасим аудио-поток ввода ДО выхода интерпретатора.
 
@@ -390,8 +531,15 @@ class SttModule(JarvisModule):
         try:
             if self._audio_thread is not None:
                 self._audio_thread.join(timeout=2.0)
+            if self._ptt_thread is not None:
+                self._ptt_thread.join(timeout=1.0)
         except Exception:
             self.log_exc(logging.ERROR, "Ошибка ожидания аудио-потока ввода")
+        # Если музыка была приглушена под PTT — вернуть на выходе (на всякий случай).
+        try:
+            self._env.restore()
+        except Exception:
+            self.log.debug("Возврат музыки при остановке не удался", exc_info=True)
         try:
             if self._stream is not None:
                 self._stream.stop()

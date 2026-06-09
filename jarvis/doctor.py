@@ -1234,6 +1234,42 @@ def check_brightness():
         )
 
 
+def check_push_to_talk():
+    """Push-to-talk (зажатие кнопки → команда без wake-word) читает /dev/input — нужен доступ
+    (группа input, как ydotool). Нет доступа → кнопка не работает, но wake-word работает."""
+    if not config.PTT_ENABLED:
+        return CheckResult(OK, "push-to-talk выключен (push_to_talk_enabled=false)")
+    import os as _os
+    import re as _re
+
+    paths = []
+    try:
+        with open("/proc/bus/input/devices", encoding="utf-8", errors="replace") as f:
+            for block in f.read().split("\n\n"):
+                if "kbd" in block:
+                    m = _re.search(r"event(\d+)", block)
+                    if m:
+                        paths.append(f"/dev/input/event{m.group(1)}")
+    except Exception:
+        pass
+    if not paths:
+        return CheckResult(WARN, "push-to-talk: клавиатура",
+                           reason="клавиатуры не найдены в /proc/bus/input/devices.",
+                           fix="проверьте подключение клавиатуры")
+    for p in paths:
+        try:
+            fd = _os.open(p, _os.O_RDONLY | _os.O_NONBLOCK)
+            _os.close(fd)
+            return CheckResult(
+                OK, f"push-to-talk: /dev/input доступен (кнопка «{config.PTT_KEY}» код {config.PTT_KEYCODE})")
+        except OSError:
+            continue
+    return CheckResult(
+        WARN, "push-to-talk: нет доступа к /dev/input",
+        reason="пользователь не в группе input → кнопка не работает (wake-word продолжает работать).",
+        fix="sudo usermod -aG input $USER, затем ПЕРЕЛОГИН (та же группа нужна ydotool)")
+
+
 def check_alarms() -> list[CheckResult]:
     """Будильники: расписание читается, парсер времени/команд жив, погода доступна (или офлайн).
 
@@ -1418,6 +1454,7 @@ def run(quick: bool = False) -> bool:
     _safe(reporter, check_audio)
     _safe(reporter, check_input_access)
     _safe(reporter, check_brightness)
+    _safe(reporter, check_push_to_talk)
 
     reporter.section("Слой 4. Модели и распознавание")
     reporter.note("загружаю модели движком…")

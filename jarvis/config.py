@@ -120,7 +120,8 @@ SAMPLE_RATE = _get("hearing", "sample_rate", 16000, "JARVIS_SAMPLE_RATE")
 CHANNELS = 1  # моно (не настраивается — модели и весь конвейер рассчитаны на 1 канал)
 # Варианты wake-word: zipformer-ru искажает «джарвис» → добавляй встреченные искажения.
 WAKE_WORDS = _get("hearing", "wake_words",
-                  ["джарвис", "джарвиз", "жарвис", "жарвиз", "сервис", "джарвес"],
+                  ["джарвис", "джарвиз", "жарвис", "жарвиз", "сервис", "джарвес",
+                   "чарвис", "чарвиз", "джарви", "джарвас"],
                   "JARVIS_WAKE_WORDS")
 WAKE_WORD_FUZZY_THRESHOLD = _get("hearing", "wake_word_fuzzy_threshold", 0.7,
                                  "JARVIS_WAKE_WORD_FUZZY_THRESHOLD")
@@ -145,7 +146,29 @@ VAD_QUIET_OFFSET = _get("hearing", "vad_quiet_offset", 0.08, "JARVIS_VAD_QUIET_O
 # Нижняя граница порога в тишине (ниже не опускаем — страховка от ловли шорохов).
 VAD_QUIET_FLOOR = _get("hearing", "vad_quiet_floor", 0.20, "JARVIS_VAD_QUIET_FLOOR")
 # Источник захвата: пусто = системный default-микрофон; имя echo-cancel source → шумоподавление.
+# ВНИМАНИЕ: на этой машине PortAudio/sounddevice видит только «default» (железный микрофон) — задать
+# denoised-источник напрямую НЕ выйдет; echo-cancel настраивается вручную через ALSA (см. CLAUDE.md).
 STT_SOURCE = str(_get("hearing", "stt_source", "", "JARVIS_STT_SOURCE")).strip()
+
+# === Push-to-talk: зажатие клавиши → слушать команду БЕЗ wake-word (надёжный путь в шуме) ===
+# Читаем /dev/input напрямую (как детектор активности) — нужна группа input (как для ydotool).
+PTT_ENABLED = _get("hearing", "push_to_talk_enabled", True, "JARVIS_PTT_ENABLED")
+# Клавиша (человекочитаемо): «правый ctrl»/«левый ctrl»/«правый shift»/«правый alt»… или код evdev.
+PTT_KEY = str(_get("hearing", "push_to_talk_key", "правый ctrl", "JARVIS_PTT_KEY")).strip().lower()
+# Приглушать музыку на время прослушивания по кнопке (переиспользует ducking адаптивной громкости).
+DUCK_WHILE_LISTENING = _get("hearing", "duck_while_listening", True, "JARVIS_DUCK_WHILE_LISTENING")
+# Имя клавиши → evdev-код (linux/input-event-codes.h). Правые по умолчанию для «ctrl/shift/alt».
+_PTT_KEYCODES = {
+    "правый ctrl": 97, "правый контрол": 97, "right ctrl": 97, "rightctrl": 97,
+    "левый ctrl": 29, "left ctrl": 29, "ctrl": 97,
+    "правый shift": 54, "левый shift": 42, "shift": 54,
+    "правый alt": 100, "левый alt": 56, "alt": 100,
+    "пробел": 57, "space": 57, "scroll lock": 70, "scrolllock": 70,
+}
+try:
+    PTT_KEYCODE = int(PTT_KEY) if PTT_KEY.isdigit() else _PTT_KEYCODES.get(PTT_KEY, 97)
+except Exception:
+    PTT_KEYCODE = 97  # дефолт — правый Ctrl
 
 # Пути моделей STT (выводятся из models_dir; обычно не трогают — можно задать явно).
 VAD_MODEL = _get_path("models", "vad_model", str(MODELS_DIR / "silero_vad.onnx"), "JARVIS_VAD_MODEL")
