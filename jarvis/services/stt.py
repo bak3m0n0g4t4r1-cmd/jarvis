@@ -139,7 +139,10 @@ class SttModule(JarvisModule):
         if self._vad is None or self._recognizer is None:
             self.request_restart("модели STT не инициализированы — слушать нечем")
             return
-        window = int(0.1 * config.SAMPLE_RATE)  # блоки по 100 мс
+        # Блоки по 50 мс: готовый сегмент VAD замечается на ~25-50мс раньше, чем при 100 мс
+        # (квантование цикла чтения). Пороги/min_silence VAD НЕ затронуты — меняется только
+        # гранулярность опроса. CPU сверен на машине: рост в пределах погрешности (Этап 21).
+        window = int(0.05 * config.SAMPLE_RATE)
         fails = 0
         while not self._stop_event.is_set():
             try:
@@ -339,7 +342,11 @@ class SttModule(JarvisModule):
             return None
 
     def _transcribe(self, samples: np.ndarray):
+        t0 = time.perf_counter()
         text = self._asr(samples)
+        if config.PERF_DEBUG and text:
+            self.log.info("PERF stt: ASR-декод %.0fмс (сегмент %.2fс)",
+                          (time.perf_counter() - t0) * 1000, len(samples) / config.SAMPLE_RATE)
         if not text:
             return
         # Страховка от эхо-петли: если в окне после речи распознали почти то же,

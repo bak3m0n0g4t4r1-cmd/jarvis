@@ -66,6 +66,7 @@ class TtsModule(JarvisModule):
         self._speech_notif_id = 0
         self._audio_state_cache: tuple[str, str] | None = None
         self._audio_check_at = 0.0
+        self._audio_refreshing = False  # guard: один фоновый wpctl-замер за раз
 
     def on_start(self):
         self.subscribe(contracts.TOPIC_SAY, self.on_say)
@@ -79,6 +80,8 @@ class TtsModule(JarvisModule):
         # Прогрев Piper в фоне при старте: первая фраза не ждёт ~3с загрузки (ценой ~106 МБ RAM).
         if config.TTS_PRELOAD:
             threading.Thread(target=self._ensure_voice, daemon=True, name="piper-preload").start()
+        # Прогрев кэша проверки звука: первая фраза не платит синхронный wpctl (~17мс).
+        self._refresh_audio_state()
 
     def _ensure_voice(self):
         """Загрузить голос Piper один раз (потокобезопасно). Используется и прогревом, и _speak."""
@@ -157,6 +160,7 @@ class TtsModule(JarvisModule):
         или сбой устройства → дубль фразы в уведомление с пометкой ПРИЧИНЫ (две разные).
         speaking держится РЕАЛЬНО пока играет звук (тайминг анти-эхо); ducking музыки; min_volume
         (будильник) — гарантированный нижний предел громкости (обход «тихо→тихо»)."""
+        t_start = time.perf_counter()
         # (1) Режим тишины: обычные фразы — в уведомление; критическое — озвучиваем как обычно.
         if silence.is_silent() and not critical:
             self._notify_speech(text)
@@ -177,18 +181,25 @@ class TtsModule(JarvisModule):
                                 + " синтез речи не загрузился.")
             return False
         ducked = False
+        duck_thread = None
         try:
             self.set_state(contracts.STATE_SPEAKING)
             self._env.set_speaking(True)
-            # Ducking музыки ноута, если она реально звучит выше порога.
+            # Ducking музыки ноута, если она реально звучит выше порога. Рампа (~150мс pactl+паузы)
+            # идёт ПАРАЛЛЕЛЬНО синтезу Piper (~170мс): музыка приглушается, пока готовится первый
+            # чанк, а не ПЕРЕД ним. restore — строго после конца рампы (join в finally).
             if self._env.should_duck():
-                self._env.duck()
+                duck_thread = threading.Thread(target=self._env.duck, daemon=True, name="tts-duck")
+                duck_thread.start()
                 ducked = True
             volume, gain = self._env.target_voice(user_level)
             # Будильник: поднять громкость до нижнего предела, если адаптив дал тише (будит надёжно).
             if min_volume is not None and min_volume > 0:
                 volume = max(volume, min(1.0, float(min_volume)))
             self.log.debug("Громкость голоса %.2f (gain %.2f), ducking=%s", volume, gain, ducked)
+            if config.PERF_DEBUG:
+                self.log.info("PERF tts: проверки до синтеза %.1fмс (ducking=%s)",
+                              (time.perf_counter() - t_start) * 1000, ducked)
             self._synth_and_play(text, volume, gain, chime)
             return True
         except Exception as exc:
@@ -206,6 +217,10 @@ class TtsModule(JarvisModule):
             self.set_state(contracts.STATE_IDLE)
             self._env.set_speaking(False)
             if ducked:
+                if duck_thread is not None:
+                    # Дождаться конца рампы duck ПЕРЕД restore — иначе гонка: restore
+                    # вернул громкость, хвост рампы снова приглушил → музыка застряла тихой.
+                    duck_thread.join(timeout=2.0)
                 self._env.restore()  # плавно вернуть музыку к исходной громкости
 
     def _notify_speech(self, text: str, prefix: str | None = None) -> None:
@@ -223,14 +238,41 @@ class TtsModule(JarvisModule):
             self.log.debug("Не удалось продублировать фразу в уведомление", exc_info=True)
 
     def _audio_state(self) -> tuple[str, str]:
-        """Состояние звука перед фразой: ('ok'|'zero'|'fail', причина). Кэш ~AUDIO_CHECK_TTL с —
-        чтобы не дёргать wpctl на каждую реплику в очереди (быстро, не тормозит озвучку)."""
+        """Состояние звука перед фразой: ('ok'|'zero'|'fail', причина).
+
+        Кэш освежается АСИНХРОННО (wpctl ~17мс не задерживает первый звук): отдаём последнее
+        известное значение сразу, протухшее обновляем фоном — следующая фраза увидит свежее.
+        СИНХРОННО проверяем только когда кэша ещё нет или он говорит «проблема» ('zero'/'fail'):
+        снятие проблемы нельзя брать из устаревшего кэша — фраза ушла бы в уведомление с
+        неверной пометкой причины (точность пометок ТЗ-16)."""
         now = time.monotonic()
-        if self._audio_state_cache is not None and (now - self._audio_check_at) < config.AUDIO_CHECK_TTL:
+        cached = self._audio_state_cache
+        if cached is not None and (now - self._audio_check_at) < config.AUDIO_CHECK_TTL:
+            return cached
+        if cached is None or cached[0] != "ok":
+            self._audio_state_cache = self._classify_audio()
+            self._audio_check_at = time.monotonic()
             return self._audio_state_cache
-        self._audio_state_cache = self._classify_audio()
-        self._audio_check_at = now
-        return self._audio_state_cache
+        self._refresh_audio_state()
+        return cached
+
+    def _refresh_audio_state(self) -> None:
+        """Обновить кэш проверки звука в фоне (один поток за раз; сбой → кэш не трогаем)."""
+        if self._audio_refreshing:
+            return
+        self._audio_refreshing = True
+
+        def _job():
+            try:
+                state = self._classify_audio()
+                self._audio_state_cache = state
+                self._audio_check_at = time.monotonic()
+            except Exception:
+                self.log.debug("Фоновая проверка звука не удалась", exc_info=True)
+            finally:
+                self._audio_refreshing = False
+
+        threading.Thread(target=_job, daemon=True, name="tts-audio-check").start()
 
     @staticmethod
     def _classify_audio() -> tuple[str, str]:
@@ -276,10 +318,12 @@ class TtsModule(JarvisModule):
                "--volume", f"{max(0.0, volume):.3f}", "--latency", f"{config.TTS_LATENCY_MS}ms", "-"]
         if config.TTS_SINK:
             cmd += ["--target", config.TTS_SINK]
+        t_synth = time.perf_counter()
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         self._play_proc = proc
         err = b""
+        first_write = None
         try:
             if chime:  # короткий сигнал перед фразой (таймер) — тем же потоком pw-cat
                 try:
@@ -292,6 +336,11 @@ class TtsModule(JarvisModule):
                     pcm = AudioEnv.apply_gain(pcm, gain)
                 try:
                     proc.stdin.write(pcm)  # стримим по мере синтеза
+                    if first_write is None:
+                        first_write = time.perf_counter()
+                        if config.PERF_DEBUG:
+                            self.log.info("PERF tts: первый звук через %.0fмс от старта синтеза "
+                                          "(Piper первый чанк)", (first_write - t_synth) * 1000)
                 except BrokenPipeError:
                     break
             try:

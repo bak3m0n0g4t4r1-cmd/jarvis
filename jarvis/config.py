@@ -117,6 +117,8 @@ LOG_BACKUP_COUNT = _get("system", "log_backup_count", 3, "JARVIS_LOG_BACKUP_COUN
 LOG_LEVEL = str(_get("system", "log_level", "INFO", "JARVIS_LOG_LEVEL")).strip().upper()
 # Раз в столько секунд каждый сервис пишет в лог «жив» (INFO). 0 — выключить.
 HEARTBEAT_INTERVAL = _get("system", "heartbeat_interval", 300.0, "JARVIS_HEARTBEAT_INTERVAL")
+# Замеры задержки звеньев (STT/core/TTS) в лог строками «PERF …» — для диагностики отклика.
+PERF_DEBUG = _get("system", "perf_debug", False, "JARVIS_PERF_DEBUG")
 
 # === Слух (STT): захват, wake-word, VAD, анти-эхо (секция hearing) ===
 SAMPLE_RATE = _get("hearing", "sample_rate", 16000, "JARVIS_SAMPLE_RATE")

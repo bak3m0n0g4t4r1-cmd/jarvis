@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -107,7 +108,15 @@ class CoreModule(JarvisModule):
             self.log.info("Команда планировщика/диалог — обработает scheduler: %s", text)
             return
         # Обработку выносим в поток, чтобы не блокировать MQTT-loop.
-        threading.Thread(target=self._process_wake, args=(text, user_level), daemon=True).start()
+        threading.Thread(target=self._process_wake_timed,
+                         args=(text, user_level, time.perf_counter()), daemon=True).start()
+
+    def _process_wake_timed(self, text: str, user_level, t0: float):
+        """Обёртка _process_wake с замером (perf_debug): приём фразы → ответ/исполнение."""
+        self._process_wake(text, user_level)
+        if config.PERF_DEBUG:
+            self.log.info("PERF core: фраза обработана за %.1fмс — %s",
+                          (time.perf_counter() - t0) * 1000, text[:40])
 
     def _toggle_silence(self, text: str, user_level: float | None) -> None:
         """Включить/выключить режим тишины + ответ в характере.
