@@ -203,10 +203,27 @@ class CoreModule(JarvisModule):
     # ------------------------------------------------------------------ #
     # Выполнение команд, ветки, комбо, история
     # ------------------------------------------------------------------ #
+    def _dispatch(self, tag: str) -> None:
+        """Отправить тег на исполнение: лампа (поле «лампа») → jarvis/lamp; иначе → jarvis/execute.
+
+        Команды лампы — не shell: у них поле `лампа: {действие,…}` вместо `команда`. Их обрабатывает
+        сервис lamp по jarvis/lamp; os_agent их НЕ видит."""
+        spec = self._commands.get(tag) or {}
+        lamp_action = spec.get("лампа")
+        if isinstance(lamp_action, dict):
+            self.publish_json(contracts.TOPIC_LAMP, lamp_action, qos=contracts.QOS_LAMP)
+        else:
+            self._execute_command(tag)
+
     def _execute_matched(self, tag: str, user_level, set_branch: bool = True) -> None:
-        """Озвучить подтверждение, выполнить тег, обновить активную ветку (опц.) и историю."""
-        self._say(self._matcher.confirmation(tag), user_level)
-        self._execute_command(tag)
+        """Выполнить тег + обновить ветку (опц.) и историю. Озвучка: обычная команда — подтверждение
+        здесь; КОМАНДА ЛАМПЫ — озвучивает сервис lamp (он знает успех/недоступность), core молчит."""
+        spec = self._commands.get(tag) or {}
+        if isinstance(spec.get("лампа"), dict):
+            self.publish_json(contracts.TOPIC_LAMP, spec["лампа"], qos=contracts.QOS_LAMP)
+        else:
+            self._say(self._matcher.confirmation(tag), user_level)
+            self._execute_command(tag)
         if set_branch:
             self._active_branch = self._primary.get(tag)  # None для команд без ветки
         self._history.record(tag)
@@ -251,7 +268,7 @@ class CoreModule(JarvisModule):
             return
         self.log.info("Повтор последней команды: %s", last)
         self._say(phrases.pick("chains.repeat_done", config.REPEAT_DONE), user_level)
-        self._execute_command(last)
+        self._dispatch(last)
         self._history.record(last)
 
     def _do_undo(self, user_level) -> None:
@@ -267,7 +284,7 @@ class CoreModule(JarvisModule):
             return
         self.log.info("Отмена %s → обратная %s", last, inv)
         self._say(phrases.pick("chains.undo_done", config.UNDO_DONE), user_level)
-        self._execute_command(inv)
+        self._dispatch(inv)
         self._history.record(inv)
         self._last_command = inv
         self._active_branch = self._primary.get(inv)

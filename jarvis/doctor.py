@@ -304,6 +304,9 @@ def check_commands_yaml() -> list[CheckResult]:
         # Служебные top-level ключи (ветки/обратимость, ТЗ-5) — НЕ команды, пропускаем.
         if tag in _RESERVED_KEYS:
             continue
+        # Команды лампы (ТЗ-8) — НЕ shell: поле «лампа» вместо «команда» (исполняет сервис jarvis-lamp).
+        if isinstance((spec or {}).get("лампа"), dict):
+            continue
         args = (spec or {}).get("команда")
         if not isinstance(args, list) or not args:
             results.append(CheckResult(
@@ -1382,6 +1385,50 @@ def check_system() -> list[CheckResult]:
     return results
 
 
+def check_lamp() -> list[CheckResult]:
+    """Умная лампа (ТЗ-8): tinytuya установлен, креды заданы, связь есть. Лампа выключена/не в сети
+    → WARN (не FAIL — это норма); нет кредов → WARN с подсказкой. Проба связи короткая."""
+    if not config.LAMP_ENABLED:
+        return [CheckResult(OK, "лампа выключена (lamp.enabled=false)")]
+    try:
+        import tinytuya
+    except Exception:
+        return [CheckResult(WARN, "лампа: tinytuya не установлен",
+                            reason="управление лампой недоступно.", fix="pip install -e .")]
+    results = [CheckResult(OK, f"лампа: tinytuya {getattr(tinytuya, 'version', '?')}")]
+    if not (config.LAMP_DEVICE_ID and config.LAMP_LOCAL_KEY):
+        results.append(CheckResult(
+            WARN, "лампа: креды не заданы",
+            reason="device_id/local_key пусты — лампа не подключится.",
+            fix="впишите device_id/local_key/ip в settings.yaml → lamp; затем `jarvis lamp test`"))
+        return results
+    ip = config.LAMP_IP
+    try:
+        if not ip:
+            results.append(CheckResult(
+                WARN, "лампа: IP не задан",
+                reason="ip пуст — нужен автопоиск (медленно) или явный адрес.",
+                fix="укажите lamp.ip в settings.yaml"))
+            return results
+        bulb = tinytuya.BulbDevice(config.LAMP_DEVICE_ID, address=ip,
+                                   local_key=config.LAMP_LOCAL_KEY, version=float(config.LAMP_VERSION))
+        bulb.set_socketTimeout(3)
+        st = bulb.status()
+        if isinstance(st, dict) and "Error" not in st and "Err" not in st:
+            results.append(CheckResult(OK, f"лампа: на связи ({ip}, протокол {config.LAMP_VERSION})"))
+        else:
+            results.append(CheckResult(
+                WARN, "лампа: не отвечает",
+                reason=f"status: {st}",
+                fix="проверьте питание лампы и ВЕРСИЮ протокола (3.3 ↔ 3.4) в settings.yaml"))
+    except Exception as exc:
+        results.append(CheckResult(
+            WARN, "лампа: нет связи",
+            reason=str(exc),
+            fix="проверьте ip/local_key и версию протокола (3.3 ↔ 3.4); `jarvis lamp test`"))
+    return results
+
+
 def check_chains() -> list[CheckResult]:
     """Цепочки (ТЗ-5): ветки продолжений валидны, обратимость валидна, фильтр/комбо-split/гейты живы."""
     results = []
@@ -1645,6 +1692,7 @@ def run(quick: bool = False) -> bool:
     _safe(reporter, check_push_to_talk)
     _safe(reporter, check_notifications)
     _safe(reporter, check_system)
+    _safe(reporter, check_lamp)
 
     reporter.section("Слой 4. Модели и распознавание")
     reporter.note("загружаю модели движком…")

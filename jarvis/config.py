@@ -953,3 +953,46 @@ ENV_EMPTY = _env_pack("empty", [
 LIVE_REFRESH_SECONDS = _get("live", "refresh_seconds", 1.0, None)
 LIVE_STATUS_TTL = _get("live", "status_ttl_seconds", 3.0, None)
 LIVE_HORIZON_HOURS = _get("live", "horizon_hours", 72, None)
+
+# === Умная Wi-Fi лампа (Tuya, ЛОКАЛЬНО через tinytuya — без облака) (ТЗ-8) ===
+LAMP_ENABLED = _get("lamp", "enabled", True, "JARVIS_LAMP_ENABLED")
+LAMP_DEVICE_ID = str(_get("lamp", "device_id", "", "JARVIS_LAMP_DEVICE_ID")).strip()
+LAMP_LOCAL_KEY = str(_get("lamp", "local_key", "", "JARVIS_LAMP_LOCAL_KEY")).strip()
+LAMP_IP = str(_get("lamp", "ip", "", "JARVIS_LAMP_IP")).strip()       # пусто → автопоиск по device_id
+LAMP_VERSION = _get("lamp", "version", 3.3, "JARVIS_LAMP_VERSION")    # 3.3/3.4 (зависит от прошивки)
+LAMP_AUTODISCOVER = _get("lamp", "autodiscover", True, None)          # искать по device_id, если ip пуст/молчит
+LAMP_RECONNECT_SECONDS = _get("lamp", "reconnect_seconds", 30, None)  # период попыток переподключения
+LAMP_SOCKET_TIMEOUT = _get("lamp", "socket_timeout", 4.0, None)       # таймаут сокета (быстрый отклик/фейл)
+LAMP_BRIGHTNESS_STEP = _get("lamp", "brightness_step", 20, None)      # шаг «ярче/темнее» (%)
+LAMP_NOTIFY_UNAVAILABLE = _get("lamp", "notify_unavailable", False, None)  # уведомлять, если лампа не в сети
+
+# Карта цветов: имя → RGB [0..255]. Пользователь правит/добавляет.
+LAMP_COLORS = _get("lamp", "colors", {
+    "тёплый": [255, 170, 87], "белый": [255, 255, 255], "красный": [255, 30, 30],
+    "зелёный": [40, 230, 60], "синий": [40, 90, 255], "голубой": [60, 200, 255],
+    "жёлтый": [255, 210, 40], "оранжевый": [255, 120, 20], "фиолетовый": [170, 40, 255],
+    "розовый": [255, 80, 160],
+}, None)
+# Фоновое состояние лампы (куда возвращаемся после реакций; индикация «готов» при старте).
+LAMP_BACKGROUND = _get("lamp", "background",
+                       {"вкл": True, "цвет": "тёплый", "яркость": 60}, None)
+# Реакции на события: {вкл, цвет, паттерн (свечение|пульс|мигание), яркость, длительность, повторы}.
+LAMP_REACTIONS = _get("lamp", "reactions", {
+    "startup":  {"вкл": True, "цвет": "тёплый", "паттерн": "пульс", "яркость": 80, "длительность": 1.5, "повторы": 1},
+    "speaking": {"вкл": True, "цвет": "синий", "паттерн": "свечение", "яркость": 55, "длительность": 0, "повторы": 1},
+    "firing":   {"вкл": True, "цвет": "красный", "паттерн": "мигание", "яркость": 100, "длительность": 3.0, "повторы": 4},
+    "silence":  {"вкл": False, "цвет": "фиолетовый", "паттерн": "свечение", "яркость": 40, "длительность": 0, "повторы": 1},
+    "break":    {"вкл": False, "цвет": "зелёный", "паттерн": "пульс", "яркость": 60, "длительность": 2.0, "повторы": 2},
+    "error":    {"вкл": False, "цвет": "красный", "паттерн": "мигание", "яркость": 90, "длительность": 1.5, "повторы": 2},
+}, None)
+
+def _lamp_pack(key, default):
+    return _get("lamp", key, default, None)
+
+LAMP_ON_ACK = _lamp_pack("on_ack", ["Включаю лампу, сэр.", "Свет, сэр.", "Зажигаю, сэр."])
+LAMP_OFF_ACK = _lamp_pack("off_ack", ["Гашу лампу, сэр.", "Выключаю свет, сэр.", "Темнота, сэр."])
+LAMP_COLOR_ACK = _lamp_pack("color_ack", ["Готово, сэр.", "Меняю цвет, сэр.", "Как скажете, сэр."])
+LAMP_BRIGHT_ACK = _lamp_pack("bright_ack", ["Готово, сэр.", "Регулирую, сэр."])
+LAMP_AUTO_ACK = _lamp_pack("auto_ack", ["Возвращаю авто-режим, сэр.", "Лампа снова реагирует сама, сэр."])
+LAMP_UNAVAILABLE = _lamp_pack("unavailable", [
+    "Сэр, лампа не отвечает.", "Не вижу лампу в сети, сэр.", "Лампа сейчас недоступна, сэр."])

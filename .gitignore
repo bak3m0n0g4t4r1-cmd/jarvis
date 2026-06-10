@@ -10,6 +10,12 @@ logs/*
 .env
 .env.local
 
+# Служебные файлы tinytuya (создаются сканом/мастером — не наши, в репо не нужны)
+tinytuya.json
+devices.json
+snapshot.json
+tuya-raw.json
+
 # Python
 __pycache__/
 *.py[cod]

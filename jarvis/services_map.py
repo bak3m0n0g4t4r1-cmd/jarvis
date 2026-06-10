@@ -51,4 +51,10 @@ SERVICES = [
         "«Планировщик» — будильники (утренний и обычные)",
         needs_audio=False,
     ),
+    ServiceDef(
+        "lamp", "jarvis-lamp.service", "jarvis-lamp",
+        "jarvis.services.lamp", "LampModule",
+        "«Свет» — умная лампа Tuya (локально) + реакции на события",
+        needs_audio=False,
+    ),
 ]

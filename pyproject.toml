@@ -19,6 +19,9 @@ dependencies = [
     # --- engine-зависимости: версии СВЕРИТЬ на целевой машине ---
     "sherpa-onnx>=1.10",
     "piper-tts>=1.2",
+    # --- live-панель (jarvis live) + умная лампа Tuya (локально, без облака) ---
+    "rich>=13",
+    "tinytuya>=1.13",
 ]
 
 # console entry points — systemd-юниты зовут эти команды (без плясок с PYTHONPATH)
@@ -30,6 +33,7 @@ jarvis-os-agent = "jarvis.services.os_agent:main"
 jarvis-tts = "jarvis.services.tts:main"
 jarvis-activity-monitor = "jarvis.services.activity_monitor:main"
 jarvis-scheduler = "jarvis.services.scheduler:main"
+jarvis-lamp = "jarvis.services.lamp:main"
 
 [tool.setuptools.packages.find]
 include = ["jarvis*"]

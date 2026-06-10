@@ -285,6 +285,63 @@ def cmd_live(args) -> int:
     return live.run()
 
 
+def cmd_lamp(args) -> int:
+    """Прямое управление лампой для проверки кредов (БЕЗ сервисов/голоса): on|off|status|test.
+
+    Помогает убедиться, что device_id/local_key/ip/версия верны (частая ошибка — версия 3.3↔3.4)."""
+    action = getattr(args, "action", "status")
+    if not (config.LAMP_DEVICE_ID and config.LAMP_LOCAL_KEY):
+        print("✗ Креды лампы не заданы (settings.yaml → lamp.device_id/local_key).")
+        return 1
+    try:
+        import tinytuya
+    except Exception:
+        print("✗ tinytuya не установлен. Выполните `pip install -e .`.")
+        return 1
+    ip = config.LAMP_IP
+    if not ip and config.LAMP_AUTODISCOVER:
+        print("Ищу лампу в сети по device_id…")
+        try:
+            for k, info in (tinytuya.deviceScan(False, 5) or {}).items():
+                if config.LAMP_DEVICE_ID in (info.get("gwId"), info.get("id")):
+                    ip = info.get("ip", k)
+                    break
+        except Exception:
+            pass
+    if not ip:
+        print("✗ IP лампы не задан и не найден автопоиском (укажите lamp.ip).")
+        return 1
+    try:
+        bulb = tinytuya.BulbDevice(config.LAMP_DEVICE_ID, address=ip,
+                                   local_key=config.LAMP_LOCAL_KEY, version=float(config.LAMP_VERSION))
+        bulb.set_socketTimeout(float(config.LAMP_SOCKET_TIMEOUT))
+        st = bulb.status()
+        if not isinstance(st, dict) or "Error" in st or "Err" in st:
+            print(f"✗ Лампа не отвечает: {st}")
+            print("  Частая причина — неверная ВЕРСИЯ протокола. Попробуйте сменить lamp.version (3.3 ↔ 3.4).")
+            return 1
+        print(f"✓ Лампа на связи: {ip} (протокол {config.LAMP_VERSION}). dps={st.get('dps')}")
+        if action == "on":
+            bulb.turn_on()
+            print("→ включена")
+        elif action == "off":
+            bulb.turn_off()
+            print("→ выключена")
+        elif action == "test":
+            import time
+            print("→ тест: красный → зелёный → синий → тёплый белый")
+            for rgb in [(255, 0, 0), (0, 255, 0), (0, 80, 255)]:
+                bulb.turn_on()
+                bulb.set_colour(*rgb)
+                time.sleep(0.9)
+            bulb.set_white_percentage(60, 50)
+        return 0
+    except Exception as exc:
+        print(f"✗ Ошибка связи с лампой: {exc}")
+        print("  Проверьте ip/local_key и ВЕРСИЮ протокола (3.3 ↔ 3.4) в settings.yaml.")
+        return 1
+
+
 def cmd_status(args) -> int:
     return _systemctl("--no-pager", "status", *[svc.unit for svc in SERVICES])
 
@@ -319,6 +376,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="статус сервисов").set_defaults(func=cmd_status)
     sub.add_parser("restart", help="перезапустить все сервисы Джарвиса + объявить статус").set_defaults(func=cmd_restart)
     sub.add_parser("live", help="живая панель состояния (до Ctrl+C)").set_defaults(func=cmd_live)
+    p_lamp = sub.add_parser("lamp", help="проверка/управление умной лампой (on|off|status|test)")
+    p_lamp.add_argument("action", nargs="?", default="status",
+                        choices=["on", "off", "status", "test"], help="действие (по умолчанию status)")
+    p_lamp.set_defaults(func=cmd_lamp)
 
     return parser
 

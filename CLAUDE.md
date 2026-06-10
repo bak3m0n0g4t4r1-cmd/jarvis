@@ -135,9 +135,10 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 │   ├── notify.py             # системные уведомления (D-Bus/gdbus) + кнопка-действие «Открыть логи»
 │   ├── system.py             # системные голос-команды: гейт перезагрузки + парсер рабочих сред
 │   ├── live.py               # живая панель `jarvis live` (rich.live: эфир/сервисы/расписание/перерыв)
+│   ├── lamp.py               # умная лампа: цвет имя→RGB, разбор реакций, нормализация яркости (хелперы)
 │   ├── weather.py            # погода Open-Meteo (геокодинг кириллицей + кэш, best-effort, таймаут)
 │   ├── cli.py, doctor.py, downloader.py, ui.py, services_map.py
-│   └── services/             # stt.py, core.py, os_agent.py, tts.py, activity_monitor.py, scheduler.py — наследники JarvisModule, main()
+│   └── services/             # stt.py, core.py, os_agent.py, tts.py, activity_monitor.py, scheduler.py, lamp.py — наследники JarvisModule, main()
 ├── systemd/                  # --user юниты, Restart=always, MemoryAccounting=true, ExecStart=абс. путь venv
 ├── models/                   # .gitignore (zipformer-ru, piper-голос, rubert-tiny2-onnx + кеш эмбеддингов)
 └── logs/
@@ -147,7 +148,7 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 `jarvis/say` {"text","source"} · `jarvis/state` {"state": idle|listening|thinking|speaking}.
 
 **Настройки** = ОДИН файл `settings.yaml` в корне (секции voice/adaptive_audio/hearing/
-recognition/startup/system/models/break_reminders/местоположение/alarms/timers/worldtime/coin/reminders/chains/notifications/silence/restart/environments/live, русские комментарии к каждому параметру). Код читает ТОЛЬКО через
+recognition/startup/system/models/break_reminders/местоположение/alarms/timers/worldtime/coin/reminders/chains/notifications/silence/restart/environments/live/lamp, русские комментарии к каждому параметру). Код читает ТОЛЬКО через
 `config.py` (единая загрузка: приоритет env `JARVIS_*` → `settings.yaml` → дефолт; отсутствие
 файла/параметра → дефолт, не падает). Менять параметр = править `settings.yaml`, Python не трогать.
 VAD-пороги (0.3/0.8) и анти-эхо в файле помечены ⚠ «настроено опытным путём».
@@ -340,6 +341,18 @@ MQTT/логирование/shutdown — всё в базовом классе.
   столе — честный предел). (4) graceful shutdown — bus.py крепкий, аудит пройден. doctor `check_system`.
   Скрытая ошибка: `config._cast` не умел dict (строковал ENVIRONMENTS) — починено. `jarvis doctor
   --quick` зелёный (✗0). Сервисов 6 (без новых).
+- **Этап 18 (умная Wi-Fi лампа Tuya локально + реакции на события) — ✅ КОД ГОТОВ (живая проверка за
+  пользователем — нужны КРЕДЫ).** Новый сервис `jarvis-lamp` (LampModule, needs_audio=False) +
+  `jarvis/lamp.py` (хелперы). Локально через **tinytuya** (БЕЗ облака): персистентный сокет, поток-
+  воркер (MQTT не блокируется Wi-Fi), переподключение backoff; лампа недоступна → Джарвис ЖИВ.
+  РЕАКЦИИ (settings.yaml `lamp.reactions`): старт (готовность), озвучка (`jarvis/state` speaking→glow→
+  фон, debounce), срабатывание (`jarvis/say` с `min_volume` → заметная реакция), опц. тишина/перерыв/
+  ошибка; после реакции — ВОЗВРАТ в фон. ГОЛОС: команды lamp_* в commands.yaml с полем `лампа:`
+  (НЕ shell) → core форвардит в `jarvis/lamp` → лампа исполняет и ОЗВУЧИВАЕТ (паки в settings.yaml);
+  ветка «лампа» (продолжения «синим»/«ярче»). `jarvis lamp on|off|status|test` для проверки кредов;
+  doctor `check_lamp`. Скрытая правка: doctor/os_agent игнорируют записи с `лампа` (нет `команда`).
+  `jarvis doctor --quick` зелёный (✗0). Сервисов 7. **ПРЕДУСЛОВИЕ:** `pip install -e .` + креды в
+  settings.yaml (device_id/local_key/ip/версия) + `jarvis start`.
 - **Возможное будущее (необязательно):** коннект телефона / музыка-доводка / громкость четвертями — отд. ТЗ.
   HUD — киношный визуал поверх готового пульта (веб-стек в прозрачном окне на Wayland, чисто
   визуальный). Только после устойчивой работы.
@@ -370,6 +383,8 @@ MQTT/логирование/shutdown — всё в базовом классе.
 - `jarvis restart` — перезапустить все сервисы + объявить статус голосом/уведомлением (ТЗ-7;
   голосовой путь зовёт её откреплённо через systemd-run, чтобы пережить рестарт core).
 - `jarvis live` — живая панель состояния (rich.live, до Ctrl+C): эфир/сервисы/расписание/перерыв/режим.
+- `jarvis lamp [on|off|status|test]` — прямая проверка/управление умной лампой (ТЗ-8), без сервисов/
+  голоса (помогает проверить креды/версию протокола 3.3↔3.4).
 - `jarvis status` — статус юнитов.
 - `jarvis doctor` (`--quick` — без синтеза/цепочки) — диагностика: импорты, версии,
   пути, железо, MQTT round-trip, модели STT/TTS, эмбеддер (грузится + осмыслен),
@@ -674,3 +689,23 @@ MQTT/логирование/shutdown — всё в базовом классе.
 - **`config._cast` не умел dict (Этап 17, скрытая ошибка).** Для dict-дефолта (напр. `environments.named`)
   `_cast` уходил в `str(value)` → строковал словарь → `.items()` падал (ловился try → пустой резолв).
   Добавлен pass-through `isinstance(default, dict)`. Новые dict-параметры теперь корректны.
+- **Умная лампа — tinytuya ЛОКАЛЬНО, версия протокола критична (Этап 18).** `tinytuya.BulbDevice(
+  device_id, address=ip, local_key, version=3.3|3.4, persist=True)`; `set_socketPersistent(True)` +
+  короткий `set_socketTimeout`; команды `set_colour(r,g,b)`/`set_brightness_percentage`/`set_white_
+  percentage`/`turn_on/off` с `nowait=True` (быстро, без ожидания ACK — для реакций). **Версия 3.3↔3.4
+  зависит от прошивки** — частая причина «не подключается» (параметр `lamp.version`). Live-тест требует
+  КРЕДОВ (пользователь) → `jarvis lamp test` + doctor WARN (не FAIL без кредов/связи). Лампа — отдельный
+  сервис (изоляция): недоступна → Джарвис не затронут.
+- **Команды лампы — поле `лампа`, НЕ `команда` (Этап 18): это НЕ shell.** core `_execute_matched`:
+  тег с `лампа:{действие,…}` → publish `jarvis/lamp` (не jarvis/execute); ОЗВУЧИВАЕТ результат сервис
+  lamp (успех-пак / «недоступна»), core молчит (единый источник). `doctor.check_commands_yaml` и
+  `os_agent` ИГНОРИРУЮТ записи с `лампа` (у них нет `команда` — иначе FAIL/«неизвестна команда»).
+  matcher строит их по `синонимы` как обычно. Реакции: `min_volume` в jarvis/say = «срабатывание»
+  (как критичность ТЗ-6); озвучка — по `jarvis/state` speaking/idle с debounce (частые реплики не
+  дёргают лампу). После любой реакции — возврат в фоновое состояние (`_apply_background`).
+- **Лампа-«ярче/темнее» vs экран (Этап 18): порядок в commands.yaml.** lamp_* идут ПОСЛЕ brightness_*
+  → в `_exact` голое «ярче/темнее» закреплено за brightness_up/down (ЭКРАН) при wake. В ВЕТКЕ «лампа»
+  (allowed_tags-подмножество, brightness_* исключён) те же слова → lamp_brighter/dimmer. Так wake
+  «ярче»=экран, а продолжение в контексте лампы «ярче»=лампа. Цвета лампы — отдельные теги
+  lamp_color_<цвет>, RGB берётся из карты `lamp.colors` (settings.yaml); нет RGB у лампы → деградация
+  на белый/яркость (флаг `_color_ok` сбрасывается при ошибке set_colour).
