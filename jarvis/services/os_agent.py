@@ -16,7 +16,7 @@ from pathlib import Path
 
 import yaml
 
-from jarvis import config, contracts, notify, services_map
+from jarvis import config, contracts, notify, phrases, services_map
 from jarvis.bus import JarvisModule
 
 # KWin (Wayland) виртуальные столы: создание/переключение через qdbus6 (сверено на KDE 6.5).
@@ -108,6 +108,11 @@ class OsAgentModule(JarvisModule):
             self.log.warning("Неизвестный тег команды: %r", tag)
             self.say(f"Сэр, мне неизвестна команда «{tag}».")
             return
+        # Тема оформления (ТЗ-10): поле «тема» (dark|light|toggle) вместо shell-команды.
+        theme = spec.get("тема")
+        if theme in ("dark", "light", "toggle"):
+            self._apply_theme(theme)
+            return
         args = spec.get("команда")
         if not isinstance(args, list) or not args:
             self.log.error("Некорректная команда для тега %s: %r", tag, args)
@@ -122,6 +127,46 @@ class OsAgentModule(JarvisModule):
             return
         wait_output = bool(spec.get("ждать_вывод", False))
         self._run(tag, [str(a) for a in args], wait_output)
+
+    def _apply_theme(self, which: str):
+        """Сменить цветовую схему KDE (plasma-apply-colorscheme). toggle — читаем текущую, ставим иную.
+        Схемы — из config (THEME_DARK_SCHEME/LIGHT_SCHEME). Сбой → внятный голос, не падаем."""
+        dark, light = config.THEME_DARK_SCHEME, config.THEME_LIGHT_SCHEME
+        try:
+            if which == "toggle":
+                cur = self._current_scheme()
+                target = light if (cur and cur.lower() == str(dark).lower()) else dark
+            else:
+                target = dark if which == "dark" else light
+            r = subprocess.run(["plasma-apply-colorscheme", target],
+                               capture_output=True, text=True, timeout=8)
+            if r.returncode == 0:
+                self.log.info("Тема применена: %s", target)
+            else:
+                self.log.warning("Тема: код %s (%s)", r.returncode, (r.stderr or "").strip()[:120])
+                self.say(phrases.pick("theme.fail", config.THEME_FAIL))
+        except FileNotFoundError:
+            self.log.error("plasma-apply-colorscheme не найден — смена темы недоступна")
+            self.say(phrases.pick("theme.fail", config.THEME_FAIL))
+        except Exception:
+            self.log_exc(logging.WARNING, "Сбой смены темы")
+            self.say(phrases.pick("theme.fail", config.THEME_FAIL))
+
+    @staticmethod
+    def _current_scheme():
+        """Имя текущей цветовой схемы (маркер «(текущая…)» / «(current…)» в --list-schemes) или None."""
+        try:
+            out = subprocess.run(["plasma-apply-colorscheme", "--list-schemes"],
+                                 capture_output=True, text=True, timeout=4).stdout
+            for line in out.splitlines():
+                low = line.lower()
+                if "текущ" in low or "current" in low:
+                    m = re.search(r"\*?\s*(\S+)\s*\(", line)
+                    if m:
+                        return m.group(1)
+        except Exception:
+            pass
+        return None
 
     def on_environment(self, payload: dict):
         """Рабочая среда (ТЗ-7): создать новый вирт. стол KDE, переключиться, запустить приложения.

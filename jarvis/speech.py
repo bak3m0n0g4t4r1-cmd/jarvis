@@ -6,7 +6,28 @@ Piper читает «14:30», «07.06.2026», «45%» криво или неод
 минуты/проценты 0–100, дни 1–31, годы ~1900–2100) — полноценный num2words не нужен,
 без внешних зависимостей. Все функции чистые и НЕ бросают (на странном входе — str(n)).
 """
+import re
 from datetime import date as _date
+
+
+def apply_pronunciation(text, table):
+    """Заменить проблемные слова на корректное произношение/ударение ПЕРЕД синтезом Piper (ТЗ-10).
+
+    Целым словом, регистронезависимо. table — {слово: замена} (латиница→кириллица или акут ́ на
+    ударной гласной). Чистая функция, не бросает: сбой/пусто → исходный текст."""
+    try:
+        if not text or not table:
+            return text
+        out = text
+        for word, repl in table.items():
+            if not word:
+                continue
+            out = re.sub(rf"(?<!\w){re.escape(str(word))}(?!\w)", str(repl), out,
+                         flags=re.IGNORECASE | re.UNICODE)
+        return out
+    except Exception:
+        return text
+
 
 # Количественные единицы. Мужской род по умолчанию; женский — для «одна минута»,
 # «две тысячи» (род важен только для 1 и 2).

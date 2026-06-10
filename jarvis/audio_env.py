@@ -20,7 +20,7 @@ import time
 
 import numpy as np
 
-from jarvis import config
+from jarvis import config, voice_volume
 
 _log = logging.getLogger("jarvis-audio-env")
 _SR = 16000  # частота замера (моно)
@@ -43,6 +43,7 @@ class AudioEnv:
         self._threads: list[threading.Thread] = []
         self._ducked: dict[str, float] = {}   # sink-input id → исходная громкость (для restore)
         self._lock = threading.Lock()
+        self._smoothed_vol = None  # сглаженная громкость голоса между фразами (нет рывка первой фразы)
 
     # ------------------------------------------------------------------ #
     # Жизненный цикл
@@ -88,8 +89,12 @@ class AudioEnv:
                         # включая голос Джарвиса → нет самоподхвата).
                         ext = max(0.0, rms - config.NOISE_SUBTRACT_K * self._monitor_rms)
                         if not self._speaking:
-                            # EMA только пока Джарвис молчит — чистый внешний фон без артефактов речи.
-                            self._noise = 0.8 * self._noise + 0.2 * ext
+                            # АСИММЕТРИЧНЫЙ ПОЛ шума (ТЗ-10, фикс скачка): быстро ВНИЗ (следуем за
+                            # тишиной), очень медленно ВВЕРХ — кратковременный всплеск голоса
+                            # пользователя/команды (до ответа _speaking=False) НЕ задирает фон, иначе
+                            # первая фраза «орала», а последующие были тихими.
+                            a = config.NOISE_FLOOR_DOWN if ext < self._noise else config.NOISE_FLOOR_UP
+                            self._noise = (1.0 - a) * self._noise + a * ext
             except Exception as exc:
                 _log.debug("Сбой замерщика микрофона (%s) — переоткрою", exc)
                 if self._stop.wait(1.0):
@@ -165,7 +170,8 @@ class AudioEnv:
         сильном шуме (если выше потолка громкости)."""
         try:
             noise = self._noise
-            vmin, vbase, vmax = (config.VOICE_VOLUME_MIN, config.VOICE_VOLUME_BASE,
+            # Базовая громкость — отправная точка (можно задать голосом, ТЗ-10); адаптив поверх неё.
+            vmin, vbase, vmax = (config.VOICE_VOLUME_MIN, voice_volume.get_base(),
                                  config.VOICE_VOLUME_MAX)
             if noise > config.QUIET_THRESHOLD:
                 # Шумно — громкость диктуется необходимостью перекрыть шум.
@@ -183,7 +189,13 @@ class AudioEnv:
                     vol = vbase
                 gain = 1.0
                 vol = max(vmin, min(vbase, vol))  # в тишине не громче базы
-            return round(vol, 3), round(gain, 3)
+            # СГЛАЖИВАНИЕ итоговой громкости между фразами (ТЗ-10): нет рывка/скачка первой фразы.
+            a = config.VOLUME_SMOOTHING
+            if self._smoothed_vol is None or not isinstance(a, (int, float)) or a >= 1.0:
+                self._smoothed_vol = vol
+            else:
+                self._smoothed_vol = self._smoothed_vol + max(0.0, min(1.0, a)) * (vol - self._smoothed_vol)
+            return round(self._smoothed_vol, 3), round(gain, 3)
         except Exception as exc:
             _log.debug("Расчёт громкости сбоил (%s) — база", exc)
             return config.VOICE_VOLUME_BASE, 1.0

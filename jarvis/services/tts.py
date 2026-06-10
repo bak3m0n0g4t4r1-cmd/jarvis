@@ -260,6 +260,9 @@ class TtsModule(JarvisModule):
         (pw-cat и так ресэмплит к частоте устройства)."""
         from piper import SynthesisConfig
 
+        from jarvis import speech
+        # Словарь произношения/ударений (ТЗ-10): правим проблемные слова ПЕРЕД синтезом.
+        text = speech.apply_pronunciation(text, config.PRONUNCIATION)
         # Защита от мусора в settings.yaml: вне разумных границ → клиппинг (битое значение не должно
         # давать немоту/нулевую частоту). length_scale и pitch — положительные множители.
         pitch = min(2.0, max(0.5, float(config.VOICE_PITCH)))

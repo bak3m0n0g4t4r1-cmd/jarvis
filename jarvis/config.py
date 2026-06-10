@@ -243,6 +243,41 @@ USER_TO_VOLUME = _get("adaptive_audio", "user_to_volume", 4.0, "JARVIS_USER_TO_V
 VOLUME_RAMP = _get("adaptive_audio", "volume_ramp", 0.25, "JARVIS_VOLUME_RAMP")
 # Окно/период замера RMS фоновыми замерщиками (с) — короткое, лёгкое по CPU.
 NOISE_WINDOW = _get("adaptive_audio", "noise_window", 0.1, "JARVIS_NOISE_WINDOW")
+# Шум меряем как ПОЛ (асимметричная EMA): быстро ВНИЗ (следуем за тишиной), очень медленно ВВЕРХ
+# (всплеск голоса пользователя/команды НЕ задирает фон → первая фраза не «орёт»). ТЗ-10, фикс скачка.
+NOISE_FLOOR_DOWN = _get("adaptive_audio", "noise_floor_down", 0.25, None)  # доля приближения вниз/шаг
+NOISE_FLOOR_UP = _get("adaptive_audio", "noise_floor_up", 0.02, None)      # доля приближения вверх/шаг
+# Сглаживание ИТОГОВОЙ громкости голоса между фразами (0..1; доля движения к цели). Меньше — плавнее,
+# нет рывка громкой первой фразы. 1.0 — без сглаживания (мгновенно).
+VOLUME_SMOOTHING = _get("adaptive_audio", "volume_smoothing", 0.5, "JARVIS_VOLUME_SMOOTHING")
+# Пак подтверждения голосовой установки громкости (ТЗ-10). {процент} — установленный уровень.
+VOLUME_ACK = _get("voice_volume", "ack", [
+    "Громкость {процент} процентов, сэр.",
+    "Ставлю {процент} процентов, сэр.",
+    "Готово, сэр — {процент} процентов.",
+], None)
+
+# Словарь произношения (ТЗ-10): слово → замена ПЕРЕД синтезом Piper (целым словом, регистронезависимо).
+# СВЕРЕНО: этот голос Piper НЕ учитывает комбинирующий акут ́ — ударение правится только ФОНЕТИЧЕСКИМ
+# РЕСПЕЛЛИНГОМ (переписать слово так, как надо читать). Транслитерация латиницы → кириллицей работает
+# отлично. Это ПЛОСКАЯ секция (pronunciation: {слово: замена}) — читаем словарь целиком.
+_PRON_DEFAULT = {
+    "Wi-Fi": "вай-фай", "WiFi": "вай-фай", "wifi": "вай-фай",
+    "Bluetooth": "блютус", "Gemini": "джемини", "GitHub": "гитхаб", "Gmail": "джимейл",
+    "Thorium": "ториум", "Telegram": "телеграм", "Yandex": "яндекс", "speedtest": "спидтест",
+    "MQTT": "эм-ку-ти-ти", "USB": "ю-эс-би", "URL": "ю-эр-эль", "VPN": "вэ-пэ-эн",
+}
+try:
+    _pron = _SETTINGS.get("pronunciation")
+    PRONUNCIATION = _pron if isinstance(_pron, dict) and _pron else _PRON_DEFAULT
+except Exception:
+    PRONUNCIATION = _PRON_DEFAULT
+
+# Тема оформления KDE (ТЗ-10): цветовые схемы для тёмной/светлой (plasma-apply-colorscheme).
+THEME_DARK_SCHEME = _get("theme", "dark_scheme", "TUXEDODark", None)
+THEME_LIGHT_SCHEME = _get("theme", "light_scheme", "TUXEDOLight", None)
+THEME_FAIL = _get("theme", "fail",
+                  ["Сэр, не удалось сменить тему.", "Тема не переключилась, сэр."], None)
 
 # === Стартовое объявление: фирменная фраза при `jarvis start` (секция startup) ===
 # Дефолтные паки (полные — фича работает и без settings.yaml). Авторитетная копия — в settings.yaml.

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import yaml
 
-from jarvis import chains, config, contracts, phrases, silence, system, worldtime
+from jarvis import chains, config, contracts, phrases, silence, system, voice_volume, worldtime
 from jarvis.breaks import is_stop_phrase
 from jarvis.bus import JarvisModule
 from jarvis.matcher import NOT_RECOGNIZED, Matcher
@@ -149,6 +149,11 @@ class CoreModule(JarvisModule):
                     return
                 if system.is_environment_command(text):
                     self._do_environment(text, user_level)
+                    return
+
+                # 0.2) Базовая громкость голоса (ТЗ-10): «громкость 30» / «половина громкости».
+                if voice_volume.is_volume_command(text):
+                    self._do_volume(text, user_level)
                     return
 
                 # 1) Встроенные info-ответы (офлайн, без матчера).
@@ -343,6 +348,18 @@ class CoreModule(JarvisModule):
         self.publish_json(contracts.TOPIC_ENVIRONMENT, {"desktop": name, "apps": apps},
                           qos=contracts.QOS_ENVIRONMENT)
         self._active_branch = None  # среда — не ветка продолжений
+
+    def _do_volume(self, text: str, user_level) -> None:
+        """Установить БАЗОВУЮ громкость голоса (ТЗ-10): проценты/доли. Адаптив работает поверх.
+        Состояние переживает рестарт (voice_volume.set_base → logs/volume_state.json)."""
+        level = voice_volume.parse_level(text)
+        if level is None:
+            return
+        voice_volume.set_base(level)
+        pct = round(level * 100)
+        self.log.info("Базовая громкость голоса → %d%%", pct)
+        self._say(phrases.pick("voice_volume.ack", config.VOLUME_ACK).replace("{процент}", str(pct)),
+                  user_level)
 
     def _say(self, text: str, user_level: float | None = None) -> None:
         """Реплика в jarvis/say с опц. громкостью речи пользователя (для адаптивной громкости TTS)."""

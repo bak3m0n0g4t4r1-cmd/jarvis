@@ -304,8 +304,9 @@ def check_commands_yaml() -> list[CheckResult]:
         # Служебные top-level ключи (ветки/обратимость, ТЗ-5) — НЕ команды, пропускаем.
         if tag in _RESERVED_KEYS:
             continue
-        # Команды лампы (ТЗ-8) / телефона (ТЗ-9) — НЕ shell: поле «лампа»/«телефон» вместо «команда».
-        if isinstance((spec or {}).get("лампа"), dict) or isinstance((spec or {}).get("телефон"), dict):
+        # Команды лампы (ТЗ-8) / телефона (ТЗ-9) / темы (ТЗ-10) — НЕ shell: спец-поле вместо «команда».
+        if (isinstance((spec or {}).get("лампа"), dict) or isinstance((spec or {}).get("телефон"), dict)
+                or (spec or {}).get("тема")):
             continue
         args = (spec or {}).get("команда")
         if not isinstance(args, list) or not args:
