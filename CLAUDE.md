@@ -138,7 +138,7 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 │   ├── lamp.py               # умная лампа: цвет имя→RGB, разбор реакций, нормализация яркости (хелперы)
 │   ├── weather.py            # погода Open-Meteo (геокодинг кириллицей + кэш, best-effort, таймаут)
 │   ├── cli.py, doctor.py, downloader.py, ui.py, services_map.py
-│   └── services/             # stt.py, core.py, os_agent.py, tts.py, activity_monitor.py, scheduler.py, lamp.py — наследники JarvisModule, main()
+│   └── services/             # stt.py, core.py, os_agent.py, tts.py, activity_monitor.py, scheduler.py, lamp.py, phone.py — наследники JarvisModule, main()
 ├── systemd/                  # --user юниты, Restart=always, MemoryAccounting=true, ExecStart=абс. путь venv
 ├── models/                   # .gitignore (zipformer-ru, piper-голос, rubert-tiny2-onnx + кеш эмбеддингов)
 └── logs/
@@ -148,7 +148,7 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 `jarvis/say` {"text","source"} · `jarvis/state` {"state": idle|listening|thinking|speaking}.
 
 **Настройки** = ОДИН файл `settings.yaml` в корне (секции voice/adaptive_audio/hearing/
-recognition/startup/system/models/break_reminders/местоположение/alarms/timers/worldtime/coin/reminders/chains/notifications/silence/restart/environments/live/lamp, русские комментарии к каждому параметру). Код читает ТОЛЬКО через
+recognition/startup/system/models/break_reminders/местоположение/alarms/timers/worldtime/coin/reminders/chains/notifications/silence/restart/environments/live/lamp/phone, русские комментарии к каждому параметру). Код читает ТОЛЬКО через
 `config.py` (единая загрузка: приоритет env `JARVIS_*` → `settings.yaml` → дефолт; отсутствие
 файла/параметра → дефолт, не падает). Менять параметр = править `settings.yaml`, Python не трогать.
 VAD-пороги (0.3/0.8) и анти-эхо в файле помечены ⚠ «настроено опытным путём».
@@ -353,7 +353,18 @@ MQTT/логирование/shutdown — всё в базовом классе.
   doctor `check_lamp`. Скрытая правка: doctor/os_agent игнорируют записи с `лампа` (нет `команда`).
   `jarvis doctor --quick` зелёный (✗0). Сервисов 7. **ПРЕДУСЛОВИЕ:** `pip install -e .` + креды в
   settings.yaml (device_id/local_key/ip/версия) + `jarvis start`.
-- **Возможное будущее (необязательно):** коннект телефона / музыка-доводка / громкость четвертями — отд. ТЗ.
+- **Этап 19 (телефон + полное подключение лампы) — ✅ КОД ГОТОВ (телефон — живая проверка за
+  пользователем через приложение/mosquitto_pub; ЛАМПА ПОДКЛЮЧЕНА И ПРОВЕРЕНА вживую).** (1) ТЕЛЕФОН:
+  новый сервис `jarvis-phone` (PhoneModule) — подписан на `jarvis/phone/*` (status/battery/call/
+  notification/presence), реагирует: входящий звонок → озвучка «вам звонит X» + ducking музыки
+  (AudioEnv) + реакция лампы; низкий заряд → пак с троттлингом (раз в N мин/эпизод); уведомления/SMS →
+  системное уведомление (notify.py); присутствие home → приветствие (на переходе); статус (LWT) →
+  `logs/phone_state.json` для `jarvis live`. `find_phone` голосом → core форвардит поле `телефон` в
+  `jarvis/phone/command`. (2) ЛАМПА: креды вписаны, **версия 3.5** (сверено живьём — не 3.3/3.4!),
+  управление НАПРЯМУЮ ПО DPS (set_multiple_values, nowait=False); добавлены температура (теплее/
+  холоднее) и реакция на звонок. doctor `check_phone`/`check_lamp` (лампа: «на связи 192.168.1.6, v3.5»).
+  `jarvis doctor --quick` зелёный (✗0). Сервисов 8. **ПРЕДУСЛОВИЕ:** `pip install -e .` + `jarvis start`.
+- **Возможное будущее (необязательно):** музыка-доводка / громкость четвертями — отд. ТЗ.
   HUD — киношный визуал поверх готового пульта (веб-стек в прозрачном окне на Wayland, чисто
   визуальный). Только после устойчивой работы.
 
@@ -709,3 +720,19 @@ MQTT/логирование/shutdown — всё в базовом классе.
   «ярче»=экран, а продолжение в контексте лампы «ярче»=лампа. Цвета лампы — отдельные теги
   lamp_color_<цвет>, RGB берётся из карты `lamp.colors` (settings.yaml); нет RGB у лампы → деградация
   на белый/яркость (флаг `_color_ok` сбрасывается при ошибке set_colour).
+- **Лампа: РЕАЛЬНАЯ версия 3.5, управление по DPS, nowait=False (Этап 19 — уточняет Этап 18).** Сверено
+  живьём: лампа (192.168.1.6) отвечает на **v3.5** (на 3.3/3.4 — Err 904/914). Управляем НАПРЯМУЮ ПО DPS
+  (set_multiple_values/set_value), НЕ высокоуровневыми set_colour: DP20 switch, DP21 work_mode
+  (colour/white), DP22 bright(10–1000), DP23 temp(0–1000), DP24 colour_data_v2 (hex h0–360 s0–1000
+  v0–1000). **В режиме colour яркость = V в DP24; DP22 НЕ слать** — собьёт режим в white (поймано
+  живьём). **ВАЖНО `nowait=False`**: на ПЕРСИСТЕНТНОМ сокете nowait=True копит непрочитанные ответы →
+  десинхрон (status читал чужой ответ, «выкл» не отражался) — ждём ответ, воркер сериализует, MQTT не
+  блокируется. HSV-v2 hex: `colorsys.rgb_to_hsv` + `"%04x%04x%04x"%(h*360,s*1000,v*1000)` (jarvis/lamp.py).
+- **Телефон — приём событий MQTT (Этап 19): сервис `jarvis-phone`, топики jarvis/phone/*.** Подписан на
+  status(LWT)/battery/call/notification/presence (JSON, QoS1). Реакции в settings.yaml `phone`: звонок
+  incoming → say {кто=имя|номер} + `AudioEnv.duck()` (restore на ended); заряд isLow и НЕ на зарядке →
+  пак с троттлингом (`battery_repeat_minutes`/эпизод, сбрасывается при isLow=false); уведомление →
+  `notify.notify`; presence home (НА ПЕРЕХОДЕ) → приветствие. Статус → `logs/phone_state.json` (читает
+  `jarvis live`). Команда телефону: `find_phone` в commands.yaml с полем **`телефон: {command}`** (как
+  `лампа`, НЕ shell) → core `_execute_matched`/`_dispatch` форвардят в `jarvis/phone/command`; doctor/
+  os_agent игнорируют записи с `телефон`. Телефон офлайн/битый JSON → штатно (всё в try-except).

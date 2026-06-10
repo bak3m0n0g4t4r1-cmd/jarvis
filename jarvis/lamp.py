@@ -3,9 +3,30 @@
 Чистые функции (только stdlib) — БЕЗ tinytuya/MQTT, легко тестируются. Использует сервис lamp
 (services/lamp.py) и CLI/doctor. Всё в try-except: кривое значение в settings.yaml → None/дефолт.
 """
+import colorsys
 import logging
 
 _log = logging.getLogger("jarvis-lamp")
+
+
+def rgb_to_v2hex(r, g, b, bright_pct=100) -> str:
+    """RGB(0..255) + яркость(%) → colour_data_v2 hex «HHHHSSSSVVVV» (DP24, сверено на лампе v3.5).
+
+    В режиме colour яркость = компонента V (НЕ DP22): берём тон/насыщенность из RGB, V = яркость%."""
+    try:
+        h, s, _ = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+        v = max(10, min(1000, round(float(bright_pct) * 10)))
+        return "%04x%04x%04x" % (round(h * 360), round(s * 1000), v)
+    except Exception:
+        return "000003e803e8"  # запасной — красный полной яркости
+
+
+def pct_to_dp(pct, lo=0) -> int:
+    """Процент (0..100) → шкала Tuya 0..1000 (яркость lo=10, температура lo=0). Кривое → середина."""
+    try:
+        return max(lo, min(1000, round(float(pct) * 10)))
+    except Exception:
+        return 500
 
 
 def _norm(s) -> str:

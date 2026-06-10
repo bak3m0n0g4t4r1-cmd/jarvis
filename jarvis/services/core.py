@@ -209,18 +209,23 @@ class CoreModule(JarvisModule):
         Команды лампы — не shell: у них поле `лампа: {действие,…}` вместо `команда`. Их обрабатывает
         сервис lamp по jarvis/lamp; os_agent их НЕ видит."""
         spec = self._commands.get(tag) or {}
-        lamp_action = spec.get("лампа")
-        if isinstance(lamp_action, dict):
-            self.publish_json(contracts.TOPIC_LAMP, lamp_action, qos=contracts.QOS_LAMP)
+        if isinstance(spec.get("лампа"), dict):
+            self.publish_json(contracts.TOPIC_LAMP, spec["лампа"], qos=contracts.QOS_LAMP)
+        elif isinstance(spec.get("телефон"), dict):
+            self.publish_json(contracts.TOPIC_PHONE_COMMAND, spec["телефон"], qos=contracts.QOS_EXECUTE)
         else:
             self._execute_command(tag)
 
     def _execute_matched(self, tag: str, user_level, set_branch: bool = True) -> None:
-        """Выполнить тег + обновить ветку (опц.) и историю. Озвучка: обычная команда — подтверждение
-        здесь; КОМАНДА ЛАМПЫ — озвучивает сервис lamp (он знает успех/недоступность), core молчит."""
+        """Выполнить тег + обновить ветку (опц.) и историю. Озвучка: обычная команда/телефон —
+        подтверждение здесь; КОМАНДА ЛАМПЫ — озвучивает сервис lamp (знает успех/недоступность)."""
         spec = self._commands.get(tag) or {}
         if isinstance(spec.get("лампа"), dict):
             self.publish_json(contracts.TOPIC_LAMP, spec["лампа"], qos=contracts.QOS_LAMP)
+        elif isinstance(spec.get("телефон"), dict):
+            # Команда телефону (find_phone): подтверждение + публикация в jarvis/phone/command.
+            self._say(self._matcher.confirmation(tag), user_level)
+            self.publish_json(contracts.TOPIC_PHONE_COMMAND, spec["телефон"], qos=contracts.QOS_EXECUTE)
         else:
             self._say(self._matcher.confirmation(tag), user_level)
             self._execute_command(tag)

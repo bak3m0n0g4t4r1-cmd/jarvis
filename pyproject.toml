@@ -34,6 +34,7 @@ jarvis-tts = "jarvis.services.tts:main"
 jarvis-activity-monitor = "jarvis.services.activity_monitor:main"
 jarvis-scheduler = "jarvis.services.scheduler:main"
 jarvis-lamp = "jarvis.services.lamp:main"
+jarvis-phone = "jarvis.services.phone:main"
 
 [tool.setuptools.packages.find]
 include = ["jarvis*"]

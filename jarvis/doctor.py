@@ -304,8 +304,8 @@ def check_commands_yaml() -> list[CheckResult]:
         # Служебные top-level ключи (ветки/обратимость, ТЗ-5) — НЕ команды, пропускаем.
         if tag in _RESERVED_KEYS:
             continue
-        # Команды лампы (ТЗ-8) — НЕ shell: поле «лампа» вместо «команда» (исполняет сервис jarvis-lamp).
-        if isinstance((spec or {}).get("лампа"), dict):
+        # Команды лампы (ТЗ-8) / телефона (ТЗ-9) — НЕ shell: поле «лампа»/«телефон» вместо «команда».
+        if isinstance((spec or {}).get("лампа"), dict) or isinstance((spec or {}).get("телефон"), dict):
             continue
         args = (spec or {}).get("команда")
         if not isinstance(args, list) or not args:
@@ -1429,6 +1429,36 @@ def check_lamp() -> list[CheckResult]:
     return results
 
 
+def check_phone() -> list[CheckResult]:
+    """Телефон (ТЗ-9): статус из logs/phone_state.json (его пишет сервис phone по событиям приложения).
+    Нет данных/офлайн → WARN (телефон может быть выключен/приложение не запущено), не FAIL."""
+    if not config.PHONE_ENABLED:
+        return [CheckResult(OK, "телефон выключен (phone.enabled=false)")]
+    import json as _json
+    import os as _os
+
+    path = _os.path.join(str(config.LOGS_DIR), "phone_state.json")
+    if not _os.path.exists(path):
+        return [CheckResult(
+            WARN, "телефон: событий не было",
+            reason="приложение «Спутник» ещё ничего не присылало (телефон офлайн / приложение не запущено).",
+            fix="запустите приложение на телефоне; проверьте подключение к брокеру Mosquitto")]
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = _json.load(f)
+        if st.get("status") == "online":
+            extra = []
+            if st.get("battery") is not None:
+                extra.append(f"заряд {st['battery']}%")
+            if st.get("presence"):
+                extra.append("дома" if st["presence"] == "home" else "не дома")
+            return [CheckResult(OK, "телефон: на связи" + (f" ({', '.join(extra)})" if extra else ""))]
+        return [CheckResult(WARN, "телефон: офлайн", reason="последний статус — offline.",
+                            fix="запустите приложение «Спутник» на телефоне")]
+    except Exception as exc:
+        return [CheckResult(WARN, "телефон: состояние", reason=str(exc))]
+
+
 def check_chains() -> list[CheckResult]:
     """Цепочки (ТЗ-5): ветки продолжений валидны, обратимость валидна, фильтр/комбо-split/гейты живы."""
     results = []
@@ -1693,6 +1723,7 @@ def run(quick: bool = False) -> bool:
     _safe(reporter, check_notifications)
     _safe(reporter, check_system)
     _safe(reporter, check_lamp)
+    _safe(reporter, check_phone)
 
     reporter.section("Слой 4. Модели и распознавание")
     reporter.note("загружаю модели движком…")

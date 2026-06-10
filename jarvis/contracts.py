@@ -20,6 +20,13 @@ TOPIC_STATE = "jarvis/state"      # {"state": "...", "source": "..."}
 TOPIC_ENVIRONMENT = "jarvis/environment"  # {"desktop": "имя стола", "apps": ["тег", ...]} (ТЗ-7)
 TOPIC_LAMP = "jarvis/lamp"        # {"действие": {...}} — голос-команда лампе (ТЗ-8); core форвардит
 #                                 # поле «лампа» распознанной команды (вкл/выкл/цвет/яркость/авто).
+# --- Телефон «Спутник Джарвиса» (ТЗ-9): приложение → Джарвис (JSON, QoS1) ---
+TOPIC_PHONE_STATUS = "jarvis/phone/status"            # {"status":"online|offline"} (LWT)
+TOPIC_PHONE_BATTERY = "jarvis/phone/battery"          # {"level":82,"isCharging":bool,"isLow":bool}
+TOPIC_PHONE_CALL = "jarvis/phone/call"                # {"type":"incoming|started|ended","number","name"}
+TOPIC_PHONE_NOTIFICATION = "jarvis/phone/notification"  # {"appCode","appName","title","content"}
+TOPIC_PHONE_PRESENCE = "jarvis/phone/presence"        # {"status":"home|away","ssid"}
+TOPIC_PHONE_COMMAND = "jarvis/phone/command"          # Джарвис → телефон: {"command":"find_phone"}
 #                                 # core резолвит «рабочую среду» → os_agent создаёт вирт. стол и
 #                                 # запускает приложения по тегам (как execute, но + новый стол KDE).
 

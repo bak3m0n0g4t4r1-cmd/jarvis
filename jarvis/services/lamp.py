@@ -41,6 +41,8 @@ class LampModule(JarvisModule):
         self._bg_on = bool(bg.get("вкл", True))
         self._bg_rgb = helpers.resolve_color(bg.get("цвет"), config.LAMP_COLORS) or _DEFAULT_RGB
         self._bg_bright = helpers.clamp_pct(bg.get("яркость"), 60)
+        self._bg_mode = "colour"               # 'colour' (rgb) | 'white' (яркость+температура)
+        self._bg_temp = 40                      # температура белого (% — 0 тёплый, 100 холодный)
 
     # ------------------------------------------------------------------ #
     # Жизненный цикл
@@ -54,6 +56,7 @@ class LampModule(JarvisModule):
         self.subscribe(contracts.TOPIC_STATE, self.on_state)   # озвучка (speaking/idle)
         self.subscribe(contracts.TOPIC_SAY, self.on_say)       # срабатывания (min_volume)
         self.subscribe(contracts.TOPIC_LAMP, self.on_lamp)     # голос-команды лампой
+        self.subscribe(contracts.TOPIC_PHONE_CALL, self.on_call)  # реакция на входящий звонок (ТЗ-9)
         # Подключение в фоне — не задерживаем старт сервиса.
         threading.Thread(target=self._connect_and_init, daemon=True, name="lamp-connect").start()
 
@@ -167,40 +170,52 @@ class LampModule(JarvisModule):
         self._schedule_reconnect()
 
     # ------------------------------------------------------------------ #
-    # Низкоуровневые операции (выполняются в воркере, под lamp_lock)
+    # Низкоуровневые операции — НАПРЯМУЮ ПО DPS (сверено на лампе v3.5; см. CLAUDE.md/ГРАБЛИ)
+    # DP20 switch · DP21 work_mode(colour/white) · DP22 bright(10–1000) · DP23 temp(0–1000) ·
+    # DP24 colour_data_v2 (HSV-hex). В режиме colour яркость = V в DP24 (DP22 НЕ слать — собьёт в white).
     # ------------------------------------------------------------------ #
-    def _set_color(self, rgb, brightness):
+    def _dps(self, data: dict):
+        """Атомарно записать DPS (set_multiple_values). nowait=False: на ПЕРСИСТЕНТНОМ сокете ждём
+        ответ — иначе непрочитанные reply копятся и десинхронят сокет (сверено: status читал чужой
+        ответ, «выкл» не отражался). Воркер сериализует, MQTT не блокируется. Ошибка → реконнект."""
         if not self._connected or self._bulb is None:
             return
         with self._lamp_lock:
-            b = self._bulb
-            b.turn_on(nowait=True)
-            if rgb and self._color_ok:
-                try:
-                    b.set_colour(int(rgb[0]), int(rgb[1]), int(rgb[2]), nowait=True)
-                except Exception:
-                    self._color_ok = False
-                    self.log.info("Лампа без RGB? — перехожу на белый/яркость")
-            b.set_brightness_percentage(helpers.clamp_pct(brightness, 60), nowait=True)
+            self._bulb.set_multiple_values(data, nowait=False)
+
+    def _set_color(self, rgb, brightness):
+        """Цвет (режим colour): тон/насыщенность из RGB, яркость — в V компоненте DP24 (без DP22)."""
+        rgb = rgb or self._bg_rgb
+        self._dps({20: True, 21: "colour",
+                   24: helpers.rgb_to_v2hex(rgb[0], rgb[1], rgb[2], helpers.clamp_pct(brightness, 60))})
+
+    def _set_white(self, brightness, temp_pct):
+        """Белый (режим white): яркость DP22 + температура DP23 (0 тёплый ↔ 1000 холодный)."""
+        self._dps({20: True, 21: "white",
+                   22: helpers.pct_to_dp(helpers.clamp_pct(brightness, 60), lo=10),
+                   23: helpers.pct_to_dp(temp_pct, lo=0)})
 
     def _set_brightness(self, brightness):
-        if not self._connected or self._bulb is None:
-            return
-        with self._lamp_lock:
-            self._bulb.set_brightness_percentage(helpers.clamp_pct(brightness, 60), nowait=True)
+        """Изменить яркость в ТЕКУЩЕМ режиме (colour → перекодировать V; white → DP22)."""
+        if self._bg_mode == "white":
+            self._dps({20: True, 22: helpers.pct_to_dp(helpers.clamp_pct(brightness, 60), lo=10)})
+        else:
+            self._set_color(self._bg_rgb, brightness)
 
     def _turn_off(self):
         if not self._connected or self._bulb is None:
             return
         with self._lamp_lock:
-            self._bulb.turn_off(nowait=True)
+            self._bulb.set_value(20, False, nowait=False)
 
     def _apply_background(self):
-        """Вернуть лампу в фоновое (желаемое) состояние."""
-        if self._bg_on:
-            self._set_color(self._bg_rgb, self._bg_bright)
-        else:
+        """Вернуть лампу в фоновое (желаемое) состояние (по запомненному режиму)."""
+        if not self._bg_on:
             self._turn_off()
+        elif self._bg_mode == "white":
+            self._set_white(self._bg_bright, self._bg_temp)
+        else:
+            self._set_color(self._bg_rgb, self._bg_bright)
 
     def _ramp(self, frm, to, steps=4, dt=0.12):
         """Плавный переход яркости (для паттерна «пульс»)."""
@@ -282,6 +297,7 @@ class LampModule(JarvisModule):
             "вкл": ("lamp.on", config.LAMP_ON_ACK), "выкл": ("lamp.off", config.LAMP_OFF_ACK),
             "цвет": ("lamp.color", config.LAMP_COLOR_ACK),
             "ярче": ("lamp.bright", config.LAMP_BRIGHT_ACK), "темнее": ("lamp.bright", config.LAMP_BRIGHT_ACK),
+            "тепло": ("lamp.temp", config.LAMP_TEMP_ACK), "холод": ("lamp.temp", config.LAMP_TEMP_ACK),
             "авто": ("lamp.auto", config.LAMP_AUTO_ACK),
         }
         key_pack = packs.get(action)
@@ -312,6 +328,7 @@ class LampModule(JarvisModule):
                 rgb = helpers.resolve_color(payload.get("цвет"), config.LAMP_COLORS)
                 if rgb:
                     self._bg_rgb = rgb
+                    self._bg_mode = "colour"
                     self._bg_on = True
                     self._enqueue(self._apply_background)
             elif action == "ярче":
@@ -320,6 +337,14 @@ class LampModule(JarvisModule):
                 self._enqueue(self._apply_background)
             elif action == "темнее":
                 self._bg_bright = max(5, self._bg_bright - int(config.LAMP_BRIGHTNESS_STEP))
+                self._enqueue(self._apply_background)
+            elif action in ("тепло", "холод"):
+                # Белый режим: тёплый = меньше DP23, холодный = больше. Шаг temp_step (%).
+                step = int(config.LAMP_TEMP_STEP)
+                self._bg_temp = (max(0, self._bg_temp - step) if action == "тепло"
+                                 else min(100, self._bg_temp + step))
+                self._bg_mode = "white"
+                self._bg_on = True
                 self._enqueue(self._apply_background)
             elif action == "авто":
                 self._reset_background()
@@ -330,11 +355,25 @@ class LampModule(JarvisModule):
         except Exception:
             self.log.debug("Сбой обработки команды лампы", exc_info=True)
 
+    def on_call(self, payload: dict):
+        """Реакция лампы на ВХОДЯЩИЙ звонок (ТЗ-9): incoming → реакция call (приоритет), затем фон."""
+        try:
+            if (payload or {}).get("type") != "incoming":
+                return
+            spec = helpers.reaction("call", config.LAMP_REACTIONS, config.LAMP_COLORS)
+            if spec:
+                self._cancel_restore()
+                self._enqueue(lambda: self._do_reaction(spec))
+        except Exception:
+            self.log.debug("Сбой реакции на звонок", exc_info=True)
+
     def _reset_background(self):
         bg = config.LAMP_BACKGROUND or {}
         self._bg_on = bool(bg.get("вкл", True))
         self._bg_rgb = helpers.resolve_color(bg.get("цвет"), config.LAMP_COLORS) or _DEFAULT_RGB
         self._bg_bright = helpers.clamp_pct(bg.get("яркость"), 60)
+        self._bg_mode = "colour"
+        self._bg_temp = 40
 
     # --- debounce возврата в фон после речи ---
     def _schedule_restore(self):

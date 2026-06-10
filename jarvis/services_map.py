@@ -57,4 +57,10 @@ SERVICES = [
         "«Свет» — умная лампа Tuya (локально) + реакции на события",
         needs_audio=False,
     ),
+    ServiceDef(
+        "phone", "jarvis-phone.service", "jarvis-phone",
+        "jarvis.services.phone", "PhoneModule",
+        "«Спутник» — приём событий телефона (звонки/заряд/уведомления/присутствие)",
+        needs_audio=False,
+    ),
 ]

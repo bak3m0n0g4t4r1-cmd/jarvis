@@ -181,6 +181,34 @@ def _schedule_lines(now: datetime, horizon_hours: int):
     return lines or ["  (пусто на ближайшие 3 дня)"]
 
 
+def _phone_lines():
+    """Состояние телефона из logs/phone_state.json (его пишет сервис phone). Нет файла → офлайн."""
+    import os
+
+    path = os.path.join(str(config.LOGS_DIR), "phone_state.json")
+    try:
+        if not os.path.exists(path):
+            return ["  (телефон не подключён)"]
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+    except Exception:
+        return ["  (состояние недоступно)"]
+    lines = []
+    try:
+        status = st.get("status", "offline")
+        lines.append(f"  статус: {'🟢 на связи' if status == 'online' else '⚪ офлайн'}")
+        bat = st.get("battery")
+        if isinstance(bat, (int, float)):
+            chrg = " (заряжается)" if st.get("charging") else ""
+            lines.append(f"  заряд: {bat}%{chrg}")
+        pres = st.get("presence")
+        if pres:
+            lines.append(f"  присутствие: {'дома' if pres == 'home' else 'нет дома'}")
+    except Exception:
+        pass
+    return lines or ["  (нет данных)"]
+
+
 def _break_lines(now: datetime):
     """Состояние детектора перерывов из logs/activity_state.json (его пишет activity_monitor)."""
     import os
@@ -271,6 +299,7 @@ def _render(state: _State):
         Panel(svc, title="Сервисы", border_style="blue"),
         Panel(sched, title="Расписание · 3 дня", border_style="magenta"),
         Panel(brk, title="Перерыв", border_style="green"),
+        Panel(Text("\n".join(_phone_lines())), title="Телефон", border_style="yellow"),
         Panel(mode, title="Режим", border_style="white"),
     )
 
