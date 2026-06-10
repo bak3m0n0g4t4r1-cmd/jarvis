@@ -215,6 +215,76 @@ def cmd_stop(args) -> int:
     return 0 if rc == 0 else 1
 
 
+def _announce_restart(ok: bool) -> None:
+    """Озвучить результат перезагрузки (успех/проблема) паком + системное уведомление.
+
+    Голос идёт через jarvis/say (TTS сам решит: в тишине — в уведомление). Плюс ЯВНОЕ уведомление
+    (видно всегда). Всё в try-except: сбой объявления не влияет на код возврата."""
+    import json
+    import time
+
+    from jarvis import contracts, notify, phrases
+
+    pack = config.RESTART_SUCCESS if ok else config.RESTART_PROBLEM
+    text = phrases.pick("restart.success" if ok else "restart.problem", pack)
+    try:
+        notify.notify("Джарвис",
+                      "Перезагрузка завершена." if ok else "Перезагрузка прошла с проблемами.",
+                      urgency="normal" if ok else "critical")
+    except Exception:
+        pass
+    if not text:
+        return
+    import paho.mqtt.client as mqtt
+
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="jarvis-restart-announce")
+    client.connect(config.MQTT_HOST, config.MQTT_PORT, 5)
+    client.loop_start()
+    try:
+        client.publish(contracts.TOPIC_SAY,
+                       json.dumps({"text": text, "source": "restart"}),
+                       qos=contracts.QOS_SAY)
+        time.sleep(1.0)
+    finally:
+        client.loop_stop()
+        client.disconnect()
+    print(f"✓ Перезагрузка объявлена ({'успех' if ok else 'проблема'}): {text}")
+
+
+def cmd_restart(args) -> int:
+    """Перезапуск ВСЕХ сервисов Джарвиса (НЕ ребут ноута) + статус-объявление.
+
+    Голосовой путь запускает эту команду ОТКРЕПЛЁННО (systemd-run --user, своя cgroup), чтобы она
+    пережила рестарт jarvis-core. Начальная пауза — дать анонсу core доиграть, пока TTS ещё жив."""
+    import time
+
+    try:
+        time.sleep(max(0.0, float(config.RESTART_INITIAL_DELAY)))
+    except Exception:
+        pass
+    print("Перезагрузка сервисов Джарвиса…")
+    rc = 0
+    for svc in SERVICES:
+        rc |= _systemctl("restart", svc.unit)
+    ok = False
+    try:
+        ok = _settle_and_status()
+    except Exception:
+        ok = False
+    try:
+        _announce_restart(ok and rc == 0)
+    except Exception as exc:
+        print(f"(объявление перезагрузки пропущено: {exc})")
+    return 0 if (rc == 0 and ok) else 1
+
+
+def cmd_live(args) -> int:
+    """Живая панель состояния (jarvis live) — перерисовывается до Ctrl+C."""
+    from jarvis import live
+
+    return live.run()
+
+
 def cmd_status(args) -> int:
     return _systemctl("--no-pager", "status", *[svc.unit for svc in SERVICES])
 
@@ -247,6 +317,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("start", help="установить юниты и запустить сервисы").set_defaults(func=cmd_start)
     sub.add_parser("stop", help="остановить и отключить сервисы").set_defaults(func=cmd_stop)
     sub.add_parser("status", help="статус сервисов").set_defaults(func=cmd_status)
+    sub.add_parser("restart", help="перезапустить все сервисы Джарвиса + объявить статус").set_defaults(func=cmd_restart)
+    sub.add_parser("live", help="живая панель состояния (до Ctrl+C)").set_defaults(func=cmd_live)
 
     return parser
 

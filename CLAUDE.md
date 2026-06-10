@@ -133,6 +133,8 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 │   ├── chains.py             # цепочки: ветки продолжений + комбо-split + обратимость + история + гейты
 │   ├── silence.py            # режим тишины: гейт «без звука»/«включи звук» + состояние-файл (персист)
 │   ├── notify.py             # системные уведомления (D-Bus/gdbus) + кнопка-действие «Открыть логи»
+│   ├── system.py             # системные голос-команды: гейт перезагрузки + парсер рабочих сред
+│   ├── live.py               # живая панель `jarvis live` (rich.live: эфир/сервисы/расписание/перерыв)
 │   ├── weather.py            # погода Open-Meteo (геокодинг кириллицей + кэш, best-effort, таймаут)
 │   ├── cli.py, doctor.py, downloader.py, ui.py, services_map.py
 │   └── services/             # stt.py, core.py, os_agent.py, tts.py, activity_monitor.py, scheduler.py — наследники JarvisModule, main()
@@ -145,7 +147,7 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 `jarvis/say` {"text","source"} · `jarvis/state` {"state": idle|listening|thinking|speaking}.
 
 **Настройки** = ОДИН файл `settings.yaml` в корне (секции voice/adaptive_audio/hearing/
-recognition/startup/system/models/break_reminders/местоположение/alarms/timers/worldtime/coin/reminders/chains/notifications/silence, русские комментарии к каждому параметру). Код читает ТОЛЬКО через
+recognition/startup/system/models/break_reminders/местоположение/alarms/timers/worldtime/coin/reminders/chains/notifications/silence/restart/environments/live, русские комментарии к каждому параметру). Код читает ТОЛЬКО через
 `config.py` (единая загрузка: приоритет env `JARVIS_*` → `settings.yaml` → дефолт; отсутствие
 файла/параметра → дефолт, не падает). Менять параметр = править `settings.yaml`, Python не трогать.
 VAD-пороги (0.3/0.8) и анти-эхо в файле помечены ⚠ «настроено опытным путём».
@@ -324,7 +326,21 @@ MQTT/логирование/shutdown — всё в базовом классе.
   процессов = «Руки»; whitelist юнитов) → `kitty -e journalctl --user -u <unit>`. «без звука»/«беззвучный
   режим» перенесены из volume_mute, «включи звук» — из volume_unmute (в silence). doctor
   `check_notifications`. `jarvis doctor --quick` зелёный (✗0). Сервисов 6 (без новых).
-- **Возможное будущее (необязательно):** системное (перезагрузка, jarvis live, среды) — отдельное ТЗ.
+- **Этап 17 (системное: перезагрузка / jarvis live / рабочие среды / плавная остановка) — ✅ КОД ГОТОВ
+  (живая проверка за пользователем).** Новые `jarvis/system.py` (гейты) + `jarvis/live.py` (панель).
+  (1) ГОЛОСОВАЯ ПЕРЕЗАГРУЗКА (только wake): «перезагрузись» → анонс-пак + уведомление + ОТКРЕПЛЁННЫЙ
+  `jarvis restart` (через `systemd-run --user` — своя cgroup, переживает рестарт core); `jarvis restart`
+  ждёт осадки (`_settle_and_status`) и объявляет статус (success/problem пак + уведомление). НЕ ребут
+  ноута. (2) `jarvis live` (rich.live, `screen=True` — чистый Ctrl+C): эфир (фразы из jarvis/input +
+  state), сервисы (6 юнитов is-active, кэш), расписание на 3 дня (`alarms.read_schedule`), перерыв (из
+  `logs/activity_state.json`, его пишет activity_monitor), режим (тишина/громкость). (3) РАБОЧИЕ СРЕДЫ:
+  «открой новую среду с Gemini и музыкой» → `system.resolve_environment` (именованные из settings +
+  из речи через `chains.split_combo`+matcher) → core publish `jarvis/environment` → os_agent
+  `createDesktop`+`setCurrentDesktop` (KWin qdbus6) + запуск тегов (Wayland: окна на текущем=новом
+  столе — честный предел). (4) graceful shutdown — bus.py крепкий, аудит пройден. doctor `check_system`.
+  Скрытая ошибка: `config._cast` не умел dict (строковал ENVIRONMENTS) — починено. `jarvis doctor
+  --quick` зелёный (✗0). Сервисов 6 (без новых).
+- **Возможное будущее (необязательно):** коннект телефона / музыка-доводка / громкость четвертями — отд. ТЗ.
   HUD — киношный визуал поверх готового пульта (веб-стек в прозрачном окне на Wayland, чисто
   визуальный). Только после устойчивой работы.
 
@@ -351,6 +367,9 @@ MQTT/логирование/shutdown — всё в базовом классе.
 ## КОМАНДЫ ПРОЕКТА
 
 - `jarvis start` — поднять/перезапустить сервисы (делает restart).
+- `jarvis restart` — перезапустить все сервисы + объявить статус голосом/уведомлением (ТЗ-7;
+  голосовой путь зовёт её откреплённо через systemd-run, чтобы пережить рестарт core).
+- `jarvis live` — живая панель состояния (rich.live, до Ctrl+C): эфир/сервисы/расписание/перерыв/режим.
 - `jarvis status` — статус юнитов.
 - `jarvis doctor` (`--quick` — без синтеза/цепочки) — диагностика: импорты, версии,
   пути, железо, MQTT round-trip, модели STT/TTS, эмбеддер (грузится + осмыслен),
@@ -631,3 +650,27 @@ MQTT/логирование/shutdown — всё в базовом классе.
   игре → тоже 'fail' («поток не открылся»). Результат кэшируется `AUDIO_CHECK_TTL` (~1.5с) — не дёргать
   wpctl на каждую фразу. В обоих сбойных случаях фраза ДУБЛИРУЕТСЯ в уведомление с пометкой ПРИЧИНЫ
   (две РАЗНЫЕ). Критическое при сломанном звуке тоже дублируется (fallback, иначе не услышит).
+- **Перезагрузка должна ПЕРЕЖИТЬ рестарт core (Этап 17): `systemd-run --user`, не setsid.** `jarvis
+  restart` рестартует и САМ jarvis-core — если запустить её просто Popen/setsid из core, она в cgroup
+  jarvis-core.service и `systemctl restart` её УБЬЁТ на полпути. Решение: core зовёт `systemd-run --user
+  --collect --quiet <venv>/jarvis restart` → отдельный transient-юнit (своя cgroup) → переживает. Фолбэк
+  `setsid -f` (если нет systemd-run). Путь к jarvis — `sys.prefix/bin/jarvis` (под systemd PATH без venv).
+  Анонс говорит core ДО запуска (TTS ещё жив); `jarvis restart` ждёт `RESTART_INITIAL_DELAY` и объявляет
+  статус разовым MQTT-клиентом (как `_announce_startup`). Гейт `system.is_restart_command` — рефлексивные
+  «-сь» формы (подстрока): не ловит «перезагрузи браузер». ТОЛЬКО на wake-пути (`_process_wake`).
+- **Рабочие среды — KWin createDesktop + switch, окна на Wayland на ТЕКУЩЕМ столе (Этап 17).** os_agent
+  по `jarvis/environment`: `qdbus6 org.kde.KWin /VirtualDesktopManager …count` → `createDesktop(count,
+  name)` → `/KWin setCurrentDesktop(count+1)` → запуск тегов с паузой `ENV_LAUNCH_DELAY`. Разместить окно
+  на КОНКРЕТНОМ столе на Wayland нельзя → создаём+переключаемся, приложения открываются на новом (честный
+  предел; некоторые окна с «помнить стол» уйдут к себе). Сбой qdbus6/KWin → None, приложения на текущем
+  (мягкая деградация). `desktops` property — тип `a(uss)` (qdbus6 без --literal не печатает) → берём id
+  стола из `current` после переключения. core резолвит (`system.resolve_environment`), исполняет os_agent
+  (создание стола = «Руки»). Триггеры сред в config БЕЗ «рабочий стол» (коллизия с desktop_next).
+- **`jarvis live` — rich.live `screen=True` (Этап 17): альтернативный буфер → чистый Ctrl+C.** Панель в
+  alt-screen, при выходе терминал восстанавливается (не «битый»). Ctrl+C=SIGINT→KeyboardInterrupt→выход;
+  MQTT закрывается в finally. Перерыв — из `logs/activity_state.json` (activity_monitor пишет throttle
+  ~10с: working_seconds/until_offer_seconds/on_break); расписание — `alarms.read_schedule` (фильтр ≤72ч).
+  Статус юнитов кэш `LIVE_STATUS_TTL`. `rich` есть (textual НЕТ — не нужен).
+- **`config._cast` не умел dict (Этап 17, скрытая ошибка).** Для dict-дефолта (напр. `environments.named`)
+  `_cast` уходил в `str(value)` → строковал словарь → `.items()` падал (ловился try → пустой резолв).
+  Добавлен pass-through `isinstance(default, dict)`. Новые dict-параметры теперь корректны.

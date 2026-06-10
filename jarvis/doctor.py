@@ -1326,6 +1326,62 @@ def check_notifications() -> list[CheckResult]:
     return results
 
 
+def check_system() -> list[CheckResult]:
+    """Системное (ТЗ-7): rich для панели, systemd-run для рестарта, KWin DBus для сред, валидность
+    именованных сред. Не KDE-сессия / нет инструмента → WARN (фича недоступна), не FAIL."""
+    import shutil as _sh
+    import subprocess as _sp
+
+    results = []
+    try:
+        import rich  # noqa: F401
+        results.append(CheckResult(OK, "live-панель: rich установлен (`jarvis live`)"))
+    except Exception:
+        results.append(CheckResult(WARN, "live-панель: rich не установлен",
+                                   reason="`jarvis live` недоступен.", fix="pip install rich"))
+    if _sh.which("systemd-run"):
+        results.append(CheckResult(OK, "перезагрузка: systemd-run --user есть (откреплённый рестарт)"))
+    else:
+        results.append(CheckResult(WARN, "перезагрузка: systemd-run не найден",
+                                   reason="рестарт пойдёт через setsid-фолбэк (может не пережить рестарт core).",
+                                   fix="обычно есть в systemd; проверьте окружение"))
+    if _sh.which("qdbus6"):
+        try:
+            r = _sp.run(["qdbus6", "org.kde.KWin", "/VirtualDesktopManager",
+                         "org.kde.KWin.VirtualDesktopManager.count"],
+                        capture_output=True, text=True, timeout=3)
+            if r.returncode == 0 and r.stdout.strip().isdigit():
+                results.append(CheckResult(
+                    OK, f"рабочие среды: KWin DBus отвечает (виртуальных столов {r.stdout.strip()})"))
+            else:
+                results.append(CheckResult(WARN, "рабочие среды: KWin DBus не отвечает",
+                                           reason="создание виртуальных столов недоступно (не KDE-сессия?)."))
+        except Exception as exc:
+            results.append(CheckResult(WARN, "рабочие среды: проба KWin", reason=str(exc)))
+    else:
+        results.append(CheckResult(WARN, "рабочие среды: qdbus6 не найден",
+                                   reason="виртуальные столы KDE недоступны.", fix="sudo apt install qt6-tools"))
+    try:
+        import yaml as _yaml
+        with open(config.COMMANDS_FILE, encoding="utf-8") as f:
+            cmds = _yaml.safe_load(f) or {}
+        bad = []
+        for name, spec in (config.ENVIRONMENTS or {}).items():
+            for tag in ((spec or {}).get("apps") or []):
+                if not isinstance(cmds.get(tag), dict):
+                    bad.append(f"{name}:{tag}")
+        if bad:
+            results.append(CheckResult(FAIL, "рабочие среды: неизвестные теги приложений",
+                                       reason=", ".join(bad[:6]),
+                                       fix="поправьте environments.named в settings.yaml"))
+        else:
+            results.append(CheckResult(
+                OK, f"рабочие среды: {len(config.ENVIRONMENTS)} именованных, теги приложений валидны"))
+    except Exception as exc:
+        results.append(CheckResult(WARN, "рабочие среды: проверка тегов", reason=str(exc)))
+    return results
+
+
 def check_chains() -> list[CheckResult]:
     """Цепочки (ТЗ-5): ветки продолжений валидны, обратимость валидна, фильтр/комбо-split/гейты живы."""
     results = []
@@ -1588,6 +1644,7 @@ def run(quick: bool = False) -> bool:
     _safe(reporter, check_brightness)
     _safe(reporter, check_push_to_talk)
     _safe(reporter, check_notifications)
+    _safe(reporter, check_system)
 
     reporter.section("Слой 4. Модели и распознавание")
     reporter.note("загружаю модели движком…")

@@ -242,12 +242,38 @@ class ActivityMonitorModule(JarvisModule):
         # wait() вернёт True при остановке — тик не задерживает выход.
         while not self._stop_event.wait(config.BREAK_TICK):
             try:
-                if not self._have_devices:
+                if self._have_devices:
+                    self._tick()
+                else:
                     self._tick_no_devices()
-                    continue
-                self._tick()
+                self._write_activity_state()  # снимок для панели jarvis live (throttled)
             except Exception:
                 self.log_exc(logging.ERROR, "Сбой тика логики напоминаний — продолжаю")
+
+    def _write_activity_state(self):
+        """Снимок состояния для панели `jarvis live` (logs/activity_state.json). Best-effort, не чаще
+        раза в 10с. Поля: работает (с), до напоминания о перерыве (с), идёт ли перерыв."""
+        try:
+            now = time.monotonic()
+            if now - getattr(self, "_state_written_at", 0.0) < 10.0:
+                return
+            self._state_written_at = now
+            import json
+            from datetime import datetime
+            data = {
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "working_seconds": round(self._accumulated),
+                "until_offer_seconds": round(max(0.0, self._cycle_target - self._accumulated)),
+                "on_break": bool(self._idle_episode_active),
+                "state": str(self._state),
+            }
+            path = config.LOGS_DIR / "activity_state.json"
+            tmp = str(path) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:
+            self.log.debug("Не удалось записать activity_state", exc_info=True)
 
     def _tick_no_devices(self):
         # Нет доступа к устройствам ввода → НЕ выполняем автомат (иначе idle «растёт вечно» →

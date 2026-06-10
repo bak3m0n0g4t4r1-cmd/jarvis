@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +18,11 @@ import yaml
 
 from jarvis import config, contracts, notify, services_map
 from jarvis.bus import JarvisModule
+
+# KWin (Wayland) виртуальные столы: создание/переключение через qdbus6 (сверено на KDE 6.5).
+_KWIN = ["qdbus6", "org.kde.KWin"]
+_VDM = "/VirtualDesktopManager"
+_VDM_IFACE = "org.kde.KWin.VirtualDesktopManager"
 
 # Парсер сигнала ActionInvoked из `gdbus monitor`: «… ActionInvoked (uint32 50, 'logs:jarvis-tts')».
 _ACTION_RE = re.compile(r"ActionInvoked \(uint32 \d+, '([^']*)'\)")
@@ -39,6 +45,7 @@ class OsAgentModule(JarvisModule):
     def on_start(self):
         self._load_commands()
         self.subscribe(contracts.TOPIC_EXECUTE, self.on_execute)
+        self.subscribe(contracts.TOPIC_ENVIRONMENT, self.on_environment)  # рабочие среды (ТЗ-7)
         # Слушатель кнопки уведомлений (ActionInvoked → открыть лог модуля в kitty).
         if shutil.which("gdbus") and shutil.which("kitty"):
             self._notif_thread = threading.Thread(
@@ -115,6 +122,54 @@ class OsAgentModule(JarvisModule):
             return
         wait_output = bool(spec.get("ждать_вывод", False))
         self._run(tag, [str(a) for a in args], wait_output)
+
+    def on_environment(self, payload: dict):
+        """Рабочая среда (ТЗ-7): создать новый вирт. стол KDE, переключиться, запустить приложения.
+
+        Wayland: окна открываются на ТЕКУЩЕМ столе → создаём стол, переключаемся, ЗАТЕМ запускаем
+        приложения (с паузами). Приложения — по тегам из своей карты команд (не произвольный shell).
+        Частичный сбой (нет приложения / стол не создался) → запускаем что можно, не падаем."""
+        try:
+            desktop = (payload.get("desktop") or config.ENV_DESKTOP_PREFIX).strip()
+            apps = [a for a in (payload.get("apps") or []) if a in self._commands]
+            if not apps:
+                self.log.info("Среда «%s»: нет валидных приложений в %r", desktop, payload.get("apps"))
+                self.say("Сэр, в этой среде нечего открывать.")
+                return
+            created = self._kwin_new_desktop(desktop)
+            self.log.info("Среда «%s»: стол %s, приложения %s", desktop, created or "(текущий)", apps)
+            failed = []
+            for tag in apps:
+                spec = self._commands.get(tag) or {}
+                args = spec.get("команда")
+                if not isinstance(args, list) or not args:
+                    failed.append(tag)
+                    continue
+                self._run(tag, [str(a) for a in args], bool(spec.get("ждать_вывод", False)))
+                time.sleep(max(0.0, float(config.ENV_LAUNCH_DELAY)))  # дать окну открыться на новом столе
+            if failed:
+                self.log.warning("Среда «%s»: не запущены %s", desktop, failed)
+        except Exception:
+            self.log_exc(logging.WARNING, "Сбой открытия рабочей среды")
+
+    def _kwin_new_desktop(self, name: str):
+        """Создать виртуальный стол KDE (qdbus6) и переключиться на него. Возвращает индекс или None.
+
+        Сбой (нет qdbus6/KWin) → None: приложения откроются на ТЕКУЩЕМ столе (мягкая деградация)."""
+        try:
+            cnt = subprocess.run(_KWIN + [_VDM, f"{_VDM_IFACE}.count"],
+                                 capture_output=True, text=True, timeout=3)
+            n = int((cnt.stdout or "").strip())
+            subprocess.run(_KWIN + [_VDM, f"{_VDM_IFACE}.createDesktop", str(n), str(name)],
+                           capture_output=True, timeout=3)
+            time.sleep(0.3)
+            subprocess.run(_KWIN + ["/KWin", "org.kde.KWin.setCurrentDesktop", str(n + 1)],
+                           capture_output=True, timeout=3)
+            return n + 1
+        except Exception:
+            self.log_exc(logging.WARNING,
+                         "Не удалось создать виртуальный стол — открою на текущем")
+            return None
 
     def _run(self, tag: str, args: list, wait_output: bool):
         try:

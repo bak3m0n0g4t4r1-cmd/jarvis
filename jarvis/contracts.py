@@ -17,12 +17,16 @@ TOPIC_SAY = "jarvis/say"          # {"text","source","user_level"?,"min_volume"?
 #                                 # critical — срабатывание (будильник/таймер/напоминание): ОЗВУЧИТЬ даже в
 #                                 #   режиме тишины. Наличие min_volume тоже трактуется как critical (ТЗ-6).
 TOPIC_STATE = "jarvis/state"      # {"state": "...", "source": "..."}
+TOPIC_ENVIRONMENT = "jarvis/environment"  # {"desktop": "имя стола", "apps": ["тег", ...]} (ТЗ-7)
+#                                 # core резолвит «рабочую среду» → os_agent создаёт вирт. стол и
+#                                 # запускает приложения по тегам (как execute, но + новый стол KDE).
 
 # --- Уровни QoS (см. таблицу контрактов в CLAUDE.md) ---
 QOS_INPUT = 0
 QOS_EXECUTE = 1
 QOS_SAY = 0
 QOS_STATE = 0
+QOS_ENVIRONMENT = 1
 
 # --- Допустимые состояния ассистента ---
 State = Literal["idle", "listening", "thinking", "speaking"]

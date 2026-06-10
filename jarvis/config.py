@@ -63,6 +63,9 @@ def _cast(value, default):
         if isinstance(value, list):
             return [str(v) for v in value]
         return [s.strip() for s in str(value).split(",") if s.strip()]
+    if isinstance(default, dict):
+        # Словарь (напр. именованные среды) — возвращаем как есть; не из dict → дефолт.
+        return value if isinstance(value, dict) else default
     return str(value)
 
 
@@ -887,3 +890,66 @@ SILENCE_OFF_ACK = _sil_pack("off_ack", [
     "Голос вернулся, сэр.",
     "Рад снова говорить, сэр.",
 ])
+
+# === Системное (ТЗ-7): перезагрузка / рабочие среды / live-панель ===
+
+# --- Голосовая перезагрузка ВСЕХ сервисов Джарвиса (НЕ ребут ноута), только с wake ---
+# Фразы-триггеры (рефлексивные «-сь» безопасны: не ловят «перезагрузи браузер»).
+RESTART_PHRASES = _get("restart", "phrases",
+    ["перезагрузись", "перезагрузи себя", "перезапустись", "перезапусти себя",
+     "ребутнись", "рестарт", "перезагрузка джарвиса", "перезагрузись джарвис"], None)
+# Начальная пауза перед рестартом (с) — дать анонсу доиграть, пока TTS ещё жив.
+RESTART_INITIAL_DELAY = _get("restart", "initial_delay_seconds", 2.5, None)
+
+def _restart_pack(key, default):
+    return _get("restart", key, default, None)
+
+RESTART_ANNOUNCE = _restart_pack("announce", [
+    "Перезагружаюсь, сэр. Одну минуту.",
+    "Перезапускаю себя, сэр.",
+    "Минутку, сэр, перезагружаю системы.",
+])
+RESTART_SUCCESS = _restart_pack("success", [
+    "С возвращением, сэр. Все системы в строю.",
+    "Готов к работе, сэр. Перезагрузка завершена.",
+    "Снова на связи, сэр. Всё в порядке.",
+])
+RESTART_PROBLEM = _restart_pack("problem", [
+    "Сэр, перезагрузился, но часть систем не поднялась.",
+    "Готов, сэр, однако есть неполадки с сервисами.",
+    "Сэр, перезагрузка прошла с проблемами — проверьте логи.",
+])
+
+# --- Рабочие среды (виртуальные столы KDE) ---
+# Именованные среды: {имя: {desktop: "Название стола", apps: [теги_команд]}}. Вызов «открой <имя> среду».
+ENVIRONMENTS = _get("environments", "named", {
+    "рабочая": {"desktop": "Работа", "apps": ["site_gemini", "music_yandex"]},
+}, None)
+# Слова-триггеры команды среды.
+ENV_TRIGGERS = _get("environments", "triggers",
+    ["сред", "новое пространство", "новое окружение"], None)
+ENV_DESKTOP_PREFIX = _get("environments", "desktop_name", "Среда", None)
+# Пауза между запусками приложений среды (с) — чтобы окна открылись на новом столе.
+ENV_LAUNCH_DELAY = _get("environments", "launch_delay_seconds", 0.8, None)
+
+def _env_pack(key, default):
+    return _get("environments", key, default, None)
+
+ENV_OPEN = _env_pack("open", [
+    "Открываю среду, сэр.",
+    "Готовлю рабочее пространство, сэр.",
+    "Создаю новый стол, сэр.",
+])
+ENV_PARTIAL = _env_pack("partial", [
+    "Открыл что смог, сэр — часть не удалась.",
+    "Среда готова частично, сэр.",
+])
+ENV_EMPTY = _env_pack("empty", [
+    "Сэр, не разобрал, что открыть в среде.",
+    "Уточните, сэр, что должно быть в среде.",
+])
+
+# --- Live-панель (jarvis live) ---
+LIVE_REFRESH_SECONDS = _get("live", "refresh_seconds", 1.0, None)
+LIVE_STATUS_TTL = _get("live", "status_ttl_seconds", 3.0, None)
+LIVE_HORIZON_HOURS = _get("live", "horizon_hours", 72, None)
