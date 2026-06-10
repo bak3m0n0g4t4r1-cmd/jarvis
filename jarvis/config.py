@@ -996,7 +996,8 @@ LAMP_LOCAL_KEY = str(_get("lamp", "local_key", "", "JARVIS_LAMP_LOCAL_KEY")).str
 LAMP_IP = str(_get("lamp", "ip", "", "JARVIS_LAMP_IP")).strip()       # пусто → автопоиск по device_id
 LAMP_VERSION = _get("lamp", "version", 3.5, "JARVIS_LAMP_VERSION")    # СВЕРЕНО на лампе: 3.5
 LAMP_AUTODISCOVER = _get("lamp", "autodiscover", True, None)          # искать по device_id, если ip пуст/молчит
-LAMP_RECONNECT_SECONDS = _get("lamp", "reconnect_seconds", 30, None)  # период попыток переподключения
+LAMP_RECONNECT_SECONDS = _get("lamp", "reconnect_seconds", 30, None)  # ПОТОЛОК паузы между попытками (старт быстрый: 0→2→4→8→15с)
+LAMP_KEEPALIVE_MINUTES = _get("lamp", "keepalive_minutes", 5, None)   # пинг лампы раз в N минут (ловит мёртвый сокет); 0 = выкл
 LAMP_SOCKET_TIMEOUT = _get("lamp", "socket_timeout", 4.0, None)       # таймаут сокета (быстрый отклик/фейл)
 LAMP_BRIGHTNESS_STEP = _get("lamp", "brightness_step", 20, None)      # шаг «ярче/темнее» (%)
 LAMP_TEMP_STEP = _get("lamp", "temp_step", 25, None)                  # шаг «теплее/холоднее» белого (%)

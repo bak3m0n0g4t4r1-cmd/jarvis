@@ -9,10 +9,14 @@
 говорит → возврат в фон), срабатывание будильника/таймера/напоминания (по `min_volume` в jarvis/say
 — заметная реакция). Опц.: тишина/перерыв/ошибка. После реакции — ВОЗВРАТ в фоновое состояние.
 """
+import json
 import logging
+import os
 import queue
+import socket
 import threading
 import time
+from datetime import datetime
 
 from jarvis import config, contracts, phrases
 from jarvis import lamp as helpers
@@ -20,6 +24,13 @@ from jarvis.bus import JarvisModule
 
 _RESTORE_DELAY = 0.8   # debounce: пауза перед возвратом в фон после конца речи (частые реплики не дёргают)
 _DEFAULT_RGB = (255, 170, 87)
+_STATE_FILE = "lamp_state.json"   # снимок для doctor/live: Tuya держит 1 локальный сокет,
+#                                 # отдельная проба при живом сервисе рвала бы соединение
+_TUYA_PORT = 6668                 # локальный TCP-порт Tuya-устройств
+# Паузы между попытками подключения: первая — сразу, дальше быстрый рост до потолка
+# lamp.reconnect_seconds. После ребута системы сеть поднимается ПОЗЖЕ сервиса — быстрый
+# старт цикла подхватывает лампу через секунды после появления Wi-Fi (корень бага Этапа 21).
+_BACKOFF_STEPS = (2.0, 4.0, 8.0, 15.0)
 
 
 class LampModule(JarvisModule):
@@ -29,11 +40,16 @@ class LampModule(JarvisModule):
         super().__init__("jarvis-lamp")
         self._bulb = None
         self._connected = False
+        self._ever_connected = False                # был ли хоть один успешный коннект (для фразы лога)
+        self._fail_logged = False                   # WARNING о недоступности — раз на эпизод, не на попытку
+        self._last_io_ok = 0.0                      # monotonic последнего успешного I/O (гейт keepalive)
         self._color_ok = True                       # сбрасывается, если set_colour не поддержан
         self._lamp_lock = threading.Lock()          # сериализация I/O с лампой
+        self._reconnect_lock = threading.Lock()     # одиночность reconnect-потока
         self._queue: "queue.Queue" = queue.Queue()
         self._worker = None
         self._reconnect_thread = None
+        self._keepalive_thread = None
         self._restore_timer = None
         self._speaking = False
         # Фоновое (желаемое устойчивое) состояние — из конфига; меняется голосом, в него возвращаемся.
@@ -57,21 +73,45 @@ class LampModule(JarvisModule):
         self.subscribe(contracts.TOPIC_SAY, self.on_say)       # срабатывания (min_volume)
         self.subscribe(contracts.TOPIC_LAMP, self.on_lamp)     # голос-команды лампой
         self.subscribe(contracts.TOPIC_PHONE_CALL, self.on_call)  # реакция на входящий звонок (ТЗ-9)
-        # Подключение в фоне — не задерживаем старт сервиса.
-        threading.Thread(target=self._connect_and_init, daemon=True, name="lamp-connect").start()
+        # Подключение в фоне (не задерживаем старт сервиса): живучий цикл с быстрым backoff —
+        # после ребута дожидается сети и сам поднимает связь и свечение.
+        self._schedule_reconnect()
+        if float(config.LAMP_KEEPALIVE_MINUTES) > 0:
+            self._keepalive_thread = threading.Thread(
+                target=self._keepalive_loop, daemon=True, name="lamp-keepalive")
+            self._keepalive_thread.start()
 
     def on_stop(self):
         self._cancel_restore()
+        self._write_state()
 
     # ------------------------------------------------------------------ #
     # Соединение / переподключение
     # ------------------------------------------------------------------ #
-    def _connect_and_init(self):
-        if self._connect():
-            spec = helpers.reaction("startup", config.LAMP_REACTIONS, config.LAMP_COLORS)
-            self._enqueue(lambda: self._do_reaction(spec) if spec else self._apply_background())
-        else:
-            self._schedule_reconnect()
+    def _tcp_probe(self, ip: str, timeout: float = 1.0) -> bool:
+        """Дешёвая проверка достижимости лампы (TCP-порт Tuya) ПЕРЕД полным коннектом:
+        сеть/лампа ещё не готовы → быстрый тихий фейл за ~1с вместо блокировки в tinytuya.
+        Зовётся только когда НЕ подключены — персистентному сокету не мешает."""
+        try:
+            sock = socket.create_connection((ip, _TUYA_PORT), timeout=timeout)
+            sock.close()
+            return True
+        except OSError:
+            return False
+
+    def _note_unreachable(self, detail: str):
+        """Лог о недоступности: WARNING один раз на эпизод (ретраи теперь частые —
+        не спамим), дальше DEBUG. Уведомление (если включено) — тоже раз на эпизод."""
+        if self._fail_logged:
+            self.log.debug("Лампа всё ещё недоступна: %s", detail)
+            return
+        self._fail_logged = True
+        self.log.warning("Лампа недоступна (%s) — продолжаю попытки в фоне", detail)
+        if config.LAMP_NOTIFY_UNAVAILABLE:
+            try:
+                self.notify("Джарвис", "Лампа сейчас не в сети.", urgency="low")
+            except Exception:
+                pass
 
     def _connect(self) -> bool:
         if not (config.LAMP_DEVICE_ID and config.LAMP_LOCAL_KEY):
@@ -84,7 +124,10 @@ class LampModule(JarvisModule):
             return False
         ip = config.LAMP_IP or self._discover_ip(tinytuya)
         if not ip:
-            self.log.warning("IP лампы не задан и не найден автопоиском — лампа не подключена")
+            self._note_unreachable("IP не задан и не найден автопоиском")
+            return False
+        if not self._tcp_probe(ip):
+            self._note_unreachable(f"{ip}:{_TUYA_PORT} не отвечает — сеть/лампа ещё не готовы")
             return False
         try:
             with self._lamp_lock:
@@ -92,23 +135,24 @@ class LampModule(JarvisModule):
                     config.LAMP_DEVICE_ID, address=ip, local_key=config.LAMP_LOCAL_KEY,
                     version=float(config.LAMP_VERSION), persist=True)
                 bulb.set_socketTimeout(float(config.LAMP_SOCKET_TIMEOUT))
+                # Внутренние ретраи tinytuya (дефолт 5×(5с+5с)) превращали ОДИН фейл в ~36-50с
+                # блокировки — из-за этого лампа «умирала» после ребута. Темп задаёт НАШ цикл.
+                bulb.set_socketRetryLimit(1)
+                bulb.set_socketRetryDelay(1)
                 bulb.set_socketPersistent(True)
                 st = bulb.status()
                 if not isinstance(st, dict) or "Error" in st or "Err" in st:
                     raise RuntimeError(f"status вернул {st}")
                 self._bulb = bulb
                 self._connected = True
+            self._fail_logged = False
+            self._last_io_ok = time.monotonic()
             self.log.info("Лампа подключена: %s (протокол %s)", ip, config.LAMP_VERSION)
+            self._write_state()
             return True
         except Exception as exc:
-            self.log.warning("Лампа не отвечает (%s, v%s): %s — Джарвис продолжает без неё",
-                             ip, config.LAMP_VERSION, exc)
             self._connected = False
-            if config.LAMP_NOTIFY_UNAVAILABLE:
-                try:
-                    self.notify("Джарвис", "Лампа сейчас не в сети.", urgency="low")
-                except Exception:
-                    pass
+            self._note_unreachable(f"{ip}, v{config.LAMP_VERSION}: {exc}")
             return False
 
     def _discover_ip(self, tinytuya) -> str:
@@ -128,19 +172,83 @@ class LampModule(JarvisModule):
         return ""
 
     def _schedule_reconnect(self):
-        if self._reconnect_thread and self._reconnect_thread.is_alive():
-            return
-        self._reconnect_thread = threading.Thread(
-            target=self._reconnect_loop, daemon=True, name="lamp-reconnect")
-        self._reconnect_thread.start()
+        with self._reconnect_lock:
+            if self._reconnect_thread and self._reconnect_thread.is_alive():
+                return
+            self._reconnect_thread = threading.Thread(
+                target=self._connect_loop, daemon=True, name="lamp-reconnect")
+            self._reconnect_thread.start()
 
-    def _reconnect_loop(self):
+    def _connect_loop(self):
+        """Живучий цикл (пере)подключения: первая попытка СРАЗУ, затем быстрый backoff
+        (2→4→8→15с) до потолка lamp.reconnect_seconds — бесконечно, пока не подключимся.
+        Любое исключение попытки не убивает цикл. На успехе — реакция startup («я жив»)
+        и возврат в фоновое свечение."""
+        attempt = 0
         while not self._stop_event.is_set() and not self._connected:
-            if self._stop_event.wait(max(5, float(config.LAMP_RECONNECT_SECONDS))):
+            ok = False
+            try:
+                ok = self._connect()
+            except Exception:
+                self.log_exc(logging.WARNING, "Неожиданный сбой попытки подключения к лампе")
+            if ok:
+                if self._ever_connected:
+                    self.log.info("Лампа снова на связи — реакции восстановлены")
+                self._ever_connected = True
+                spec = helpers.reaction("startup", config.LAMP_REACTIONS, config.LAMP_COLORS)
+                self._enqueue(lambda: self._do_reaction(spec) if spec else self._apply_background())
                 return
-            if self._connect():
-                self._enqueue(self._apply_background)
+            cap = max(5.0, float(config.LAMP_RECONNECT_SECONDS))
+            delay = _BACKOFF_STEPS[attempt] if attempt < len(_BACKOFF_STEPS) else cap
+            attempt += 1
+            if self._stop_event.wait(min(delay, cap)):
                 return
+
+    # ------------------------------------------------------------------ #
+    # Keepalive: ловим молча умерший персистентный сокет (лампу выключали,
+    # Wi-Fi моргнул) — иначе первая реакция после долгой паузы терялась бы.
+    # ------------------------------------------------------------------ #
+    def _keepalive_loop(self):
+        interval = max(60.0, float(config.LAMP_KEEPALIVE_MINUTES) * 60.0)
+        while not self._stop_event.wait(interval):
+            if not self._connected:
+                continue
+            if time.monotonic() - self._last_io_ok < interval * 0.5:
+                self._write_state()      # I/O было недавно — пинг не нужен, но снимок освежаем
+                continue
+            self._enqueue(self._ping)
+
+    def _ping(self):
+        """Лёгкий status-пинг через воркер (сериализован, nowait=False — сокет не десинхронится).
+        Сбой → исключение → воркер вызовет _on_io_error → мгновенный реконнект."""
+        if not self._connected or self._bulb is None:
+            return
+        with self._lamp_lock:
+            st = self._bulb.status()
+        if not isinstance(st, dict) or "Error" in st or "Err" in st:
+            raise RuntimeError(f"keepalive: status вернул {st}")
+        self._last_io_ok = time.monotonic()
+        self._write_state()
+
+    def _write_state(self):
+        """Снимок состояния лампы (logs/lamp_state.json, атомарно). Его читает doctor:
+        Tuya держит ОДИН локальный сокет — отдельная проба при живом сервисе рвала бы
+        соединение сервиса (та же причина — предупреждение в `jarvis lamp`)."""
+        try:
+            data = {
+                "connected": bool(self._connected),
+                "ip": config.LAMP_IP,
+                "version": config.LAMP_VERSION,
+                "keepalive_minutes": float(config.LAMP_KEEPALIVE_MINUTES),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            path = os.path.join(str(config.LOGS_DIR), _STATE_FILE)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:
+            self.log.debug("Не удалось записать lamp_state", exc_info=True)
 
     # ------------------------------------------------------------------ #
     # Воркер очереди команд (один поток — сериализует обращения к лампе)
@@ -167,6 +275,7 @@ class LampModule(JarvisModule):
     def _on_io_error(self):
         self.log_exc(logging.WARNING, "Сбой обращения к лампе — помечаю недоступной, переподключусь")
         self._connected = False
+        self._write_state()
         self._schedule_reconnect()
 
     # ------------------------------------------------------------------ #
@@ -182,6 +291,7 @@ class LampModule(JarvisModule):
             return
         with self._lamp_lock:
             self._bulb.set_multiple_values(data, nowait=False)
+        self._last_io_ok = time.monotonic()
 
     def _set_color(self, rgb, brightness):
         """Цвет (режим colour): тон/насыщенность из RGB, яркость — в V компоненте DP24 (без DP22)."""
@@ -207,6 +317,7 @@ class LampModule(JarvisModule):
             return
         with self._lamp_lock:
             self._bulb.set_value(20, False, nowait=False)
+        self._last_io_ok = time.monotonic()
 
     def _apply_background(self):
         """Вернуть лампу в фоновое (желаемое) состояние (по запомненному режиму)."""

@@ -49,10 +49,12 @@ def _render_unit(svc, bin_dir: Path) -> str:
         env_line = f"EnvironmentFile=-{config.BASE_DIR / '.env'}\n"
     # Аудио-сервисам (STT/TTS) нужен пользовательский PipeWire: без этой зависимости
     # они стартуют до сессии звука, падают на устройстве и крутятся на рестартах.
+    # network.target в USER-менеджере systemd не существует (not-found) — директива была
+    # пустышкой; сетевую готовность сервисы обеспечивают сами ретраями (лампа — Этап 21).
     if svc.needs_audio:
-        deps = "Wants=pipewire.service\nAfter=pipewire.service network.target\n"
+        deps = "Wants=pipewire.service\nAfter=pipewire.service\n"
     else:
-        deps = "After=network.target\n"
+        deps = ""
     return (
         "[Unit]\n"
         f"Description=Джарвис — {svc.description}\n"
@@ -293,6 +295,15 @@ def cmd_lamp(args) -> int:
     if not (config.LAMP_DEVICE_ID and config.LAMP_LOCAL_KEY):
         print("✗ Креды лампы не заданы (settings.yaml → lamp.device_id/local_key).")
         return 1
+    # Tuya держит ОДИН локальный сокет: параллельное подключение CLI может сбить
+    # персистентный сокет сервиса (реакции «зависнут» до его реконнекта).
+    try:
+        if subprocess.run(["systemctl", "--user", "is-active", "--quiet", "jarvis-lamp.service"],
+                          timeout=5).returncode == 0:
+            print("⚠ Сервис jarvis-lamp активен: параллельное подключение может сбить его сокет "
+                  "(лампа Tuya держит одно соединение). Сервис восстановится сам через реконнект.")
+    except Exception:
+        pass
     try:
         import tinytuya
     except Exception:
@@ -315,6 +326,8 @@ def cmd_lamp(args) -> int:
         bulb = tinytuya.BulbDevice(config.LAMP_DEVICE_ID, address=ip,
                                    local_key=config.LAMP_LOCAL_KEY, version=float(config.LAMP_VERSION))
         bulb.set_socketTimeout(float(config.LAMP_SOCKET_TIMEOUT))
+        bulb.set_socketRetryLimit(1)   # без внутренних ретраев tinytuya — быстрый честный фейл
+        bulb.set_socketRetryDelay(1)
         st = bulb.status()
         if not isinstance(st, dict) or "Error" in st or "Err" in st:
             print(f"✗ Лампа не отвечает: {st}")

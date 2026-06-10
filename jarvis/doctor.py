@@ -1388,7 +1388,11 @@ def check_system() -> list[CheckResult]:
 
 def check_lamp() -> list[CheckResult]:
     """Умная лампа (ТЗ-8): tinytuya установлен, креды заданы, связь есть. Лампа выключена/не в сети
-    → WARN (не FAIL — это норма); нет кредов → WARN с подсказкой. Проба связи короткая."""
+    → WARN (не FAIL — это норма); нет кредов → WARN с подсказкой.
+
+    ⚠ Tuya держит ОДИН локальный сокет: пока сервис jarvis-lamp активен, свою пробу НЕ открываем
+    (рвала бы персистентный сокет сервиса) — читаем его снимок logs/lamp_state.json (Этап 21).
+    Прямая проба — только когда сервис не запущен."""
     if not config.LAMP_ENABLED:
         return [CheckResult(OK, "лампа выключена (lamp.enabled=false)")]
     try:
@@ -1403,6 +1407,9 @@ def check_lamp() -> list[CheckResult]:
             reason="device_id/local_key пусты — лампа не подключится.",
             fix="впишите device_id/local_key/ip в settings.yaml → lamp; затем `jarvis lamp test`"))
         return results
+    if _systemctl_show("jarvis-lamp.service").get("ActiveState") == "active":
+        results.append(_lamp_state_result())
+        return results
     ip = config.LAMP_IP
     try:
         if not ip:
@@ -1414,6 +1421,8 @@ def check_lamp() -> list[CheckResult]:
         bulb = tinytuya.BulbDevice(config.LAMP_DEVICE_ID, address=ip,
                                    local_key=config.LAMP_LOCAL_KEY, version=float(config.LAMP_VERSION))
         bulb.set_socketTimeout(3)
+        bulb.set_socketRetryLimit(1)   # без внутренних ретраев tinytuya (5×10с) — doctor не виснет
+        bulb.set_socketRetryDelay(1)
         st = bulb.status()
         if isinstance(st, dict) and "Error" not in st and "Err" not in st:
             results.append(CheckResult(OK, f"лампа: на связи ({ip}, протокол {config.LAMP_VERSION})"))
@@ -1428,6 +1437,42 @@ def check_lamp() -> list[CheckResult]:
             reason=str(exc),
             fix="проверьте ip/local_key и версию протокола (3.3 ↔ 3.4); `jarvis lamp test`"))
     return results
+
+
+def _lamp_state_result() -> CheckResult:
+    """Состояние лампы по снимку сервиса (logs/lamp_state.json) — без второго сокета к Tuya."""
+    import json as _json
+    import os as _os
+    from datetime import datetime as _dt
+
+    path = _os.path.join(str(config.LOGS_DIR), "lamp_state.json")
+    if not _os.path.exists(path):
+        return CheckResult(WARN, "лампа: сервис запущен, снимка состояния ещё нет",
+                           reason="lamp_state.json не появился (сервис только стартовал?).",
+                           fix="подождите минуту; затем `journalctl --user -u jarvis-lamp -n 20`")
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = _json.load(f)
+        age = None
+        try:
+            age = (_dt.now() - _dt.fromisoformat(st.get("updated_at", ""))).total_seconds()
+        except Exception:
+            pass
+        keepalive = float(st.get("keepalive_minutes") or 0)
+        # Снимок освежается keepalive-пингом; протух сильнее 3 интервалов (мин. 10 мин) → WARN.
+        if st.get("connected") and keepalive > 0 and age is not None \
+                and age > max(600.0, keepalive * 60 * 3):
+            return CheckResult(WARN, "лампа: снимок состояния устарел",
+                               reason=f"lamp_state.json обновлялся {int(age // 60)} мин назад.",
+                               fix="проверьте лог: journalctl --user -u jarvis-lamp -n 30")
+        if st.get("connected"):
+            return CheckResult(OK, f"лампа: на связи ({st.get('ip')}, протокол {st.get('version')}) "
+                                   "— по данным сервиса")
+        return CheckResult(WARN, "лампа: не в сети (по данным сервиса)",
+                           reason="сервис jarvis-lamp переподключается в фоне.",
+                           fix="проверьте питание лампы и Wi-Fi; лог: journalctl --user -u jarvis-lamp")
+    except Exception as exc:
+        return CheckResult(WARN, "лампа: состояние", reason=str(exc))
 
 
 def check_phone() -> list[CheckResult]:
