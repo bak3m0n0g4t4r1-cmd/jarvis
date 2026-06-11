@@ -60,3 +60,30 @@
     url: "https://huggingface.co/Vuy/rubert-tiny2-onnx/resolve/main/tokenizer.json"
     назначение: "rubert-tiny2-onnx/tokenizer.json"
     размер: 2413691
+
+  # --- Кандидаты ASR поточнее (Этап 21в). ОПЦИОНАЛЬНЫЕ: обычный `--download` их НЕ тянет ---
+  # Скачать: `jarvis models --download <имя>`. Включить: settings.yaml → models.asr_preset.
+  # Сравнение точности/задержки/RAM на этой машине: `python tools/bench_asr.py` (см. шапку).
+  zipformer_ru_full:
+    # Полноразмерный zipformer-ru (тот же API, что текущий small; ~330 МБ распакованный).
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-ru-2024-09-18.tar.bz2"
+    назначение: "zipformer-ru-full.tar.bz2"
+    распаковать: true
+    распаковать_в: ""
+    опционально: true
+
+  giga_am_v2_ctc:
+    # GigaAM-v2 CTC (Сбер, топ-точность по-русски; ~240 МБ; декод тяжелее zipformer).
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-ctc-giga-am-v2-russian-2025-04-19.tar.bz2"
+    назначение: "giga-am-v2-ctc.tar.bz2"
+    распаковать: true
+    распаковать_в: ""
+    опционально: true
+
+  giga_am_v2_transducer:
+    # GigaAM-v2 transducer (та же акустика, декодер-трансдьюсер; ~245 МБ).
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-transducer-giga-am-v2-russian-2025-04-19.tar.bz2"
+    назначение: "giga-am-v2-transducer.tar.bz2"
+    распаковать: true
+    распаковать_в: ""
+    опционально: true

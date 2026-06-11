@@ -218,6 +218,14 @@ models:
   models_dir: "models"
   logs_dir: "logs"
   commands_file: "commands.yaml"
+  # Пресет ASR (модель распознавания речи). Откат = вернуть строку и перезапустить stt.
+  #   zipformer-small-ru     — лёгкая боевая (по умолчанию, ~390 МБ RSS прогретая)
+  #   zipformer-ru           — полноразмерный zipformer (точнее, тяжелее)
+  #   giga-am-v2-ctc         — GigaAM-v2 CTC (топ-точность по-русски, декод тяжелее)
+  #   giga-am-v2-transducer  — GigaAM-v2 transducer
+  # Кандидаты сперва скачать: jarvis models --download <имя из models.yaml>;
+  # честное сравнение на этой машине: python tools/bench_asr.py (точность/задержка/RAM).
+  asr_preset: "zipformer-small-ru"
   # Пути конкретных моделей выводятся из models_dir автоматически — обычно НЕ трогают.
   # Раскомментируй и укажи абсолютный путь, только если модель лежит вне models_dir:
   # vad_model: "/путь/silero_vad.onnx"

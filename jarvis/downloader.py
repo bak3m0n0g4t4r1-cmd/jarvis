@@ -132,28 +132,55 @@ def _unpack(archive: Path, target_dir: Path) -> bool:
 
 
 def download_all() -> bool:
-    """Скачать все модели из models.yaml. Возвращает True, если всё успешно."""
-    if not MODELS_YAML.exists():
-        print(f"✗ не найден {MODELS_YAML}. Он должен лежать в корне проекта.")
+    """Скачать БАЗОВЫЕ модели из models.yaml (помеченные `опционально: true` пропускаются —
+    это кандидаты ASR, их тянут явно: download_named). Возвращает True, если всё успешно."""
+    models = _read_models()
+    if models is None:
         return False
-    try:
-        with open(MODELS_YAML, encoding="utf-8") as f:
-            spec = yaml.safe_load(f) or {}
-    except Exception as exc:
-        print(f"✗ не удалось разобрать models.yaml: {exc}")
-        return False
-
-    models = spec.get("модели") or {}
-    if not models:
-        print("✗ в models.yaml нет секции «модели».")
-        return False
-
     config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
     ok = True
+    skipped = []
     for name, item in models.items():
-        ok = _download_one(name, item or {}) and ok
+        item = item or {}
+        if item.get("опционально"):
+            skipped.append(name)
+            continue
+        ok = _download_one(name, item) and ok
+    if skipped:
+        print(f"  (опциональные пропущены: {', '.join(skipped)} — "
+              f"качаются явно: jarvis models --download <имя>)")
     if ok:
         print("\n✓ Все модели загружены. Проверьте: jarvis doctor")
     else:
         print("\n✗ Часть моделей не загрузилась — см. сообщения выше и правьте models.yaml.")
     return ok
+
+
+def download_named(name: str) -> bool:
+    """Скачать ОДНУ модель по имени из models.yaml (включая опциональные кандидаты ASR)."""
+    models = _read_models()
+    if models is None:
+        return False
+    if name not in models:
+        print(f"✗ модели «{name}» нет в models.yaml. Доступные: {', '.join(models)}")
+        return False
+    config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    return _download_one(name, models[name] or {})
+
+
+def _read_models():
+    """Секция «модели» из models.yaml; None при любой проблеме (с человеческим сообщением)."""
+    if not MODELS_YAML.exists():
+        print(f"✗ не найден {MODELS_YAML}. Он должен лежать в корне проекта.")
+        return None
+    try:
+        with open(MODELS_YAML, encoding="utf-8") as f:
+            spec = yaml.safe_load(f) or {}
+    except Exception as exc:
+        print(f"✗ не удалось разобрать models.yaml: {exc}")
+        return None
+    models = spec.get("модели") or {}
+    if not models:
+        print("✗ в models.yaml нет секции «модели».")
+        return None
+    return models

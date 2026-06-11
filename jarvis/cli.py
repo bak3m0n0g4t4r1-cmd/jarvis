@@ -115,9 +115,12 @@ def cmd_models(args) -> int:
     from jarvis import downloader
 
     if not args.download:
-        print("Укажите действие, например: jarvis models --download")
+        print("Укажите действие, например: jarvis models --download "
+              "(или --download <имя> для опционального кандидата ASR)")
         return 2
-    return 0 if downloader.download_all() else 1
+    if args.download is True:   # без имени — все базовые (опциональные пропускаются)
+        return 0 if downloader.download_all() else 1
+    return 0 if downloader.download_named(str(args.download)) else 1
 
 
 def cmd_test(args) -> int:
@@ -378,7 +381,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor.set_defaults(func=cmd_doctor)
 
     p_models = sub.add_parser("models", help="управление моделями")
-    p_models.add_argument("--download", action="store_true", help="скачать модели в models/")
+    p_models.add_argument("--download", nargs="?", const=True, metavar="ИМЯ",
+                          help="скачать базовые модели; с ИМЕНЕМ — одну из models.yaml "
+                               "(вкл. опциональные кандидаты ASR)")
     p_models.set_defaults(func=cmd_models)
 
     p_test = sub.add_parser("test", help="сквозной тест живой шины")

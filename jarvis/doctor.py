@@ -720,7 +720,7 @@ def check_mqtt_stability(quick: bool = False) -> CheckResult:
 # Слой 3. Модели (загружаемость движком — инициализация, не инференс)
 # --------------------------------------------------------------------------- #
 def check_sherpa_models() -> list[CheckResult]:
-    """VAD и zipformer-ru реально загружаются движком, а не «файл на месте»."""
+    """VAD и АКТИВНЫЙ ASR-пресет реально загружаются движком, а не «файл на месте»."""
     results = []
     try:
         import sherpa_onnx
@@ -739,22 +739,33 @@ def check_sherpa_models() -> list[CheckResult]:
             reason=f"движок не смог загрузить VAD: {exc}",
             fix="jarvis models --download  (или сверьте путь JARVIS_VAD_MODEL)",
         ))
+    if not config.ASR_PRESET_KNOWN:
+        results.append(CheckResult(
+            WARN, f"ASR-пресет «{config.ASR_PRESET}» неизвестен",
+            reason="models.asr_preset не из списка пресетов — STT возьмёт zipformer-small-ru.",
+            fix="поправьте settings.yaml (models.asr_preset)",
+        ))
     try:
-        # zipformer-ru — offline transducer с BPE-словарём.
-        sherpa_onnx.OfflineRecognizer.from_transducer(
-            encoder=config.ZIPFORMER_ENCODER,
-            decoder=config.ZIPFORMER_DECODER,
-            joiner=config.ZIPFORMER_JOINER,
-            tokens=config.ZIPFORMER_TOKENS,
-            modeling_unit="bpe",
-            bpe_vocab=config.ZIPFORMER_BPE,
-        )
-        results.append(CheckResult(OK, "Модель zipformer-ru загружается движком"))
+        # Грузим ровно так же, как stt._init_engines (та же ветка по типу пресета).
+        p = config.ASR_PATHS
+        if config.ASR_TYPE == "nemo_ctc":
+            sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
+                model=p["model"], tokens=p["tokens"], sample_rate=config.SAMPLE_RATE)
+        elif config.ASR_TYPE == "nemo_transducer":
+            sherpa_onnx.OfflineRecognizer.from_transducer(
+                encoder=p["encoder"], decoder=p["decoder"], joiner=p["joiner"],
+                tokens=p["tokens"], model_type="nemo_transducer", sample_rate=config.SAMPLE_RATE)
+        else:
+            sherpa_onnx.OfflineRecognizer.from_transducer(
+                encoder=p["encoder"], decoder=p["decoder"], joiner=p["joiner"],
+                tokens=p["tokens"], modeling_unit="bpe", bpe_vocab=p["bpe"])
+        results.append(CheckResult(OK, f"Модель ASR ({config.ASR_PRESET}) загружается движком"))
     except Exception as exc:
         results.append(CheckResult(
-            FAIL, "Модель zipformer-ru загружается движком",
-            reason=f"движок не смог загрузить zipformer-ru: {exc}",
-            fix="jarvis models --download  (или сверьте JARVIS_ZIPFORMER_*)",
+            FAIL, f"Модель ASR ({config.ASR_PRESET}) загружается движком",
+            reason=f"движок не смог загрузить пресет: {exc}",
+            fix=f"jarvis models --download  (кандидаты: jarvis models --download <имя>; "
+                f"или откат models.asr_preset)",
         ))
     return results
 

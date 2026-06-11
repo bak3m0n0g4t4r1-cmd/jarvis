@@ -189,6 +189,41 @@ ZIPFORMER_TOKENS = _get_path("models", "zipformer_tokens", str(_ZIPFORMER_DIR / 
 ZIPFORMER_BPE = _get_path("models", "zipformer_bpe", str(_ZIPFORMER_DIR / "bpe.model"),
                      "JARVIS_ZIPFORMER_BPE")
 
+# === Пресет ASR-модели (Этап 21в): переключение распознавания ОДНОЙ строкой, откат лёгкий ===
+# zipformer-small-ru — боевая лёгкая (по умолчанию). Кандидаты поточнее скачиваются
+# `jarvis models --download <имя>` (см. models.yaml), сравнение — tools/bench_asr.py.
+ASR_PRESET = str(_get("models", "asr_preset", "zipformer-small-ru", "JARVIS_ASR_PRESET")).strip() \
+    or "zipformer-small-ru"
+_ASR_PRESETS = {
+    # тип → ветка загрузки в stt (zipformer_bpe | nemo_ctc | nemo_transducer);
+    # дир/файлы — относительно models_dir. У small путей нет: берутся ZIPFORMER_* (env-оверрайды живы).
+    "zipformer-small-ru": {"тип": "zipformer_bpe"},
+    "zipformer-ru": {"тип": "zipformer_bpe", "дир": "sherpa-onnx-zipformer-ru-2024-09-18",
+                     "файлы": {"encoder": "encoder.int8.onnx", "decoder": "decoder.onnx",
+                               "joiner": "joiner.int8.onnx", "tokens": "tokens.txt", "bpe": "bpe.model"}},
+    "giga-am-v2-ctc": {"тип": "nemo_ctc", "дир": "sherpa-onnx-nemo-ctc-giga-am-v2-russian-2025-04-19",
+                       "файлы": {"model": "model.int8.onnx", "tokens": "tokens.txt"}},
+    "giga-am-v2-transducer": {"тип": "nemo_transducer",
+                              "дир": "sherpa-onnx-nemo-transducer-giga-am-v2-russian-2025-04-19",
+                              "файлы": {"encoder": "encoder.int8.onnx", "decoder": "decoder.onnx",
+                                        "joiner": "joiner.onnx", "tokens": "tokens.txt"}},
+}
+ASR_PRESET_KNOWN = ASR_PRESET in _ASR_PRESETS   # неизвестный пресет → doctor предупредит
+
+
+def _asr_spec():
+    spec = _ASR_PRESETS[ASR_PRESET] if ASR_PRESET_KNOWN else _ASR_PRESETS["zipformer-small-ru"]
+    if "дир" not in spec:
+        paths = {"encoder": ZIPFORMER_ENCODER, "decoder": ZIPFORMER_DECODER,
+                 "joiner": ZIPFORMER_JOINER, "tokens": ZIPFORMER_TOKENS, "bpe": ZIPFORMER_BPE}
+    else:
+        d = MODELS_DIR / spec["дир"]
+        paths = {k: str(d / v) for k, v in spec["файлы"].items()}
+    return spec["тип"], paths
+
+
+ASR_TYPE, ASR_PATHS = _asr_spec()
+
 # === Распознавание команд: матчер (секция recognition) ===
 EMBEDDER_DIR = Path(_get_path("models", "embedder_dir", str(MODELS_DIR / "rubert-tiny2-onnx"),
                          "JARVIS_EMBEDDER_DIR"))

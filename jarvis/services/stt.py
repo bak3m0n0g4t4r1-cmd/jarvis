@@ -113,18 +113,28 @@ class SttModule(JarvisModule):
 
             self._vad = self._build_vad(self._vad_threshold)
 
-            # zipformer-ru — offline transducer с BPE-словарём. num_threads=1 — меньше
-            # потоковой возни на крошечной модели (сверено: параметр поддержан).
-            self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
-                encoder=config.ZIPFORMER_ENCODER,
-                decoder=config.ZIPFORMER_DECODER,
-                joiner=config.ZIPFORMER_JOINER,
-                tokens=config.ZIPFORMER_TOKENS,
-                modeling_unit="bpe",
-                bpe_vocab=config.ZIPFORMER_BPE,
-                num_threads=config.STT_NUM_THREADS,
-            )
-            self.log.info("Модели STT инициализированы (zipformer-ru)")
+            # ASR по пресету (models.asr_preset): пути/тип готовит config. num_threads=1 —
+            # меньше потоковой возни на маленьких моделях (сверено профилем, Этап 14).
+            if not config.ASR_PRESET_KNOWN:
+                self.log.warning("Неизвестный ASR-пресет «%s» — использую zipformer-small-ru",
+                                 config.ASR_PRESET)
+            p = config.ASR_PATHS
+            if config.ASR_TYPE == "nemo_ctc":
+                self._recognizer = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
+                    model=p["model"], tokens=p["tokens"],
+                    num_threads=config.STT_NUM_THREADS, sample_rate=config.SAMPLE_RATE)
+            elif config.ASR_TYPE == "nemo_transducer":
+                self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+                    encoder=p["encoder"], decoder=p["decoder"], joiner=p["joiner"],
+                    tokens=p["tokens"], model_type="nemo_transducer",
+                    num_threads=config.STT_NUM_THREADS, sample_rate=config.SAMPLE_RATE)
+            else:  # zipformer_bpe — offline transducer с BPE-словарём (small и полный)
+                self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+                    encoder=p["encoder"], decoder=p["decoder"], joiner=p["joiner"],
+                    tokens=p["tokens"], modeling_unit="bpe", bpe_vocab=p["bpe"],
+                    num_threads=config.STT_NUM_THREADS,
+                )
+            self.log.info("Модели STT инициализированы (ASR-пресет: %s)", config.ASR_PRESET)
         except Exception:
             self.log.exception("Не удалось инициализировать модели STT")
             self._vad = None
