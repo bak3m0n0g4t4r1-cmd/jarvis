@@ -204,6 +204,12 @@ MATCHER_FUZZY_THRESHOLD = _get("recognition", "fuzzy_threshold", 0.7, "JARVIS_MA
 MATCHER_EMB_THRESHOLD = _get("recognition", "emb_threshold", 0.6, "JARVIS_MATCHER_EMB_THRESHOLD")
 # Мин. отрыв лучшего кандидата от второго (косинус): меньше — кандидаты почти равны → переспрос.
 MATCHER_EMB_MARGIN = _get("recognition", "emb_margin", 0.04, "JARVIS_MATCHER_EMB_MARGIN")
+# Отклик на голое «Джарвис» без команды (раньше терялось молча — Этап 21в).
+LISTENING_ACK = _get("recognition", "listening_phrases", [
+    "Слушаю, сэр.",
+    "Да, сэр?",
+    "Весь внимание, сэр.",
+], None)
 
 # === Голос (TTS): Piper + громкость (секция voice) ===
 PIPER_MODEL = _get_path("models", "piper_model", str(MODELS_DIR / "ru_RU-dmitri-medium.onnx"),
@@ -999,7 +1005,7 @@ LAMP_IP = str(_get("lamp", "ip", "", "JARVIS_LAMP_IP")).strip()       # пуст
 LAMP_VERSION = _get("lamp", "version", 3.5, "JARVIS_LAMP_VERSION")    # СВЕРЕНО на лампе: 3.5
 LAMP_AUTODISCOVER = _get("lamp", "autodiscover", True, None)          # искать по device_id, если ip пуст/молчит
 LAMP_RECONNECT_SECONDS = _get("lamp", "reconnect_seconds", 30, None)  # ПОТОЛОК паузы между попытками (старт быстрый: 0→2→4→8→15с)
-LAMP_KEEPALIVE_MINUTES = _get("lamp", "keepalive_minutes", 5, None)   # пинг лампы раз в N минут (ловит мёртвый сокет); 0 = выкл
+LAMP_KEEPALIVE_MINUTES = _get("lamp", "keepalive_minutes", 0.33, None)  # пинг раз в N минут (дробное ок); лампа рвёт простаивающий TCP за 30-60с — пинг чаще; 0 = выкл
 LAMP_SOCKET_TIMEOUT = _get("lamp", "socket_timeout", 4.0, None)       # таймаут сокета (быстрый отклик/фейл)
 LAMP_BRIGHTNESS_STEP = _get("lamp", "brightness_step", 20, None)      # шаг «ярче/темнее» (%)
 LAMP_TEMP_STEP = _get("lamp", "temp_step", 25, None)                  # шаг «теплее/холоднее» белого (%)

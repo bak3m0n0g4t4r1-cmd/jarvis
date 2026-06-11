@@ -42,6 +42,11 @@ class LampModule(JarvisModule):
         self._connected = False
         self._ever_connected = False                # был ли хоть один успешный коннект (для фразы лога)
         self._fail_logged = False                   # WARNING о недоступности — раз на эпизод, не на попытку
+        # Тихий реконнект: сокет умер В ПРОСТОЕ (лампа рвёт неактивный TCP — это норма, не поломка).
+        # Взводит ТОЛЬКО _ping, сбрасывает ТОЛЬКО _connect_loop/_on_io_error (GIL-атомарный bool,
+        # паттерн _ptt из stt). Тихий путь — без startup-вспышки/WARNING, иначе лампа мигала бы
+        # и спамила лог на каждый keepalive-цикл простоя (поймано по journalctl, Этап 21в).
+        self._quiet_reconnect = False
         self._last_io_ok = 0.0                      # monotonic последнего успешного I/O (гейт keepalive)
         self._color_ok = True                       # сбрасывается, если set_colour не поддержан
         self._lamp_lock = threading.Lock()          # сериализация I/O с лампой
@@ -143,11 +148,21 @@ class LampModule(JarvisModule):
                 st = bulb.status()
                 if not isinstance(st, dict) or "Error" in st or "Err" in st:
                     raise RuntimeError(f"status вернул {st}")
+                # Старый объект закрываем ЯВНО: замена без close() копила бы fd до сборщика
+                # мусора (по сокету на каждый реконнект — поймано в аудите Этапа 21в).
+                old = self._bulb
+                if old is not None:
+                    try:
+                        old.close()
+                    except Exception:
+                        pass
                 self._bulb = bulb
                 self._connected = True
             self._fail_logged = False
             self._last_io_ok = time.monotonic()
-            self.log.info("Лампа подключена: %s (протокол %s)", ip, config.LAMP_VERSION)
+            # Тихий реконнект (умерший в простое сокет) — не событие, лог не выше DEBUG.
+            level = logging.DEBUG if self._quiet_reconnect else logging.INFO
+            self.log.log(level, "Лампа подключена: %s (протокол %s)", ip, config.LAMP_VERSION)
             self._write_state()
             return True
         except Exception as exc:
@@ -182,8 +197,9 @@ class LampModule(JarvisModule):
     def _connect_loop(self):
         """Живучий цикл (пере)подключения: первая попытка СРАЗУ, затем быстрый backoff
         (2→4→8→15с) до потолка lamp.reconnect_seconds — бесконечно, пока не подключимся.
-        Любое исключение попытки не убивает цикл. На успехе — реакция startup («я жив»)
-        и возврат в фоновое свечение."""
+        Любое исключение попытки не убивает цикл. На успехе — ДВА пути: тихий (сокет умер
+        в простое, поднялись с первой попытки → DEBUG, без вспышки) и громкий (настоящий
+        обрыв → INFO + реакция startup «я жив» + возврат в фоновое свечение)."""
         attempt = 0
         while not self._stop_event.is_set() and not self._connected:
             ok = False
@@ -192,6 +208,15 @@ class LampModule(JarvisModule):
             except Exception:
                 self.log_exc(logging.WARNING, "Неожиданный сбой попытки подключения к лампе")
             if ok:
+                # Тихий путь: сокет умер в простое и поднялся С ПЕРВОЙ попытки — физическое
+                # состояние лампы не менялось, слать DPS/вспышку незачем (иначе мигала бы
+                # на каждый цикл простоя). Не с первой → значит был настоящий обрыв
+                # (_connect уже дал WARNING) → громкий путь со startup-реакцией.
+                quiet = self._quiet_reconnect and attempt == 0
+                self._quiet_reconnect = False
+                if quiet:
+                    self.log.debug("Сокет лампы переподнят тихо (умер в простое — норма)")
+                    return
                 if self._ever_connected:
                     self.log.info("Лампа снова на связи — реакции восстановлены")
                 self._ever_connected = True
@@ -205,30 +230,47 @@ class LampModule(JarvisModule):
                 return
 
     # ------------------------------------------------------------------ #
-    # Keepalive: ловим молча умерший персистентный сокет (лампу выключали,
-    # Wi-Fi моргнул) — иначе первая реакция после долгой паузы терялась бы.
+    # Keepalive: лампа рвёт ПРОСТАИВАЮЩИЙ TCP уже через 30–60с (замерено на
+    # v3.5, Этап 21в) — пинг обязан держать паузу трафика ≤30с, иначе каждый
+    # цикл находил бы труп → реконнект → вспышка/спам. Без keepalive первая
+    # реакция после паузы попадала бы в мёртвый сокет и терялась.
     # ------------------------------------------------------------------ #
     def _keepalive_loop(self):
-        interval = max(60.0, float(config.LAMP_KEEPALIVE_MINUTES) * 60.0)
+        interval = max(15.0, float(config.LAMP_KEEPALIVE_MINUTES) * 60.0)
+        last_snapshot = 0.0
         while not self._stop_event.wait(interval):
+            now = time.monotonic()
+            if now - last_snapshot >= 60.0:
+                last_snapshot = now
+                self._write_state()      # снимок для doctor/live — раз в минуту достаточно
             if not self._connected:
                 continue
-            if time.monotonic() - self._last_io_ok < interval * 0.5:
-                self._write_state()      # I/O было недавно — пинг не нужен, но снимок освежаем
-                continue
+            if now - self._last_io_ok < interval * 0.5:
+                continue                 # I/O было недавно — пинг не нужен
             self._enqueue(self._ping)
 
     def _ping(self):
-        """Лёгкий status-пинг через воркер (сериализован, nowait=False — сокет не десинхронится).
-        Сбой → исключение → воркер вызовет _on_io_error → мгновенный реконнект."""
+        """status-пинг через воркер (сериализован, nowait=False — сокет не десинхронится).
+        HEART_BEAT эта прошивка ИГНОРИРУЕТ (замерено: ответа нет, ожидание до таймаута ~4с)
+        — потому пингуем status(): быстрый и проверяет живость насквозь.
+
+        Сбой пинга = сокет умер в простое (норма для этой лампы) → ТИХИЙ реконнект:
+        DEBUG + флаг _quiet_reconnect, без WARNING и без startup-вспышки. Громкий путь
+        (_on_io_error) остаётся за сбоями РЕАЛЬНЫХ действий — команда/реакция."""
         if not self._connected or self._bulb is None:
             return
-        with self._lamp_lock:
-            st = self._bulb.status()
-        if not isinstance(st, dict) or "Error" in st or "Err" in st:
-            raise RuntimeError(f"keepalive: status вернул {st}")
-        self._last_io_ok = time.monotonic()
-        self._write_state()
+        try:
+            with self._lamp_lock:
+                st = self._bulb.status()
+            if not isinstance(st, dict) or "Error" in st or "Err" in st:
+                raise RuntimeError(f"status вернул {st}")
+            self._last_io_ok = time.monotonic()
+        except Exception as exc:
+            self.log.debug("keepalive: сокет умер в простое (%s) — тихо переподключаюсь", exc)
+            self._quiet_reconnect = True
+            self._connected = False
+            self._write_state()
+            self._schedule_reconnect()
 
     def _write_state(self):
         """Снимок состояния лампы (logs/lamp_state.json, атомарно). Его читает doctor:
@@ -273,7 +315,10 @@ class LampModule(JarvisModule):
             self.log.debug("Очередь лампы переполнена — команда отброшена", exc_info=True)
 
     def _on_io_error(self):
+        """Громкий путь: сбой РЕАЛЬНОГО действия (команда/реакция) — WARNING + реконнект со
+        startup-реакцией на восстановлении. Тихий keepalive-путь живёт в _ping."""
         self.log_exc(logging.WARNING, "Сбой обращения к лампе — помечаю недоступной, переподключусь")
+        self._quiet_reconnect = False   # настоящий обрыв перекрывает тихий план восстановления
         self._connected = False
         self._write_state()
         self._schedule_reconnect()
