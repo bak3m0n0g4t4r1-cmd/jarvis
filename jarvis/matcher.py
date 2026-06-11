@@ -393,6 +393,8 @@ class Matcher:
         top_tag, top_sim = ranked[0]
         second_sim = ranked[1][1] if len(ranked) > 1 else -1.0
         if top_sim < config.MATCHER_EMB_THRESHOLD:
+            _log.debug("Эмбеддинги не уверены: лучший %s=%.3f < порога %.2f — переспрос",
+                       top_tag, top_sim, config.MATCHER_EMB_THRESHOLD)
             return None
         # Почти равные кандидаты (часто антонимы) → не угадываем, лучше переспросить.
         if (top_sim - second_sim) < config.MATCHER_EMB_MARGIN:

@@ -59,6 +59,7 @@ class SttModule(JarvisModule):
         # Контент-фильтр эха: последняя фраза Джарвиса и срок действия фильтра.
         self._last_say_text = ""
         self._echo_until = 0.0  # время (monotonic), до которого сверяем с эхом
+        self._near_wake_log_at = 0.0  # rate-limit INFO о фразах «похоже на обращение, но ниже порога»
         # Адаптивный порог VAD: в тишине чуть снижаем (ловим тихую речь), в шуме — закреплённая
         # база. Шумовой пол оцениваем по собственному потоку захвата (без второго аудиострима).
         self._noise_floor = config.QUIET_THRESHOLD  # старт на границе → до замера тишины держим базу
@@ -352,15 +353,21 @@ class SttModule(JarvisModule):
             return
         # Страховка от эхо-петли: если в окне после речи распознали почти то же,
         # что Джарвис только что произнёс — это эхо из колонок, не команда.
-        if self._is_echo(text):
+        # Фразу с ТОЧНЫМ wake-префиксом фильтр НЕ трогает: реплики Джарвиса не начинаются
+        # с «джарвис» (сверено по пакам) — а команда сразу после ответа, похожая на сам
+        # ответ, раньше молча съедалась фильтром как эхо (Этап 21в).
+        if not self._has_exact_wake(text) and self._is_echo(text):
             return
         self.log.info("Распознано: %s", text)
         command = self._match_wake_word(text)
         user_level = self._rms(samples)
-        if command:
+        if command is not None:
             # Wake-word есть → полноценная команда (core обработает обычным путём, задаст ветку).
+            # ПУСТОЙ остаток (голое «Джарвис» и пауза) тоже публикуем: core откликнется
+            # «Слушаю» — раньше такая фраза терялась МОЛЧА (точка потери, Этап 21в).
             self._publish_input(command, wake=True, user_level=user_level)
-            self.log.info("Команда в шину: %s (wake, громкость речи %.4f)", command, user_level or 0.0)
+            self.log.info("Команда в шину: %s (wake, громкость речи %.4f)",
+                          command or "<голое обращение>", user_level or 0.0)
         elif config.CONTINUATIONS_ENABLED:
             # Без wake-word → отправляем ВСЮ фразу как кандидат-ПРОДОЛЖЕНИЕ активной ветки. Решает
             # core (примет, только если фраза — продолжение текущей ветки; иначе молча игнор).
@@ -394,9 +401,20 @@ class SttModule(JarvisModule):
             return False
         ratio = difflib.SequenceMatcher(None, a, b).ratio()
         if ratio >= config.ECHO_SIMILARITY_THRESHOLD:
-            self.log.debug("Отброшено как эхо (ratio=%.2f): %r ~ %r", ratio, a, b)
+            # INFO, не debug: отброс фразы — потеря, она должна быть ВИДНА в логах
+            # (диагностика «сказал — не услышал» по логам, не гаданием).
+            self.log.info("Отброшено как эхо (ratio=%.2f): %r ~ %r", ratio, a, b)
             return True
         return False
+
+    def _has_exact_wake(self, text: str) -> bool:
+        """Точный wake-префикс (без difflib). Такую фразу эхо-фильтр не трогает: реплики
+        Джарвиса не начинаются с «джарвис», значит это точно команда пользователя."""
+        normalized = self._normalize(text)
+        if not normalized:
+            return False
+        return any(normalized.startswith(w.strip().lower())
+                   for w in config.WAKE_WORDS if w.strip())
 
     def _match_wake_word(self, text: str):
         """Возвращает текст команды после wake-word, иначе None.
@@ -428,6 +446,14 @@ class SttModule(JarvisModule):
         if best_score >= config.WAKE_WORD_FUZZY_THRESHOLD:
             return " ".join(normalized.split()[1:])
 
+        # Near-miss: первое слово ПОХОЖЕ на обращение, но не дотянуло до порога — фраза
+        # будет отброшена. INFO с rate-limit, чтобы потери были видны в логах (Этап 21в).
+        if best_score >= 0.5:
+            now = time.monotonic()
+            if now - self._near_wake_log_at >= 10.0:
+                self._near_wake_log_at = now
+                self.log.info("Похоже на обращение, но ниже порога: '%s' ~ '%s' (%.2f < %.2f) — отброшено",
+                              first, best_wake, best_score, config.WAKE_WORD_FUZZY_THRESHOLD)
         return None
 
     # ------------------------------------------------------------------ #

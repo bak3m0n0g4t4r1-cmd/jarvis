@@ -79,6 +79,13 @@ class CoreModule(JarvisModule):
     def on_input(self, payload: dict):
         text = (payload.get("text") or "").strip()
         if not text:
+            # Голое «Джарвис» без команды (wake есть, остаток пуст): откликаемся, что слушаем —
+            # раньше фраза терялась МОЛЧА (точка потери, Этап 21в). Требуем ЯВНЫЙ wake=true:
+            # пустой текст от старых публикаторов без поля wake — мусор, игнорируем как раньше.
+            if payload.get("wake") is True:
+                level = payload.get("user_level")
+                ul = level if isinstance(level, (int, float)) else None
+                threading.Thread(target=self._say_listening, args=(ul,), daemon=True).start()
             return
         # Громкость речи пользователя (от STT) пробрасываем в ответ — для адаптивной громкости TTS.
         level = payload.get("user_level")
@@ -135,6 +142,13 @@ class CoreModule(JarvisModule):
                     self._say(phrases.pick("silence.on_ack", config.SILENCE_ON_ACK), user_level)
             except Exception:
                 self.log_exc(logging.ERROR, "Сбой переключения режима тишины")
+
+    def _say_listening(self, user_level: float | None) -> None:
+        """Отклик на голое «Джарвис» (обращение без команды): подтверждаем, что слушаем."""
+        try:
+            self._say(phrases.pick("recognition.listening", config.LISTENING_ACK), user_level)
+        except Exception:
+            self.log_exc(logging.WARNING, "Сбой отклика на обращение")
 
     def _process_wake(self, text: str, user_level: float | None = None):
         """Полноценная команда (с wake-word/PTT): повтор/отмена → info → комбо → матчер.
