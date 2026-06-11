@@ -88,6 +88,17 @@ class LampModule(JarvisModule):
 
     def on_stop(self):
         self._cancel_restore()
+        # Сокет лампы закрываем ЯВНО: под systemd Restart=always полагаться на сборщик
+        # мусора нельзя (найдено аудитом Этапа 21в; при реконнекте старый bulb тоже
+        # закрывается явно — та же причина).
+        bulb = self._bulb
+        self._bulb = None
+        self._connected = False
+        if bulb is not None:
+            try:
+                bulb.close()
+            except Exception:
+                pass
         self._write_state()
 
     # ------------------------------------------------------------------ #

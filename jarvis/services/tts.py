@@ -353,6 +353,27 @@ class TtsModule(JarvisModule):
             except Exception:
                 err = b""
         finally:
+            # Дожать pw-cat ПРИ ЛЮБОМ исходе: исключение синтеза посреди цикла раньше
+            # оставляло процесс осиротевшим с открытым stdin (висел до сборщика мусора —
+            # утечка fd/процесса, найдено аудитом Этапа 21в). Штатный путь уже дождался
+            # wait() выше — здесь poll() не None и блок проходится мгновенно.
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        self.log.debug("pw-cat не дожат", exc_info=True)
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
             self._play_proc = None
         if proc.returncode not in (0, None):
             detail = err.decode("utf-8", "replace").strip() if err else ""

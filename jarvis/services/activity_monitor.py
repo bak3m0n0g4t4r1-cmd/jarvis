@@ -133,12 +133,19 @@ class ActivityMonitorModule(JarvisModule):
 
     def on_stop(self):
         # Вернуть яркость НЕМЕДЛЕННО (без рампы — _stop_event уже взведён, рампа прервётся),
-        # чтобы не оставить тёмный экран после остановки сервиса. Потоки-демоны выйдут сами.
+        # чтобы не оставить тёмный экран после остановки сервиса.
         try:
             with self._lock:
                 self._restore_brightness(immediate=True)
         except Exception:
             self.log_exc(logging.WARNING, "Не удалось вернуть яркость при остановке")
+        # Дождаться потоков с таймаутом (как stt/scheduler): daemon-флаг спасает от зависания,
+        # но без join поток мог быть прерван посреди записи state-файла (аудит Этапа 21в).
+        for t in self._threads:
+            try:
+                t.join(timeout=2.0)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     # Поток-читатель: события ввода → _last_input
