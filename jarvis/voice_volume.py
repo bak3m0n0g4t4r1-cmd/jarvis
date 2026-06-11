@@ -62,9 +62,12 @@ def parse_level(text: str):
 
 def is_volume_command(text: str) -> bool:
     """Команда установить громкость голоса? Требуем слово «громкост…» + распознанный уровень
-    (чтобы не путать с системными «громче/тише» = volume_up/down)."""
+    (чтобы не путать с системными «громче/тише» = volume_up/down). Фразы про ЛАМПЫ
+    («громкость лампы 50») — НЕ сюда: это яркость ламп, её ловит гейт is_lamp_level_command
+    (jarvis/lamp.py), который в core стоит раньше; здесь — второй ремень от коллизии."""
     try:
-        return "громкост" in _norm(text) and parse_level(text) is not None
+        s = _norm(text)
+        return "громкост" in s and "ламп" not in s and parse_level(text) is not None
     except Exception:
         return False
 

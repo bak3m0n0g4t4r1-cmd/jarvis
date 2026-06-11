@@ -22,6 +22,42 @@ import paho.mqtt.client as mqtt
 from jarvis import config, contracts, resilience
 
 
+class _ErrorEventHandler(logging.Handler):
+    """ERROR/CRITICAL в логе сервиса → событие jarvis/event {"event":"error"} (заход «лампы»):
+    лампы мягко подсвечивают неполадку оранжевым — «любая ошибка» видна без чтения логов.
+
+    Защиты: троттлинг (config.ERROR_EVENT_THROTTLE — шторм ошибок не превращает лампы в
+    стробоскоп), реентерабельность (сбой самой публикации не порождает событий по кругу),
+    публикация напрямую через paho-клиент БЕЗ логирования сбоёв (шина лежит → молча мимо;
+    paho до коннекта просто откажет — это нормально)."""
+
+    def __init__(self, module: "JarvisModule"):
+        super().__init__(level=logging.ERROR)
+        self._module = module
+        self._last = 0.0
+        self._guard = threading.local()
+
+    def emit(self, record):
+        try:
+            if getattr(self._guard, "busy", False):
+                return
+            now = time.monotonic()
+            if now - self._last < float(config.ERROR_EVENT_THROTTLE):
+                return
+            self._last = now
+            self._guard.busy = True
+            try:
+                payload = {"event": "error", "source": self._module.name,
+                           "detail": str(record.getMessage())[:200]}
+                self._module.client.publish(
+                    contracts.TOPIC_EVENT, json.dumps(payload, ensure_ascii=False),
+                    qos=contracts.QOS_EVENT)
+            finally:
+                self._guard.busy = False
+        except Exception:
+            pass  # канал событий — best-effort, ошибки канала не существуют для сервиса
+
+
 class JarvisModule:
     """Базовый класс микросервиса «Джарвиса».
 
@@ -64,6 +100,14 @@ class JarvisModule:
             min_delay=config.MQTT_RECONNECT_MIN,
             max_delay=config.MQTT_RECONNECT_MAX,
         )
+        # Канал ошибок (заход «лампы»): ERROR+ в логе любого сервиса → jarvis/event.
+        # Вешается ПОСЛЕ создания клиента (хендлеру нужен publish). Логгер процесса один —
+        # повторного навешивания нет (модуль создаётся один раз на процесс).
+        if getattr(config, "ERROR_EVENTS", True):
+            try:
+                self.log.addHandler(_ErrorEventHandler(self))
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ #
     # Логирование
@@ -223,15 +267,30 @@ class JarvisModule:
             self.log.debug("Не удалось показать уведомление", exc_info=True)
             return 0
 
+    def publish_event(self, event: str, detail: str | None = None) -> None:
+        """Событие Джарвиса на шину (jarvis/event): error / silence_on|off / break_offer|praise.
+
+        Подписаны лампы (мягкие световые реакции, заход «лампы»). Best-effort: сбой публикации
+        не мешает вызывающему."""
+        try:
+            payload = {"event": event, "source": self.name}
+            if detail:
+                payload["detail"] = str(detail)[:200]
+            self.publish_json(contracts.TOPIC_EVENT, payload, qos=contracts.QOS_EVENT)
+        except Exception:
+            self.log.debug("Не удалось опубликовать событие %s", event, exc_info=True)
+
     def notify_failure(self, human: str, reason: str | None = None) -> None:
         """ЭЛЕГАНТНОЕ уведомление о сбое: человеческий текст (БЕЗ сырых трейсов) + кнопка «Открыть
-        логи» → kitty с логом ИМЕННО этого модуля. reason — короткое уточнение (тоже человеческое)."""
+        логи» → kitty с логом ИМЕННО этого модуля. reason — короткое уточнение (тоже человеческое).
+        Заодно — событие error на шину (лампы мягко подсветят неполадку оранжевым)."""
         try:
             title = getattr(config, "NOTIFY_FAILURE_TITLE", "Джарвис — неполадка")
             body = f"{human}\n{reason}" if reason else human
             self.notify(title, body, module=self.name, urgency="critical")
         except Exception:
             self.log.debug("Не удалось показать уведомление о сбое", exc_info=True)
+        self.publish_event("error", human)
 
     # ------------------------------------------------------------------ #
     # Жизненный цикл

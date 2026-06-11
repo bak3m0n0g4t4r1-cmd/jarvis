@@ -22,6 +22,7 @@ from pathlib import Path
 import yaml
 
 from jarvis import chains, config, contracts, phrases, silence, system, voice_volume, worldtime
+from jarvis import lamp as lamp_helpers
 from jarvis.breaks import is_stop_phrase
 from jarvis.bus import JarvisModule
 from jarvis.matcher import NOT_RECOGNIZED, Matcher
@@ -135,10 +136,12 @@ class CoreModule(JarvisModule):
                 if silence.is_silence_off(text):
                     silence.set_silent(False)
                     self.log.info("Режим тишины ВЫКЛЮЧЕН: %s", text)
+                    self.publish_event("silence_off")  # лампы: мягкая индикация (заход «лампы»)
                     self._say(phrases.pick("silence.off_ack", config.SILENCE_OFF_ACK), user_level)
                 else:
                     silence.set_silent(True)
                     self.log.info("Режим тишины ВКЛЮЧЁН: %s", text)
+                    self.publish_event("silence_on")
                     self._say(phrases.pick("silence.on_ack", config.SILENCE_ON_ACK), user_level)
             except Exception:
                 self.log_exc(logging.ERROR, "Сбой переключения режима тишины")
@@ -174,6 +177,13 @@ class CoreModule(JarvisModule):
                     self._do_environment(text, user_level)
                     return
 
+                # 0.15) Яркость ламп уровнем (заход «лампы»): «яркость ламп 50», «лампы
+                # наполовину». СТРОГО ДО гейта громкости голоса: «громкость лампы 50» —
+                # это про лампы (раньше угоняла громкость ГОЛОСА — гейт-коллизия).
+                if lamp_helpers.is_lamp_level_command(text):
+                    self._do_lamp_level(text)
+                    return
+
                 # 0.2) Базовая громкость голоса (ТЗ-10): «громкость 30» / «половина громкости».
                 if voice_volume.is_volume_command(text):
                     self._do_volume(text, user_level)
@@ -194,7 +204,7 @@ class CoreModule(JarvisModule):
                 if match is not None:
                     self.log.info("Команда распознана: %s (%s, %.3f) — %s",
                                   match.tag, match.layer, match.score, text)
-                    self._execute_matched(match.tag, user_level)
+                    self._execute_matched(match.tag, user_level, text=text)
                     return
 
                 # 4) Не распознано — переспрос в характере (не падаем).
@@ -226,7 +236,7 @@ class CoreModule(JarvisModule):
                 self.log.info("Продолжение ветки «%s»: %s — %s",
                               self._active_branch, match.tag, text)
                 self.set_state(contracts.STATE_THINKING)
-                self._execute_matched(match.tag, user_level, set_branch=False)
+                self._execute_matched(match.tag, user_level, set_branch=False, text=text)
                 self.set_state(contracts.STATE_IDLE)  # не зависаем в thinking (режим тишины)
             except Exception:
                 self.log_exc(logging.WARNING, "Сбой обработки продолжения — игнорирую")
@@ -235,30 +245,43 @@ class CoreModule(JarvisModule):
     # ------------------------------------------------------------------ #
     # Выполнение команд, ветки, комбо, история
     # ------------------------------------------------------------------ #
+    def _forward_special(self, spec: dict, text: str | None = None) -> str | None:
+        """Спец-поля команды (НЕ shell): «лампа» → jarvis/lamp, «телефон» → jarvis/phone/command.
+
+        Возврат: «лампа» / «телефон» / None (обычная команда). Единая точка роутинга для
+        _dispatch и _execute_matched (раньше дублировалась — риск рассинхрона). В payload ламп
+        добавляется исходная фраза — для адресации по имени («выключи вторую лампу»)."""
+        if isinstance(spec.get("лампа"), dict):
+            payload = dict(spec["лампа"])
+            if text:
+                payload["текст"] = text
+            self.publish_json(contracts.TOPIC_LAMP, payload, qos=contracts.QOS_LAMP)
+            return "лампа"
+        if isinstance(spec.get("телефон"), dict):
+            self.publish_json(contracts.TOPIC_PHONE_COMMAND, spec["телефон"],
+                              qos=contracts.QOS_EXECUTE)
+            return "телефон"
+        return None
+
     def _dispatch(self, tag: str) -> None:
         """Отправить тег на исполнение: лампа (поле «лампа») → jarvis/lamp; иначе → jarvis/execute.
 
         Команды лампы — не shell: у них поле `лампа: {действие,…}` вместо `команда`. Их обрабатывает
         сервис lamp по jarvis/lamp; os_agent их НЕ видит."""
         spec = self._commands.get(tag) or {}
-        if isinstance(spec.get("лампа"), dict):
-            self.publish_json(contracts.TOPIC_LAMP, spec["лампа"], qos=contracts.QOS_LAMP)
-        elif isinstance(spec.get("телефон"), dict):
-            self.publish_json(contracts.TOPIC_PHONE_COMMAND, spec["телефон"], qos=contracts.QOS_EXECUTE)
-        else:
+        if self._forward_special(spec) is None:
             self._execute_command(tag)
 
-    def _execute_matched(self, tag: str, user_level, set_branch: bool = True) -> None:
+    def _execute_matched(self, tag: str, user_level, set_branch: bool = True,
+                         text: str | None = None) -> None:
         """Выполнить тег + обновить ветку (опц.) и историю. Озвучка: обычная команда/телефон —
-        подтверждение здесь; КОМАНДА ЛАМПЫ — озвучивает сервис lamp (знает успех/недоступность)."""
+        подтверждение здесь; КОМАНДА ЛАМП — озвучивает сервис lamp (знает успех/недоступность)."""
         spec = self._commands.get(tag) or {}
-        if isinstance(spec.get("лампа"), dict):
-            self.publish_json(contracts.TOPIC_LAMP, spec["лампа"], qos=contracts.QOS_LAMP)
-        elif isinstance(spec.get("телефон"), dict):
-            # Команда телефону (find_phone): подтверждение + публикация в jarvis/phone/command.
+        routed = self._forward_special(spec, text)
+        if routed == "телефон":
+            # Команда телефону (find_phone): подтверждение озвучиваем здесь.
             self._say(self._matcher.confirmation(tag), user_level)
-            self.publish_json(contracts.TOPIC_PHONE_COMMAND, spec["телефон"], qos=contracts.QOS_EXECUTE)
-        else:
+        elif routed is None:
             self._say(self._matcher.confirmation(tag), user_level)
             self._execute_command(tag)
         if set_branch:
@@ -387,6 +410,20 @@ class CoreModule(JarvisModule):
         self.log.info("Базовая громкость голоса → %d%%", pct)
         self._say(phrases.pick("voice_volume.ack", config.VOLUME_ACK).replace("{процент}", str(pct)),
                   user_level)
+
+    def _do_lamp_level(self, text: str) -> None:
+        """Яркость ламп уровнем (заход «лампы»): «яркость ламп 50» / «лампы наполовину».
+
+        core только парсит уровень и форвардит сервису ламп (с исходной фразой — адресация
+        «яркость второй лампы 30»). Озвучивает РЕЗУЛЬТАТ сервис ламп (единый источник:
+        знает успех/недоступность), как и остальные lamp-команды."""
+        level = voice_volume.parse_level(text)
+        if level is None:
+            return  # недостижимо: гейт is_lamp_level_command требует распознанный уровень
+        self.log.info("Яркость ламп голосом: %d%% — %s", round(level * 100), text)
+        self.publish_json(contracts.TOPIC_LAMP,
+                          {"действие": "яркость", "уровень": level, "текст": text},
+                          qos=contracts.QOS_LAMP)
 
     def _say(self, text: str, user_level: float | None = None) -> None:
         """Реплика в jarvis/say с опц. громкостью речи пользователя (для адаптивной громкости TTS)."""

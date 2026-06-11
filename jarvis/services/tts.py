@@ -10,8 +10,11 @@ monitor воспроизведения), приглушаем музыку (duck
 import logging
 import queue
 import subprocess
+import sys
 import threading
 import time
+
+import numpy as np
 
 from jarvis import config, contracts, phrases, silence
 from jarvis.audio_env import AudioEnv
@@ -20,6 +23,78 @@ from jarvis.sysinfo import read_volume
 
 # Сколько фраз подряд не озвучилось, чтобы крикнуть CRITICAL (синтез/вывод недоступен).
 _TTS_FAILS_CRITICAL = 3
+
+
+class _EnvelopeStream:
+    """Огибающая РЕАЛЬНОГО звука фразы → батчи в jarvis/tts/envelope (пульсация ламп в такт).
+
+    RMS по окнам (lamp.animation.окно_мс) НЕПРЕРЫВНО через границы чанков-предложений Piper,
+    нормализация на бегущий пик фразы. Таймлайн привязан к ФАКТУ первого байта в pw-cat:
+    t0 = время первого write + старт_задержка_мс — момент, когда звук реально слышен (сам
+    write опережает воспроизведение: pipe ядра держит до ~1.5с аудио). Позиция любого окна
+    дальше вычислима из числа уже отданных окон — лампы проигрывают уровни по wall-clock.
+    Публикация best-effort: сбой шины НЕ мешает озвучке (всё в try-except)."""
+
+    _seq = 0   # id фразы: класс-счётчик процесса TTS (фразы строго по одной — гонок нет)
+
+    def __init__(self, module: "TtsModule", rate: int, volume: float):
+        self._m = module
+        self._rate = max(1, int(rate))
+        self._vol = round(max(0.0, float(volume)), 3)
+        self._win = max(0.01, float(config.LAMP_ANIM_WINDOW_MS) / 1000.0)
+        self._win_samples = max(1, int(self._rate * self._win))
+        self._rest = b""        # хвост, не кратный окну (переносится в следующий чанк)
+        self._bytes_sent = 0    # всего байт звука, ушедших в pw-cat (точная длительность)
+        self._win_count = 0     # окон уже опубликовано (offset следующего батча)
+        self._peak = 0.02       # бегущий пик фразы (пол — чтобы тишина не делилась на ноль)
+        self._t0 = None         # epoch старта ЗВУКА (ставится на первом feed)
+        type(self)._seq += 1    # новый стрим = новая фраза
+        self._id = type(self)._seq
+
+    def feed(self, pcm: bytes) -> None:
+        """Учесть чанк, только что УСПЕШНО записанный в pw-cat, и опубликовать батч уровней."""
+        try:
+            if not pcm:
+                return
+            if self._t0 is None:
+                self._t0 = time.time() + float(config.LAMP_ANIM_START_OFFSET_MS) / 1000.0
+            self._bytes_sent += len(pcm)
+            buf = self._rest + pcm
+            n_win = len(buf) // (2 * self._win_samples)
+            if n_win <= 0:
+                self._rest = buf
+                return
+            usable = n_win * self._win_samples * 2
+            self._rest = buf[usable:]
+            arr = np.frombuffer(buf[:usable], dtype=np.int16).astype(np.float32) / 32768.0
+            rms = np.sqrt(np.mean(np.square(arr.reshape(n_win, self._win_samples),
+                                            dtype=np.float64), axis=1) + 1e-12)
+            self._peak = max(self._peak, float(rms.max()))
+            levels = [round(float(x), 3) for x in np.clip(rms / self._peak, 0.0, 1.0)]
+            payload = {"seq": self._id, "t0": round(self._t0, 4),
+                       "offset": round(self._win_count * self._win, 4),
+                       "win": self._win, "vol": self._vol, "levels": levels}
+            self._win_count += n_win
+            self._m.publish_json(contracts.TOPIC_TTS_ENVELOPE, payload,
+                                 qos=contracts.QOS_TTS_ENVELOPE)
+        except Exception:
+            self._m.log.debug("Огибающая: сбой батча — пропускаю", exc_info=True)
+
+    def finish(self, cancelled: bool) -> None:
+        """Финал из finally синтеза: точная длительность звука или cancel (авария pw-cat —
+        лампы гасят анимацию немедленно). Если звука не было вовсе — молчим."""
+        try:
+            if self._t0 is None:
+                return
+            payload = {"seq": self._id, "final": True}
+            if cancelled:
+                payload["cancel"] = True
+            else:
+                payload["duration"] = round(self._bytes_sent / (2.0 * self._rate), 4)
+            self._m.publish_json(contracts.TOPIC_TTS_ENVELOPE, payload,
+                                 qos=contracts.QOS_TTS_ENVELOPE)
+        except Exception:
+            self._m.log.debug("Огибающая: сбой финала", exc_info=True)
 
 
 def _chime_pcm(rate: int) -> bytes:
@@ -322,12 +397,34 @@ class TtsModule(JarvisModule):
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         self._play_proc = proc
-        err = b""
+        # stderr читаем ФОНОВЫМ потоком: чтение после wait() — классический дедлок (pw-cat,
+        # заливший stderr больше буфера pipe, никогда не завершится; найдено аудитом захода).
+        err_buf: list[bytes] = []
+        err_thread = threading.Thread(target=self._drain_stderr, args=(proc, err_buf),
+                                      daemon=True, name="tts-stderr")
+        err_thread.start()
+        # Огибающая звука для анимации ламп (заход «лампы»): кормим тем, что РЕАЛЬНО ушло
+        # в pw-cat (чайм + чанки), финал — в finally. Выключена → ноль накладных расходов.
+        env_stream = _EnvelopeStream(self, rate, volume) if config.LAMP_ANIM_ENABLED else None
         first_write = None
+
+        def _mark_first():
+            nonlocal first_write
+            if first_write is None:
+                first_write = time.perf_counter()
+                if config.PERF_DEBUG:
+                    self.log.info("PERF tts: первый звук через %.0fмс от старта синтеза",
+                                  (first_write - t_synth) * 1000)
         try:
             if chime:  # короткий сигнал перед фразой (таймер) — тем же потоком pw-cat
                 try:
-                    proc.stdin.write(_chime_pcm(rate))
+                    data = _chime_pcm(rate)
+                    if gain > 1.0:
+                        data = AudioEnv.apply_gain(data, gain)  # чайм не тонет в шуме (как фраза)
+                    proc.stdin.write(data)
+                    _mark_first()  # чайм — первый РЕАЛЬНЫЙ звук (раньше PERF-метка его не видела)
+                    if env_stream is not None:
+                        env_stream.feed(data)
                 except Exception:
                     self.log.debug("Не удалось проиграть чайм", exc_info=True)
             for chunk in self._voice.synthesize(text, syn_config=syn):
@@ -336,11 +433,9 @@ class TtsModule(JarvisModule):
                     pcm = AudioEnv.apply_gain(pcm, gain)
                 try:
                     proc.stdin.write(pcm)  # стримим по мере синтеза
-                    if first_write is None:
-                        first_write = time.perf_counter()
-                        if config.PERF_DEBUG:
-                            self.log.info("PERF tts: первый звук через %.0fмс от старта синтеза "
-                                          "(Piper первый чанк)", (first_write - t_synth) * 1000)
+                    _mark_first()
+                    if env_stream is not None:
+                        env_stream.feed(pcm)
                 except BrokenPipeError:
                     break
             try:
@@ -348,10 +443,6 @@ class TtsModule(JarvisModule):
             except Exception:
                 pass
             proc.wait()  # дождаться конца воспроизведения (НЕ communicate — stdin уже закрыт)
-            try:
-                err = proc.stderr.read() or b""
-            except Exception:
-                err = b""
         finally:
             # Дожать pw-cat ПРИ ЛЮБОМ исходе: исключение синтеза посреди цикла раньше
             # оставляло процесс осиротевшим с открытым stdin (висел до сборщика мусора —
@@ -371,13 +462,35 @@ class TtsModule(JarvisModule):
                     except Exception:
                         self.log.debug("pw-cat не дожат", exc_info=True)
             try:
+                err_thread.join(timeout=1.0)
+            except Exception:
+                pass
+            try:
                 proc.stderr.close()
             except Exception:
                 pass
             self._play_proc = None
+            # Финал огибающей ВСЕГДА (лампы вернутся в фон): штатно — точная длительность;
+            # исключение синтеза или ненулевой код pw-cat → cancel (гасить немедленно).
+            if env_stream is not None:
+                cancelled = (sys.exc_info()[0] is not None
+                             or proc.returncode not in (0, None))
+                env_stream.finish(cancelled)
         if proc.returncode not in (0, None):
+            err = b"".join(err_buf)
             detail = err.decode("utf-8", "replace").strip() if err else ""
             raise RuntimeError(f"pw-cat вернул код {proc.returncode}: {detail or 'без stderr'}")
+
+    @staticmethod
+    def _drain_stderr(proc, sink: list) -> None:
+        """Выпить stderr pw-cat до EOF (фоновый поток): wait() не блокируется переполненным
+        pipe, а текст ошибки доступен после завершения процесса."""
+        try:
+            data = proc.stderr.read()
+            if data:
+                sink.append(data)
+        except Exception:
+            pass
 
     def on_stop(self):
         """Останавливаем замерщики, прерываем воспроизведение, ждём воркер ДО выхода."""

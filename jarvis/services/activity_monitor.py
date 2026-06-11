@@ -367,6 +367,7 @@ class ActivityMonitorModule(JarvisModule):
             phrase = phrases.pick("break.praise", config.BREAK_PRAISE_PHRASES)
             if phrase:
                 self._say(phrase)
+            self.publish_event("break_praise")  # лампы: мягкий зелёный пульс (заход «лампы»)
             self.log.info("Пользователь вернулся с перерыва — похвала")
         # Свежий цикл.
         self._state = _ACCUMULATING
@@ -380,6 +381,7 @@ class ActivityMonitorModule(JarvisModule):
         phrase = phrases.pick("break.offer", config.BREAK_OFFER_PHRASES)
         if phrase:
             self._say(phrase)
+        self.publish_event("break_offer")  # лампы: мягкий зелёный пульс (заход «лампы»)
         self._state = _OFFERED
         self._offer_active_accum = 0.0
         self._remind_target = self._rand_remind()
@@ -400,6 +402,7 @@ class ActivityMonitorModule(JarvisModule):
         phrase = phrases.pick("break.offer", config.BREAK_OFFER_PHRASES)
         if phrase:
             self._say(phrase)
+        self.publish_event("break_offer")
         self._remind_active_accum = 0.0
         self._next_remind_target = self._rand_remind()
         self.log.info("Повторное напоминание о перерыве")

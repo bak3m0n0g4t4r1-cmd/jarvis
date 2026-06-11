@@ -119,6 +119,11 @@ LOG_LEVEL = str(_get("system", "log_level", "INFO", "JARVIS_LOG_LEVEL")).strip()
 HEARTBEAT_INTERVAL = _get("system", "heartbeat_interval", 300.0, "JARVIS_HEARTBEAT_INTERVAL")
 # Замеры задержки звеньев (STT/core/TTS) в лог строками «PERF …» — для диагностики отклика.
 PERF_DEBUG = _get("system", "perf_debug", False, "JARVIS_PERF_DEBUG")
+# Канал событий об ошибках (заход «лампы»): ERROR/CRITICAL в логе любого сервиса →
+# событие jarvis/event {"event":"error"} (лампы мягко подсвечивают неполадку оранжевым).
+ERROR_EVENTS = _get("system", "error_events", True, "JARVIS_ERROR_EVENTS")
+# Не чаще раза в N секунд на сервис (шторм ошибок не превращается в стробоскоп).
+ERROR_EVENT_THROTTLE = _get("system", "error_event_throttle_seconds", 30.0, None)
 
 # === Слух (STT): захват, wake-word, VAD, анти-эхо (секция hearing) ===
 SAMPLE_RATE = _get("hearing", "sample_rate", 16000, "JARVIS_SAMPLE_RATE")
@@ -1032,13 +1037,53 @@ LIVE_REFRESH_SECONDS = _get("live", "refresh_seconds", 1.0, None)
 LIVE_STATUS_TTL = _get("live", "status_ttl_seconds", 3.0, None)
 LIVE_HORIZON_HOURS = _get("live", "horizon_hours", 72, None)
 
-# === Умная Wi-Fi лампа (Tuya, ЛОКАЛЬНО через tinytuya — без облака) (ТЗ-8) ===
+# === Умные Wi-Fi лампы (Tuya, ЛОКАЛЬНО через tinytuya — без облака) (ТЗ-8, заход «лампы») ===
 LAMP_ENABLED = _get("lamp", "enabled", True, "JARVIS_LAMP_ENABLED")
+# Старый плоский формат (одна лампа) — оставлен для обратной совместимости и фолбэка ниже.
 LAMP_DEVICE_ID = str(_get("lamp", "device_id", "", "JARVIS_LAMP_DEVICE_ID")).strip()
 LAMP_LOCAL_KEY = str(_get("lamp", "local_key", "", "JARVIS_LAMP_LOCAL_KEY")).strip()
 LAMP_IP = str(_get("lamp", "ip", "", "JARVIS_LAMP_IP")).strip()       # пусто → автопоиск по device_id
 LAMP_VERSION = _get("lamp", "version", 3.5, "JARVIS_LAMP_VERSION")    # СВЕРЕНО на лампе: 3.5
 LAMP_AUTODISCOVER = _get("lamp", "autodiscover", True, None)          # искать по device_id, если ip пуст/молчит
+
+
+def _lamp_devices() -> dict:
+    """Список ламп: {имя: {device_id, local_key, ip, version}} из lamp.lamps.
+
+    Формат — СЛОВАРЬ словарей (имя-ключ), НЕ список: _cast превращает элементы списка в строки
+    (класс бага Этапа 17, см. ГРАБЛИ). Записи с «вкл: false» пропускаются (лампа временно вне
+    группы). Фолбэк: lamps не задан → одна лампа «лампа» из плоских lamp.device_id/local_key
+    (старый конфиг продолжает работать)."""
+    out = {}
+    raw = _get("lamp", "lamps", {}, None)
+    if isinstance(raw, dict):
+        for name, spec in raw.items():
+            try:
+                if not isinstance(spec, dict) or not spec.get("вкл", True):
+                    continue
+                dev = str(spec.get("device_id", "")).strip()
+                key = str(spec.get("local_key", "")).strip()
+                if not (dev and key):
+                    continue
+                out[str(name).strip()] = {
+                    "device_id": dev,
+                    "local_key": key,
+                    "ip": str(spec.get("ip", "")).strip(),
+                    "version": float(spec.get("version", 3.5) or 3.5),
+                }
+            except Exception:
+                continue  # кривая запись не валит остальные лампы
+    if not out and LAMP_DEVICE_ID and LAMP_LOCAL_KEY:
+        try:
+            ver = float(LAMP_VERSION or 3.5)
+        except Exception:
+            ver = 3.5
+        out = {"лампа": {"device_id": LAMP_DEVICE_ID, "local_key": LAMP_LOCAL_KEY,
+                         "ip": LAMP_IP, "version": ver}}
+    return out
+
+
+LAMP_DEVICES = _lamp_devices()
 LAMP_RECONNECT_SECONDS = _get("lamp", "reconnect_seconds", 30, None)  # ПОТОЛОК паузы между попытками (старт быстрый: 0→2→4→8→15с)
 LAMP_KEEPALIVE_MINUTES = _get("lamp", "keepalive_minutes", 0.33, None)  # пинг раз в N минут (дробное ок); лампа рвёт простаивающий TCP за 30-60с — пинг чаще; 0 = выкл
 LAMP_SOCKET_TIMEOUT = _get("lamp", "socket_timeout", 4.0, None)       # таймаут сокета (быстрый отклик/фейл)
@@ -1053,31 +1098,67 @@ LAMP_COLORS = _get("lamp", "colors", {
     "жёлтый": [255, 210, 40], "оранжевый": [255, 120, 20], "фиолетовый": [170, 40, 255],
     "розовый": [255, 80, 160],
 }, None)
-# Фоновое состояние лампы (куда возвращаемся после реакций; индикация «готов» при старте).
+# Фоновое состояние ламп (куда возвращаемся после реакций; индикация «готов» при старте).
+# Яркость 100 — по ТЗ захода «лампы»: по умолчанию максимально ярко; голосовой override
+# («яркость ламп 50») хранится в logs/lamp_brightness.json и переживает рестарт.
 LAMP_BACKGROUND = _get("lamp", "background",
-                       {"вкл": True, "цвет": "тёплый", "яркость": 60}, None)
+                       {"вкл": True, "цвет": "тёплый", "яркость": 100}, None)
 # Реакции на события: {вкл, цвет, паттерн (свечение|пульс|мигание), яркость, длительность, повторы}.
+# silence/break/error ОЖИВЛЕНЫ заходом «лампы» (события приходят по jarvis/event).
 LAMP_REACTIONS = _get("lamp", "reactions", {
     "startup":  {"вкл": True, "цвет": "тёплый", "паттерн": "пульс", "яркость": 80, "длительность": 1.5, "повторы": 1},
     "speaking": {"вкл": True, "цвет": "синий", "паттерн": "свечение", "яркость": 55, "длительность": 0, "повторы": 1},
     "firing":   {"вкл": True, "цвет": "красный", "паттерн": "мигание", "яркость": 100, "длительность": 3.0, "повторы": 4},
     "call":     {"вкл": True, "цвет": "голубой", "паттерн": "пульс", "яркость": 100, "длительность": 3.0, "повторы": 4},
-    "silence":  {"вкл": False, "цвет": "фиолетовый", "паттерн": "свечение", "яркость": 40, "длительность": 0, "повторы": 1},
-    "break":    {"вкл": False, "цвет": "зелёный", "паттерн": "пульс", "яркость": 60, "длительность": 2.0, "повторы": 2},
-    "error":    {"вкл": False, "цвет": "красный", "паттерн": "мигание", "яркость": 90, "длительность": 1.5, "повторы": 2},
+    "silence":  {"вкл": True, "цвет": "фиолетовый", "паттерн": "пульс", "яркость": 40, "длительность": 1.5, "повторы": 1},
+    "break":    {"вкл": True, "цвет": "зелёный", "паттерн": "пульс", "яркость": 60, "длительность": 2.0, "повторы": 2},
+    # Ошибка Джарвиса — ЭТАЛОН интеграции: мягкая ОРАНЖЕВАЯ пульсация, без агрессии.
+    "error":    {"вкл": True, "цвет": "оранжевый", "паттерн": "пульс", "яркость": 55, "длительность": 2.0, "повторы": 2},
 }, None)
+
+# --- Анимация в такт голосу (огибающая реального звука TTS → пульсация ламп) ---
+_LAMP_ANIM = _get("lamp", "animation", {}, None)  # вложенный dict (как background/reactions)
+
+
+def _anim(key, default):
+    """Параметр из lamp.animation с приведением к типу дефолта (нет/кривое значение → дефолт)."""
+    try:
+        v = _LAMP_ANIM.get(key) if isinstance(_LAMP_ANIM, dict) else None
+        return default if v is None else _cast(v, default)
+    except Exception:
+        return default
+
+
+LAMP_ANIM_ENABLED = _anim("вкл", True)              # false → прежнее ровное свечение speaking
+LAMP_ANIM_FPS_MAX = _anim("fps_max", 6.0)           # потолок кадров/с на лампу (реальный темп задаёт RTT ACK)
+LAMP_ANIM_ATTACK_MS = _anim("атака_мс", 60.0)       # подъём яркости к пику
+LAMP_ANIM_RELEASE_MS = _anim("спад_мс", 250.0)      # мягкий спад («дыхание»)
+LAMP_ANIM_BRIGHT_MIN = _anim("яркость_мин", 25)     # пол яркости в паузах речи (%)
+LAMP_ANIM_BRIGHT_MAX = _anim("яркость_макс", 90)    # потолок на пиках (%)
+LAMP_ANIM_GAMMA = _anim("гамма", 0.6)               # кривая уровень→яркость (<1 — тихое заметнее)
+LAMP_ANIM_HUE_DRIFT = _anim("дрейф_оттенка", 8.0)   # ± градусов HSV в такт уровню (0 = выкл)
+LAMP_ANIM_START_OFFSET_MS = _anim("старт_задержка_мс", 50.0)  # компенсация латентности pw-cat
+LAMP_ANIM_MAX_SECONDS = _anim("макс_сек", 30.0)     # страховка от «застрявшей» анимации
+LAMP_ANIM_WINDOW_MS = _anim("окно_мс", 50.0)        # окно RMS огибающей в TTS (мс)
 
 def _lamp_pack(key, default):
     return _get("lamp", key, default, None)
 
-LAMP_ON_ACK = _lamp_pack("on_ack", ["Включаю лампу, сэр.", "Свет, сэр.", "Зажигаю, сэр."])
-LAMP_OFF_ACK = _lamp_pack("off_ack", ["Гашу лампу, сэр.", "Выключаю свет, сэр.", "Темнота, сэр."])
+LAMP_ON_ACK = _lamp_pack("on_ack", ["Включаю лампы, сэр.", "Свет, сэр.", "Зажигаю, сэр."])
+LAMP_OFF_ACK = _lamp_pack("off_ack", ["Гашу лампы, сэр.", "Выключаю свет, сэр.", "Темнота, сэр."])
 LAMP_COLOR_ACK = _lamp_pack("color_ack", ["Готово, сэр.", "Меняю цвет, сэр.", "Как скажете, сэр."])
+LAMP_COLOR_UNKNOWN = _lamp_pack("color_unknown", [
+    "Сэр, такого цвета я не знаю.", "Не нашёл такой цвет в палитре, сэр."])
 LAMP_BRIGHT_ACK = _lamp_pack("bright_ack", ["Готово, сэр.", "Регулирую, сэр."])
+LAMP_BRIGHT_SET_ACK = _lamp_pack("bright_set_ack", [
+    "Яркость ламп {процент} процентов, сэр.", "Ставлю {процент}, сэр.",
+    "Готово, сэр — {процент} процентов."])
 LAMP_TEMP_ACK = _lamp_pack("temp_ack", ["Готово, сэр.", "Меняю оттенок белого, сэр."])
-LAMP_AUTO_ACK = _lamp_pack("auto_ack", ["Возвращаю авто-режим, сэр.", "Лампа снова реагирует сама, сэр."])
+LAMP_AUTO_ACK = _lamp_pack("auto_ack", ["Возвращаю авто-режим, сэр.", "Лампы снова реагируют сами, сэр."])
 LAMP_UNAVAILABLE = _lamp_pack("unavailable", [
-    "Сэр, лампа не отвечает.", "Не вижу лампу в сети, сэр.", "Лампа сейчас недоступна, сэр."])
+    "Сэр, лампы не отвечают.", "Не вижу ламп в сети, сэр.", "Лампы сейчас недоступны, сэр."])
+LAMP_UNAVAILABLE_ONE = _lamp_pack("unavailable_one", [
+    "Сэр, лампа «{имя}» не отвечает.", "Лампа «{имя}» сейчас не в сети, сэр."])
 
 # === Коннект с телефоном (приём событий MQTT от «Спутника Джарвиса») (ТЗ-9) ===
 PHONE_ENABLED = _get("phone", "enabled", True, "JARVIS_PHONE_ENABLED")
