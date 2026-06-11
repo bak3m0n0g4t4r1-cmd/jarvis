@@ -37,14 +37,9 @@ CORPUS_FILE = os.path.join(CORPUS_DIR, "corpus.json")
 RESULTS_DIR = os.path.join(BENCH_DIR, "results")
 SAMPLE_RATE = 16000
 
-# Кандидаты: пути относительно models/_bench (распакованные архивы sherpa-onnx).
-PRESETS = {
-    "zipformer-small-ru": {"тип": "transducer", "дир": None},   # текущая боевая (пути из config)
-    "zipformer-ru": {"тип": "transducer", "дир": "sherpa-onnx-zipformer-ru-2024-09-18"},
-    "giga-am-v2-ctc": {"тип": "nemo_ctc", "дир": "sherpa-onnx-nemo-ctc-giga-am-v2-russian-2025-04-19"},
-    "giga-am-v2-transducer": {"тип": "nemo_transducer",
-                              "дир": "sherpa-onnx-nemo-transducer-giga-am-v2-russian-2025-04-19"},
-}
+# Кандидаты — РОВНО те же пресеты и пути, что у боевого stt (config._ASR_PRESETS):
+# бенчмарк меряет именно то, что загрузит сервис после смены models.asr_preset.
+PRESETS = dict(config._ASR_PRESETS)
 
 # Фразы планировщика (гейт — слой правил, эталон = гейт сработал).
 SCHEDULER_PHRASES = [
@@ -235,34 +230,32 @@ def cmd_gen():
 # Прогон модели
 # ---------------------------------------------------------------------------- #
 def load_recognizer(preset: str):
+    """Загрузка РОВНО как stt._init_engines: те же ветки по типу и те же пути (config)."""
     import sherpa_onnx
 
     spec = PRESETS[preset]
     t0 = time.monotonic()
-    if spec["дир"] is None:
-        rec = sherpa_onnx.OfflineRecognizer.from_transducer(
-            encoder=str(config.ZIPFORMER_ENCODER), decoder=str(config.ZIPFORMER_DECODER),
-            joiner=str(config.ZIPFORMER_JOINER), tokens=str(config.ZIPFORMER_TOKENS),
-            num_threads=config.STT_NUM_THREADS, sample_rate=SAMPLE_RATE,
-            feature_dim=80, decoding_method="greedy_search")
+    if "дир" not in spec:   # боевой small: пути ZIPFORMER_* (уважают env-оверрайды)
+        paths = {"encoder": str(config.ZIPFORMER_ENCODER), "decoder": str(config.ZIPFORMER_DECODER),
+                 "joiner": str(config.ZIPFORMER_JOINER), "tokens": str(config.ZIPFORMER_TOKENS),
+                 "bpe": str(config.ZIPFORMER_BPE)}
     else:
-        d = os.path.join(BENCH_DIR, spec["дир"])
-        if spec["тип"] == "nemo_ctc":
-            rec = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
-                model=os.path.join(d, "model.int8.onnx"), tokens=os.path.join(d, "tokens.txt"),
-                num_threads=config.STT_NUM_THREADS, sample_rate=SAMPLE_RATE)
-        elif spec["тип"] == "nemo_transducer":
-            rec = sherpa_onnx.OfflineRecognizer.from_transducer(
-                encoder=os.path.join(d, "encoder.int8.onnx"), decoder=os.path.join(d, "decoder.onnx"),
-                joiner=os.path.join(d, "joiner.onnx"), tokens=os.path.join(d, "tokens.txt"),
-                num_threads=config.STT_NUM_THREADS, sample_rate=SAMPLE_RATE,
-                model_type="nemo_transducer")
-        else:  # transducer (zipformer полный, int8)
-            rec = sherpa_onnx.OfflineRecognizer.from_transducer(
-                encoder=os.path.join(d, "encoder.int8.onnx"), decoder=os.path.join(d, "decoder.onnx"),
-                joiner=os.path.join(d, "joiner.int8.onnx"), tokens=os.path.join(d, "tokens.txt"),
-                num_threads=config.STT_NUM_THREADS, sample_rate=SAMPLE_RATE,
-                feature_dim=80, decoding_method="greedy_search")
+        d = config.MODELS_DIR / spec["дир"]
+        paths = {k: str(d / v) for k, v in spec["файлы"].items()}
+    if spec["тип"] == "nemo_ctc":
+        rec = sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
+            model=paths["model"], tokens=paths["tokens"],
+            num_threads=config.STT_NUM_THREADS, sample_rate=SAMPLE_RATE)
+    elif spec["тип"] == "nemo_transducer":
+        rec = sherpa_onnx.OfflineRecognizer.from_transducer(
+            encoder=paths["encoder"], decoder=paths["decoder"], joiner=paths["joiner"],
+            tokens=paths["tokens"], model_type="nemo_transducer",
+            num_threads=config.STT_NUM_THREADS, sample_rate=SAMPLE_RATE)
+    else:  # zipformer_bpe (small и полный)
+        rec = sherpa_onnx.OfflineRecognizer.from_transducer(
+            encoder=paths["encoder"], decoder=paths["decoder"], joiner=paths["joiner"],
+            tokens=paths["tokens"], modeling_unit="bpe", bpe_vocab=paths["bpe"],
+            num_threads=config.STT_NUM_THREADS)
     print(f"модель {preset} загружена за {time.monotonic()-t0:.1f}с, RSS {rss_mb()} МБ", flush=True)
     return rec
 
