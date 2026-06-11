@@ -28,6 +28,7 @@ class PhoneModule(JarvisModule):
         super().__init__("jarvis-phone")
         self._env = AudioEnv()              # ducking музыки на время звонка (без замерных потоков)
         self._call_ducked = False
+        self._duck_timer = None             # страховка: вернуть музыку, если "ended" не пришёл
         self._battery_low_active = False    # эпизод низкого заряда (для троттлинга)
         self._battery_alert_at = 0.0
         self._presence = None               # последнее присутствие (home/away)
@@ -95,6 +96,7 @@ class PhoneModule(JarvisModule):
                     try:
                         self._env.duck()
                         self._call_ducked = True
+                        self._arm_duck_timeout()
                     except Exception:
                         self.log.debug("Не удалось приглушить музыку на звонок", exc_info=True)
             elif ctype == "ended":
@@ -102,7 +104,38 @@ class PhoneModule(JarvisModule):
         except Exception:
             self.log.debug("Сбой обработки звонка", exc_info=True)
 
+    def _arm_duck_timeout(self):
+        """Страховка: вернуть музыку через call_duck_timeout_seconds, если "ended" потерялся
+        (приложение упало/телефон ушёл из сети) — иначе музыка осталась бы тихой навсегда."""
+        try:
+            self._cancel_duck_timeout()
+            timeout = float(config.PHONE_DUCK_TIMEOUT)
+            if timeout <= 0:
+                return
+            t = threading.Timer(timeout, self._restore_call_by_timeout)
+            t.daemon = True
+            t.start()
+            self._duck_timer = t
+        except Exception:
+            self.log.debug("Не удалось взвести страховку ducking", exc_info=True)
+
+    def _cancel_duck_timeout(self):
+        t = self._duck_timer
+        self._duck_timer = None
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def _restore_call_by_timeout(self):
+        if self._call_ducked:
+            self.log.warning("Событие ended не пришло за %.0fс — возвращаю музыку по страховке",
+                             float(config.PHONE_DUCK_TIMEOUT))
+        self._restore_call()
+
     def _restore_call(self):
+        self._cancel_duck_timeout()
         if self._call_ducked:
             try:
                 self._env.restore()

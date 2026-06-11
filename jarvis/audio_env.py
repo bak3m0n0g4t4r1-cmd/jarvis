@@ -41,6 +41,7 @@ class AudioEnv:
         self._speaking = False
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._mon_proc: subprocess.Popen | None = None  # текущий pw-cat монитора (для стопа)
         self._ducked: dict[str, float] = {}   # sink-input id → исходная громкость (для restore)
         self._lock = threading.Lock()
         self._smoothed_vol = None  # сглаженная громкость голоса между фразами (нет рывка первой фразы)
@@ -61,6 +62,20 @@ class AudioEnv:
 
     def stop(self) -> None:
         self._stop.set()
+        # Разблокировать _monitor_loop: его blocking read() ждёт данных pw-cat. Терминируем
+        # текущий процесс и дожидаемся потоков — иначе на остановке оставалось окно
+        # с висящим pw-cat (дожимался только убийством cgroup).
+        proc = self._mon_proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        for t in self._threads:
+            try:
+                t.join(timeout=1.0)
+            except Exception:
+                pass
 
     def set_speaking(self, value: bool) -> None:
         """TTS сообщает, говорит ли сейчас Джарвис (чтобы не считать свой голос внешним шумом)."""
@@ -117,6 +132,7 @@ class AudioEnv:
                      "--channels", "1", "--format", "s16", "-"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 )
+                self._mon_proc = proc
                 while not self._stop.is_set():
                     buf = proc.stdout.read(block_bytes)
                     if not buf:
@@ -127,6 +143,7 @@ class AudioEnv:
                 _log.debug("Сбой замерщика воспроизведения (%s) — переоткрою", exc)
             finally:
                 self._monitor_rms = 0.0
+                self._mon_proc = None
                 if proc is not None:
                     try:
                         proc.terminate()

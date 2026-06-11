@@ -58,23 +58,51 @@ class OsAgentModule(JarvisModule):
         """Читает `gdbus monitor` и на ActionInvoked с ключом logs:<unit> открывает лог в kitty.
 
         Один gdbus-monitor на сервис; ловит клики по ЛЮБЫМ нашим уведомлениям (ключ кодирует модуль).
-        Сбой/выход монитора — на WARNING, сервис продолжает исполнять команды."""
+        Умер сам gdbus (перезапуск сессии D-Bus и т.п.) → ПЕРЕЗАПУСКАЕМ монитор с паузой — иначе
+        кнопка «Открыть логи» была бы мертва до рестарта сервиса (Этап 21)."""
+        while not self._stop_event.is_set():
+            try:
+                self._notif_proc = subprocess.Popen(
+                    ["gdbus", "monitor", "--session", "--dest", "org.freedesktop.Notifications"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                self.log.info("Слушатель кнопок уведомлений запущен (ActionInvoked → kitty)")
+                for line in self._notif_proc.stdout:
+                    if self._stop_event.is_set():
+                        break
+                    m = _ACTION_RE.search(line)
+                    if not m:
+                        continue
+                    key = m.group(1)
+                    if key.startswith(notify.ACTION_PREFIX):
+                        self._open_logs(key[len(notify.ACTION_PREFIX):])
+            except Exception:
+                self.log_exc(logging.WARNING, "Слушатель кнопок уведомлений сбоил")
+            finally:
+                self._reap_notif_proc()
+            if self._stop_event.is_set():
+                return
+            self.log.warning("gdbus monitor завершился — перезапущу слушатель кнопок через 5с")
+            if self._stop_event.wait(5):
+                return
+
+    def _reap_notif_proc(self):
+        """Дожать текущий gdbus monitor (terminate + wait) — без wait() копились бы зомби."""
+        proc = self._notif_proc
+        self._notif_proc = None
+        if proc is None:
+            return
         try:
-            self._notif_proc = subprocess.Popen(
-                ["gdbus", "monitor", "--session", "--dest", "org.freedesktop.Notifications"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-            self.log.info("Слушатель кнопок уведомлений запущен (ActionInvoked → kitty)")
-            for line in self._notif_proc.stdout:
-                if self._stop_event.is_set():
-                    break
-                m = _ACTION_RE.search(line)
-                if not m:
-                    continue
-                key = m.group(1)
-                if key.startswith(notify.ACTION_PREFIX):
-                    self._open_logs(key[len(notify.ACTION_PREFIX):])
+            proc.terminate()
         except Exception:
-            self.log_exc(logging.WARNING, "Слушатель кнопок уведомлений остановлен")
+            self.log.debug("Не удалось прервать gdbus monitor", exc_info=True)
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=1)
+            except Exception:
+                self.log.debug("gdbus monitor не дожат", exc_info=True)
 
     def _open_logs(self, unit: str):
         """Открыть лог юнита в kitty (journalctl --user). Только наши юниты (whitelist)."""
@@ -169,7 +197,13 @@ class OsAgentModule(JarvisModule):
         return None
 
     def on_environment(self, payload: dict):
-        """Рабочая среда (ТЗ-7): создать новый вирт. стол KDE, переключиться, запустить приложения.
+        """Рабочая среда (ТЗ-7): обработка в потоке — внутри паузы ENV_LAUNCH_DELAY на каждое
+        приложение, а MQTT-колбэк блокировать нельзя (следующие команды ждали бы секунды)."""
+        threading.Thread(target=self._open_environment, args=(payload,),
+                         daemon=True, name="os-environment").start()
+
+    def _open_environment(self, payload: dict):
+        """Создать новый вирт. стол KDE, переключиться, запустить приложения.
 
         Wayland: окна открываются на ТЕКУЩЕМ столе → создаём стол, переключаемся, ЗАТЕМ запускаем
         приложения (с паузами). Приложения — по тегам из своей карты команд (не произвольный shell).
@@ -284,12 +318,7 @@ class OsAgentModule(JarvisModule):
 
     def on_stop(self):
         """Погасить слушатель уведомлений (gdbus monitor) при остановке сервиса."""
-        proc = self._notif_proc
-        if proc is not None:
-            try:
-                proc.terminate()
-            except Exception:
-                self.log.debug("Не удалось прервать gdbus monitor", exc_info=True)
+        self._reap_notif_proc()
 
 
 def main():

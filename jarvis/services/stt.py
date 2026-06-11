@@ -28,6 +28,7 @@ _EVENT_SIZE = struct.calcsize(_EVENT_FMT)
 _EV_KEY = 1  # тип события — клавиша
 # Push-to-talk: не копим бесконечно (защита от зажатой/залипшей кнопки), потолок секунд.
 _PTT_MAX_SECONDS = 30
+_PTT_RESCAN_SECONDS = 60   # период переоткрытия клавиатур (подхват новых/выдернутых устройств)
 _PROC_DEVICES = "/proc/bus/input/devices"  # карта устройств ввода (поиск клавиатур для PTT)
 
 # Самовосстановление аудио-входа: сколько раз подряд пытаться переоткрыть микрофон,
@@ -453,46 +454,71 @@ class SttModule(JarvisModule):
         """Поток-читатель клавиатуры: следит за зажатием/отпусканием PTT-кнопки (/dev/input).
 
         Читаем сырые input_event, фильтруем EV_KEY + код кнопки. value 1=нажата, 0=отпущена,
-        2=автоповтор (игнорируем). Нет доступа (нет группы input) → WARN и тихо выходим (wake-word
-        продолжает работать)."""
-        paths = self._keyboard_event_paths()
-        fds = {}
-        for p in paths:
-            try:
-                fds[os.open(p, os.O_RDONLY | os.O_NONBLOCK)] = p
-            except OSError:
+        2=автоповтор (игнорируем). Нет доступа (нет группы input) → WARN раз + повторный поиск.
+
+        Устройства ПЕРЕОТКРЫВАЮТСЯ при ошибке fd и периодически (Этап 21): раньше выдернутая
+        USB-клавиатура либо тихо убивала поток (PTT мёртв до рестарта), либо вгоняла цикл в
+        busy-spin (select «readable» → read OSError → continue → снова select)."""
+        warned_no_access = False
+        announced = False  # «активен» объявляем ОДИН раз (плановые переоткрытия — на DEBUG)
+        while not self._stop_event.is_set():
+            fds = {}
+            for p in self._keyboard_event_paths():
+                try:
+                    fds[os.open(p, os.O_RDONLY | os.O_NONBLOCK)] = p
+                except OSError:
+                    continue
+            if not fds:
+                if not warned_no_access:
+                    warned_no_access = True
+                    announced = False
+                    self.log.warning(
+                        "Push-to-talk не активен: нет доступа к /dev/input (нужна группа input: "
+                        "`sudo usermod -aG input $USER` + перелогин) или клавиатура не найдена — "
+                        "поищу клавиатуры снова через %dс", _PTT_RESCAN_SECONDS)
+                if self._stop_event.wait(_PTT_RESCAN_SECONDS):
+                    return
                 continue
-        if not fds:
-            self.log.warning(
-                "Push-to-talk не активен: нет доступа к /dev/input (нужна группа input: "
-                "`sudo usermod -aG input $USER` + перелогин) или клавиатура не найдена")
-            return
-        self.log.info("Push-to-talk активен: кнопка код %d (%s)", config.PTT_KEYCODE, config.PTT_KEY)
-        try:
-            while not self._stop_event.is_set():
-                try:
-                    r, _, _ = select.select(list(fds), [], [], 0.5)
-                except Exception:
-                    break
-                for fd in r:
+            warned_no_access = False
+            if not announced:
+                announced = True
+                self.log.info("Push-to-talk активен: кнопка код %d (%s)", config.PTT_KEYCODE, config.PTT_KEY)
+            else:
+                self.log.debug("PTT: клавиатуры переоткрыты (%d устройств)", len(fds))
+            deadline = time.monotonic() + _PTT_RESCAN_SECONDS  # периодически подхватываем новые клавиатуры
+            reopen = False
+            try:
+                # Пока кнопка зажата (self._ptt) — плановое переоткрытие откладываем (не потерять release).
+                while not self._stop_event.is_set() and not reopen \
+                        and (time.monotonic() < deadline or self._ptt):
                     try:
-                        data = os.read(fd, _EVENT_SIZE * 64)
-                    except OSError:
-                        continue
-                    for off in range(0, len(data) - _EVENT_SIZE + 1, _EVENT_SIZE):
-                        _s, _us, etype, code, val = struct.unpack(
-                            _EVENT_FMT, data[off:off + _EVENT_SIZE])
-                        if etype == _EV_KEY and code == config.PTT_KEYCODE:
-                            if val == 1:
-                                self._ptt_press()
-                            elif val == 0:
-                                self._ptt_release()
-        finally:
-            for fd in fds:
-                try:
-                    os.close(fd)
-                except Exception:
-                    pass
+                        r, _, _ = select.select(list(fds), [], [], 0.5)
+                    except Exception:
+                        self.log.debug("PTT: select сбоил — переоткрою клавиатуры", exc_info=True)
+                        reopen = True
+                        break
+                    for fd in r:
+                        try:
+                            data = os.read(fd, _EVENT_SIZE * 64)
+                        except OSError:
+                            # Устройство выдернули — без переоткрытия был бы busy-spin на этом fd.
+                            self.log.debug("PTT: устройство ввода закрылось — переоткрою")
+                            reopen = True
+                            break
+                        for off in range(0, len(data) - _EVENT_SIZE + 1, _EVENT_SIZE):
+                            _s, _us, etype, code, val = struct.unpack(
+                                _EVENT_FMT, data[off:off + _EVENT_SIZE])
+                            if etype == _EV_KEY and code == config.PTT_KEYCODE:
+                                if val == 1:
+                                    self._ptt_press()
+                                elif val == 0:
+                                    self._ptt_release()
+            finally:
+                for fd in fds:
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass
 
     def _ptt_press(self):
         """Кнопка зажата → режим прослушивания команды без wake-word + приглушить музыку."""

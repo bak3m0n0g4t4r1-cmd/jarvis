@@ -1042,6 +1042,7 @@ LAMP_UNAVAILABLE = _lamp_pack("unavailable", [
 PHONE_ENABLED = _get("phone", "enabled", True, "JARVIS_PHONE_ENABLED")
 PHONE_ANNOUNCE_CALLS = _get("phone", "announce_calls", True, None)       # озвучивать входящие звонки
 PHONE_DUCK_ON_CALL = _get("phone", "duck_on_call", True, None)           # приглушать музыку на время звонка
+PHONE_DUCK_TIMEOUT = _get("phone", "call_duck_timeout_seconds", 180, None)  # страховка: вернуть музыку, если ended не пришёл
 PHONE_NOTIFY = _get("phone", "notify_notifications", True, None)         # дублировать уведомления телефона
 PHONE_BATTERY_ALERTS = _get("phone", "battery_alerts", True, None)       # сообщать о низком заряде
 PHONE_BATTERY_REPEAT_MIN = _get("phone", "battery_repeat_minutes", 30, None)  # не чаще раза в N минут

@@ -87,7 +87,9 @@ class SchedulerModule(JarvisModule):
                 json.dumps({"последнее_срабатывание": self._fired}, ensure_ascii=False),
                 encoding="utf-8")
         except Exception:
-            self.log.debug("Состояние планировщика не сохранено", exc_info=True)
+            # WARNING, не debug: без этого файла ломается анти-двойное срабатывание
+            # (после рестарта будильник/таймер может прозвонить повторно).
+            self.log_exc(logging.WARNING, "Состояние планировщика не сохранено")
 
     # ------------------------------------------------------------------ #
     # Озвучка

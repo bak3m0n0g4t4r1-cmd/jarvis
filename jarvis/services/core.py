@@ -189,6 +189,9 @@ class CoreModule(JarvisModule):
             except Exception:
                 self.log_exc(logging.ERROR,
                              "Непредвиденный сбой обработки реплики — сбрасываю состояние")
+            finally:
+                # IDLE на ЛЮБОМ исходе: раньше в режиме тишины (TTS не трогает состояния)
+                # thinking зависал до следующей фразы (видно в jarvis live).
                 self.set_state(contracts.STATE_IDLE)
 
     def _process_continuation(self, text: str, user_level: float | None = None):
@@ -210,6 +213,7 @@ class CoreModule(JarvisModule):
                               self._active_branch, match.tag, text)
                 self.set_state(contracts.STATE_THINKING)
                 self._execute_matched(match.tag, user_level, set_branch=False)
+                self.set_state(contracts.STATE_IDLE)  # не зависаем в thinking (режим тишины)
             except Exception:
                 self.log_exc(logging.WARNING, "Сбой обработки продолжения — игнорирую")
                 self.set_state(contracts.STATE_IDLE)
@@ -363,7 +367,7 @@ class CoreModule(JarvisModule):
         Состояние переживает рестарт (voice_volume.set_base → logs/volume_state.json)."""
         level = voice_volume.parse_level(text)
         if level is None:
-            return
+            return  # недостижимо: гейт is_volume_command требует распознанный уровень
         voice_volume.set_base(level)
         pct = round(level * 100)
         self.log.info("Базовая громкость голоса → %d%%", pct)
