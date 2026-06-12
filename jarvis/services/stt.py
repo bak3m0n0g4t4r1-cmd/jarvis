@@ -65,6 +65,9 @@ class SttModule(JarvisModule):
         self._noise_floor = config.QUIET_THRESHOLD  # старт на границе → до замера тишины держим базу
         self._vad_threshold = config.VAD_THRESHOLD  # текущий эффективный порог VAD
         self._last_vad_switch = 0.0                 # rate-limit пересборки VAD (анти-дёрганье)
+        # Перебивание речи голосом (barge-in): ОТДЕЛЬНЫЙ VAD, питается ТОЛЬКО пока Джарвис говорит
+        # (основной конвейер в это время молчит — анти-эхо). Строится лениво при первом перебивании.
+        self._barge_vad = None
         # Push-to-talk: пока кнопка зажата — копим аудио (без wake-word). Флаг пишет поток-читатель
         # клавиатуры, буфер ведёт ТОЛЬКО поток захвата (нет гонки). Ducking — через AudioEnv (pactl).
         self._ptt = False
@@ -225,6 +228,10 @@ class SttModule(JarvisModule):
                 self._process_ptt_buffer()
                 continue
             if self._is_muted():
+                # Пока Джарвис говорит — основной конвейер молчит (анти-эхо). Но СЛУШАЕМ на
+                # ПЕРЕБИВАНИЕ: точное «Джарвис…» поверх речи → мгновенный обрыв озвучки (barge-in).
+                if (config.BARGE_ENABLED and config.BARGE_VOICE_ENABLED and self._speaking):
+                    self._barge_listen(np.asarray(data, dtype=np.float32).reshape(-1))
                 # Помечаем, что при возобновлении нужен чистый сброс — чтобы
                 # частичный сегмент, накопленный на границе, не склеился
                 # со следующей фразой пользователя.
@@ -307,6 +314,13 @@ class SttModule(JarvisModule):
         if state == contracts.STATE_SPEAKING:
             if not self._speaking:
                 self._speaking = True
+                # Новая реплика — свежий barge-VAD (если уже строился): копит речь в пределах
+                # одной фразы Джарвиса, не таща хвосты прошлой.
+                if self._barge_vad is not None:
+                    try:
+                        self._barge_vad.reset()
+                    except Exception:
+                        pass
                 self.log.debug("STT пауза: state=speaking")
         elif self._speaking:
             # Речь закончилась — возобновляем не сразу, а после «хвоста».
@@ -467,6 +481,51 @@ class SttModule(JarvisModule):
         return None
 
     # ------------------------------------------------------------------ #
+    # Перебивание речи голосом (barge-in)
+    # ------------------------------------------------------------------ #
+    def _barge_stop(self, reason: str) -> None:
+        """Сигнал TTS оборвать текущую озвучку (barge-in). Если Джарвис молчит — для TTS это no-op."""
+        try:
+            self.publish_json(contracts.TOPIC_TTS_CONTROL,
+                              {"action": "stop", "reason": reason},
+                              qos=contracts.QOS_TTS_CONTROL)
+        except Exception:
+            self.log.debug("Не удалось отправить сигнал перебивания", exc_info=True)
+
+    def _barge_listen(self, samples: np.ndarray) -> None:
+        """Лёгкий детектор перебивания голосом, пока Джарвис говорит: точное «Джарвис…» поверх
+        речи → мгновенный обрыв + публикация команды. КОНСЕРВАТИВНО (без AEC микрофон слышит сам
+        голос Джарвиса): отдельный VAD + энерго-гейт (пользователь должен говорить ГРОМЧЕ эха) +
+        ТОЧНЫЙ wake-префикс (реплики Джарвиса не начинаются с «джарвис») + анти-эхо по содержанию.
+        Сегментирует на естественных паузах речи; для мгновенного обрыва посреди фразы — надёжнее PTT."""
+        try:
+            if self._barge_vad is None:
+                self._barge_vad = self._build_vad(config.VAD_THRESHOLD)
+            self._barge_vad.accept_waveform(samples)
+            while not self._barge_vad.empty():
+                seg = np.asarray(self._barge_vad.front.samples, dtype=np.float32)
+                self._barge_vad.pop()
+                rms = self._rms(seg) or 0.0
+                if rms < config.BARGE_MIN_RMS:
+                    continue  # тише порога — это эхо Джарвиса/фон, не намеренная команда
+                text = self._asr(seg)
+                if not text or not self._has_exact_wake(text) or self._is_echo(text):
+                    continue
+                self.log.info("Перебивание голосом: «%s» (RMS %.3f)", text[:40], rms)
+                self._barge_stop("wake")
+                # Остаток после «Джарвис» → обычная команда (core ответит/исполнит свежей фразой).
+                command = self._match_wake_word(text)
+                if command is not None:
+                    self._publish_input(command, wake=True, user_level=rms)
+                try:
+                    self._barge_vad.reset()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            self.log.debug("Сбой детектора перебивания голосом", exc_info=True)
+
+    # ------------------------------------------------------------------ #
     # Push-to-talk (зажатие клавиши → команда без wake-word)
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -557,11 +616,16 @@ class SttModule(JarvisModule):
                         pass
 
     def _ptt_press(self):
-        """Кнопка зажата → режим прослушивания команды без wake-word + приглушить музыку."""
+        """Кнопка зажата → режим прослушивания команды без wake-word + приглушить музыку.
+
+        Заодно ПЕРЕБИВАЕМ речь Джарвиса (barge-in): зажал кнопку, чтобы дать команду — значит, ему
+        пора замолчать. Физический сигнал, без эха → самый надёжный путь перебивания."""
         if self._ptt:
             return
         self._ptt = True
         self._ptt_buf = []
+        if config.BARGE_ENABLED:
+            self._barge_stop("ptt")  # если Джарвис говорит — мгновенно оборвать (иначе no-op)
         self.log.info("PTT: слушаю команду (кнопка зажата)")
         if config.DUCK_WHILE_LISTENING:
             try:

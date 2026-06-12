@@ -17,6 +17,10 @@ TOPIC_SAY = "jarvis/say"          # {"text","source","user_level"?,"min_volume"?
 #                                 # critical — срабатывание (будильник/таймер/напоминание): ОЗВУЧИТЬ даже в
 #                                 #   режиме тишины. Наличие min_volume тоже трактуется как critical (ТЗ-6).
 TOPIC_STATE = "jarvis/state"      # {"state": "...", "source": "..."}
+TOPIC_TTS_CONTROL = "jarvis/tts/control"  # перебивание речи (barge-in): {"action":"stop",
+#                                 # "reason":"ptt"|"wake"}. Публикует STT (зажат PTT или точное
+#                                 # «Джарвис…» поверх речи), подписан TTS → мгновенно обрывает
+#                                 # текущую озвучку (kill pw-cat) и чистит очередь фраз.
 TOPIC_ENVIRONMENT = "jarvis/environment"  # {"desktop": "имя стола", "apps": ["тег", ...]} (ТЗ-7)
 TOPIC_LAMP = "jarvis/lamp"        # голос-команда лампам (ТЗ-8, заход «лампы»); core форвардит поле
 #                                 # «лампа» распознанной команды: {"действие": "вкл|выкл|цвет|ярче|
@@ -50,6 +54,7 @@ QOS_INPUT = 0
 QOS_EXECUTE = 1
 QOS_SAY = 0
 QOS_STATE = 0
+QOS_TTS_CONTROL = 1   # сигнал обрыва не должен потеряться (at-least-once; обрыв идемпотентен)
 QOS_ENVIRONMENT = 1
 QOS_LAMP = 1      # голос-команда лампам не должна теряться (была 0). QoS1 = at-least-once:
 #                 # дубль на ЛОКАЛЬНОМ брокере практически исключён, действия идемпотентны.

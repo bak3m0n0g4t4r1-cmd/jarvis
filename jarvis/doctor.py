@@ -1292,6 +1292,17 @@ def check_push_to_talk():
         fix="sudo usermod -aG input $USER, затем ПЕРЕЛОГИН (та же группа нужна ydotool)")
 
 
+def check_barge_in() -> CheckResult:
+    """Перебивание речи (barge-in, Этап 23): согласованность настроек. PTT-обрыв надёжен всегда,
+    голосовой — best-effort (без AEC). Информационная проверка — не FAIL (фича вспомогательная)."""
+    if not config.BARGE_ENABLED:
+        return CheckResult(OK, "перебивание речи выключено (barge_in.enabled=false)")
+    voice = "по точному «Джарвис…»" if config.BARGE_VOICE_ENABLED else "выключено"
+    return CheckResult(
+        OK, f"перебивание речи: PTT «{config.PTT_KEY}» + голос {voice} "
+            f"(порог RMS {config.BARGE_MIN_RMS})")
+
+
 def check_notifications() -> list[CheckResult]:
     """Уведомления (ТЗ-6): gdbus есть, D-Bus-сервер с actions (кнопки), kitty для кнопки, состояние
     тишины читается. Нет графической сессии (headless/cron) → WARN, не FAIL (фича вспомогательная)."""
@@ -1830,6 +1841,7 @@ def run(quick: bool = False) -> bool:
     _safe(reporter, check_input_access)
     _safe(reporter, check_brightness)
     _safe(reporter, check_push_to_talk)
+    _safe(reporter, check_barge_in)
     _safe(reporter, check_notifications)
     _safe(reporter, check_system)
     _safe(reporter, check_lamp)

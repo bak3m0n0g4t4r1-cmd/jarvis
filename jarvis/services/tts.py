@@ -155,9 +155,13 @@ class TtsModule(JarvisModule):
         self._audio_state_cache: tuple[str, str] | None = None
         self._audio_check_at = 0.0
         self._audio_refreshing = False  # guard: один фоновый wpctl-замер за раз
+        # Перебивание речи (barge-in): взводится из on_control (STT попросил оборвать). Текущий
+        # синтез прерывается, очередь чистится. Намеренный обрыв ≠ сбой озвучки (см. _synth_and_play).
+        self._interrupt = threading.Event()
 
     def on_start(self):
         self.subscribe(contracts.TOPIC_SAY, self.on_say)
+        self.subscribe(contracts.TOPIC_TTS_CONTROL, self.on_control)  # перебивание речи (barge-in)
         self._worker = threading.Thread(target=self._run_worker, daemon=True)
         self._worker.start()
         # Постоянный замер звуковой обстановки (микрофон + monitor воспроизведения).
@@ -208,6 +212,33 @@ class TtsModule(JarvisModule):
                 critical,
             ))
 
+    def on_control(self, payload: dict):
+        """Перебивание речи (barge-in): пользователь заговорил (PTT/точное «Джарвис…») — мгновенно
+        оборвать текущую озвучку и выбросить отложенные фразы. Сама новая команда придёт обычным
+        путём (jarvis/input → core → jarvis/say) и озвучится свежей."""
+        try:
+            if (payload or {}).get("action") != "stop":
+                return
+            self._interrupt.set()
+            proc = self._play_proc
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()   # pw-cat завершится → write даст BrokenPipe → синтез прервётся
+                except Exception:
+                    self.log.debug("Не удалось прервать pw-cat при barge-in", exc_info=True)
+            self._drain_queue()        # отложенные фразы после перебивания не нужны
+            self.log.info("Перебивание (barge-in, %s) — обрываю озвучку", payload.get("reason", "?"))
+        except Exception:
+            self.log.debug("Сбой обработки barge-in", exc_info=True)
+
+    def _drain_queue(self) -> None:
+        """Выбросить все отложенные фразы из очереди (после перебивания/сброса)."""
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+
     def _run_worker(self):
         """Очередь озвучки по одной фразе. Воркер не умирает от единичного сбоя; стойкий сбой
         (3+ фразы) → CRITICAL, но продолжаем пытаться (вернётся устройство — озвучка оживёт)."""
@@ -215,6 +246,11 @@ class TtsModule(JarvisModule):
         announced_critical = False
         while not self._stop_event.is_set():
             try:
+                # Сбрасываем флаг перебивания ПЕРЕД новой фразой: очередь уже очищена в on_control,
+                # а свежая barge-команда придёт по jarvis/say ПОСЛЕ (paho-колбэки сериализованы) —
+                # её мы НЕ теряем. Чистим, не дренируем (drain — только в on_control до прихода команды).
+                if self._interrupt.is_set():
+                    self._interrupt.clear()
                 try:
                     text, level, min_volume, chime, critical = self._queue.get(timeout=0.5)
                 except queue.Empty:
@@ -443,6 +479,8 @@ class TtsModule(JarvisModule):
                 except Exception:
                     self.log.debug("Не удалось проиграть чайм", exc_info=True)
             for chunk in self._voice.synthesize(text, syn_config=syn):
+                if self._interrupt.is_set():
+                    break  # barge-in: пользователь заговорил — прекращаем синтез немедленно
                 pcm = chunk.audio_int16_bytes
                 if gain > 1.0:
                     pcm = AudioEnv.apply_gain(pcm, gain)
@@ -493,7 +531,10 @@ class TtsModule(JarvisModule):
                 cancelled = (sys.exc_info()[0] is not None
                              or proc.returncode not in (0, None))
                 env_stream.finish(cancelled)
-        if proc.returncode not in (0, None):
+        # Намеренный обрыв (barge-in убил pw-cat) — НЕ сбой: не поднимаем ошибку, не шлём
+        # уведомление/не считаем фразу проваленной. Лампы уже погасли через envelope cancel
+        # (returncode≠0 → cancelled=True в finally выше). Иначе ненулевой код — настоящий сбой.
+        if proc.returncode not in (0, None) and not self._interrupt.is_set():
             err = b"".join(err_buf)
             detail = err.decode("utf-8", "replace").strip() if err else ""
             raise RuntimeError(f"pw-cat вернул код {proc.returncode}: {detail or 'без stderr'}")
