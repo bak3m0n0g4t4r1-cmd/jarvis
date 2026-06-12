@@ -469,6 +469,31 @@ def check_hardware() -> list[CheckResult]:
     except Exception as exc:
         results.append(CheckResult(WARN, "Диск",
                                    reason=f"не удалось определить место: {exc}."))
+    # --- Режим CPU (governor): powersave замедляет ASR/Piper → задержку отклика (Этап 25) ---
+    try:
+        import glob
+
+        govs = []
+        for gf in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor")):
+            try:
+                with open(gf, encoding="utf-8") as f:
+                    govs.append(f.read().strip())
+            except Exception:
+                pass
+        if not govs:
+            results.append(CheckResult(OK, "Режим CPU: governor недоступен (нет cpufreq) — пропускаю"))
+        elif all(g == "performance" for g in govs):
+            results.append(CheckResult(OK, "Режим CPU: performance (отклик максимально быстрый)"))
+        else:
+            uniq = ", ".join(sorted(set(govs)))
+            results.append(CheckResult(
+                WARN, "Режим CPU",
+                reason=f"governor = {uniq} — на N100 это замедляет распознавание и синтез речи.",
+                fix="включите режим производительности: sudo systemctl enable --now jarvis-perf "
+                    "(или sudo tools/perf_mode.sh)",
+            ))
+    except Exception as exc:
+        results.append(CheckResult(WARN, "Режим CPU", reason=f"не удалось прочитать governor: {exc}."))
     return results
 
 

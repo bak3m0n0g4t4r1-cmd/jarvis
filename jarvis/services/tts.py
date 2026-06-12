@@ -184,6 +184,16 @@ class TtsModule(JarvisModule):
                 return
             self._voice_tried = True
             try:
+                # Число потоков синтеза (Этап 25): выставляем ДО первого создания сессии
+                # onnxruntime (PiperVoice.load). 0 — не трогать (онрантайм-дефолт). На N100
+                # первый чанк упирается в CPU — потоки + performance-governor режут задержку.
+                n = int(config.VOICE_SYNTH_THREADS or 0)
+                if n > 0:
+                    import os
+                    os.environ["OMP_NUM_THREADS"] = str(n)
+                    os.environ["ORT_INTRA_OP_NUM_THREADS"] = str(n)
+                    self.log.info("Piper: число потоков синтеза = %d", n)
+
                 from piper import PiperVoice
 
                 self._voice = PiperVoice.load(config.PIPER_MODEL, config_path=config.PIPER_CONFIG)

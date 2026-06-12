@@ -1,0 +1,27 @@
+[Unit]
+# Джарвис — режим производительности CPU (Этап 25).
+# СИСТЕМНЫЙ юнит (НЕ --user): governor пишется в /sys и требует root, поэтому
+# ставится отдельно от пользовательских сервисов Джарвиса:
+#
+#   sudo cp systemd/jarvis-perf.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now jarvis-perf
+#
+# Поднимает CPU в performance при загрузке и держит (RemainAfterExit). Откат:
+#   sudo systemctl disable --now jarvis-perf   (governor останется performance до ребута)
+#   sudo /путь/к/jarvis/tools/perf_mode.sh --off   (вернуть энергосбережение сразу)
+#
+# ПРИМЕР: путь к скрипту ниже под проект в %h недоступен в системном юните — укажите
+# АБСОЛЮТНЫЙ путь к tools/perf_mode.sh вашего проекта.
+Description=Джарвис — режим производительности CPU (performance governor)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Замените на абсолютный путь к скрипту в вашем проекте:
+ExecStart=/home/tux/proj/jarvis/tools/perf_mode.sh
+ExecStop=/home/tux/proj/jarvis/tools/perf_mode.sh --off
+
+[Install]
+WantedBy=multi-user.target

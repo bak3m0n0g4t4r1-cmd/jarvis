@@ -144,7 +144,7 @@ ECHO_SIMILARITY_THRESHOLD = _get("hearing", "echo_similarity_threshold", 0.6,
 MIN_SEGMENT_SAMPLES = _get("hearing", "min_segment_samples", 8000, "JARVIS_MIN_SEGMENT_SAMPLES")
 # VAD-пороги — НАСТРОЕНЫ ОПЫТНЫМ ПУТЁМ. Менять осторожно: влияет на распознавание речи.
 VAD_THRESHOLD = _get("hearing", "vad_threshold", 0.3, "JARVIS_VAD_THRESHOLD")
-VAD_MIN_SILENCE = _get("hearing", "vad_min_silence", 0.8, "JARVIS_VAD_MIN_SILENCE")
+VAD_MIN_SILENCE = _get("hearing", "vad_min_silence", 0.5, "JARVIS_VAD_MIN_SILENCE")
 VAD_MIN_SPEECH = _get("hearing", "vad_min_speech", 0.25, "JARVIS_VAD_MIN_SPEECH")
 VAD_BUFFER_SECONDS = _get("hearing", "vad_buffer_seconds", 10, "JARVIS_VAD_BUFFER_SECONDS")
 STT_NUM_THREADS = _get("hearing", "stt_num_threads", 1, "JARVIS_STT_NUM_THREADS")
@@ -282,6 +282,10 @@ VOICE_LENGTH_SCALE = _get("voice", "length_scale", 1.12, "JARVIS_VOICE_LENGTH_SC
 # Высота тона (1.0 норма, <1 ниже): подмена частоты pw-cat + компенсация темпа (независимо от
 # length_scale). Не формант-сохраняющий — разумный диапазон 0.88–1.0 (лёгкое понижение тона).
 VOICE_PITCH = _get("voice", "pitch", 0.95, "JARVIS_VOICE_PITCH")
+# Число потоков синтеза Piper (onnxruntime, Этап 25). 0 — НЕ трогать (онрантайм-дефолт, обычно по
+# числу ядер). На N100 первый чанк упирается в CPU — подберите оптимум замером (PERF tts: первый звук)
+# вместе с performance-governor. >0 выставляет OMP/ORT-потоки процесса TTS ДО загрузки голоса.
+VOICE_SYNTH_THREADS = _get("voice", "synth_threads", 0, "JARVIS_VOICE_SYNTH_THREADS")
 
 # === Адаптивная громкость: реальные уровни сигнала RMS (секция adaptive_audio) ===
 ADAPTIVE_VOLUME = _get("adaptive_audio", "enabled", True, "JARVIS_ADAPTIVE_VOLUME")

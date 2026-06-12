@@ -75,7 +75,8 @@ CORE «Мозг» (jarvis/services/core.py — тонкий сервис)
 - **STT «Уши»**: sherpa-onnx, **zipformer-ru** (`sherpa-onnx-small-zipformer-ru-2024-09-18`,
   offline transducer, int8). НЕ SenseVoice (без русского). silero-VAD. Захват
   sounddevice 16кГц моно. Wake-word «джарвис» через VAD+ASR + difflib (ловит «джарвиз/сервис»).
-  VAD-пороги ЗАКРЕПЛЕНЫ: `JARVIS_VAD_THRESHOLD=0.3`, `JARVIS_VAD_MIN_SILENCE=0.8` — НЕ ТРОГАТЬ.
+  VAD: `JARVIS_VAD_THRESHOLD=0.3` ЗАКРЕПЛЁН (НЕ трогать); `vad_min_silence` снижен 0.8→0.5 (Этап 25 —
+  рычаг задержки отклика, настраивается в settings.yaml).
   Лёгкость: `VAD_BUFFER_SECONDS=10` (было 30), `STT_NUM_THREADS=1` (sherpa — один поток; сверено:
   1 поток БЫСТРЕЕ 2/3 на этой модели). **Push-to-talk** (Этап 14): зажатие правого Ctrl → команда без
   wake-word (читаем /dev/input; ducking музыки; см. ГРАБЛИ). Замер TUXEDO (Этап 21в): RSS ~119 МБ
@@ -493,6 +494,20 @@ MQTT/логирование/shutdown — всё в базовом классе.
   core `_local_info_answer` (ПЕРЕД датой/временем). Секция `weather` в settings.yaml + config
   `WEATHER_*`. doctor `check_weather` (гейт/парсер дат прошлое/будущее). `jarvis doctor --quick`
   зелёный (✗0). Сервисов 8 (без новых; `pip install -e .` НЕ нужен). **ПРЕДУСЛОВИЕ:** `jarvis start`.
+- **Этап 25 (скорость отклика: минимизация задержки «договорил → ответ») — ✅ КОД ГОТОВ (живая
+  проверка/замеры за пользователем).** Профиль задержки (Этап 21б): VAD-пауза + первый чанк Piper —
+  доминанты, обе кратно зависят от CPU governor. Рычаги (по убыванию эффекта): (1) **CPU governor →
+  performance** (на N100 powersave душит короткие всплески ASR/Piper): `tools/perf_mode.sh`
+  (performance + EPP + platform_profile, идемпотентно, `--off` откат) + СИСТЕМНЫЙ юнит
+  `systemd/jarvis-perf.service` (root, `sudo systemctl enable --now jarvis-perf`); `jarvis doctor`
+  `check_hardware` WARN'ит, если governor ≠ performance. (2) **VAD-пауза `vad_min_silence` 0.8→0.5с**
+  (settings.yaml `hearing`) — прямые −300мс к отклику; `vad_threshold`/анти-эхо НЕ тронуты; PTT
+  по-прежнему обходит паузу. (3) **Потоки синтеза Piper** `voice.synth_threads` (0=онрантайм-дефолт;
+  >0 выставляет OMP/ORT ДО загрузки голоса) — рычаг первого чанка, подбирается замером
+  `PERF tts: первый звук` под performance-governor. (4) Префетч погоды в scheduler (фоновый поток при
+  старте) — утреннее срабатывание не ждёт сеть. `system.perf_debug=true` для замеров. doctor зелёный
+  (✗0). Сервисов 8 (без новых; `pip install -e .` НЕ нужен). **ПРЕДУСЛОВИЕ:** `sudo systemctl enable
+  --now jarvis-perf` (производительность) + `jarvis start`. Замер «договорил → первый звук» до/после.
 - **Возможное будущее (необязательно):** музыка-доводка / лайк (нужен ydotool) — отд. ТЗ.
   HUD — киношный визуал поверх готового пульта (веб-стек в прозрачном окне на Wayland, чисто
   визуальный). Только после устойчивой работы.
@@ -531,6 +546,8 @@ MQTT/логирование/shutdown — всё в базовом классе.
   матчер (команды распознаются по синонимам), сервисы, сквозная цепочка.
 - `jarvis models --download` — скачать модели по `models.yaml` (вкл. rubert-tiny2-onnx).
 - `pip install -e .` (в venv) — переустановить пакет после правок зависимостей.
+- `sudo tools/perf_mode.sh [--off]` — режим производительности CPU (Этап 25, рычаг задержки);
+  постоянно — системным юнитом `sudo systemctl enable --now jarvis-perf`.
 
 ---
 
@@ -598,6 +615,15 @@ MQTT/логирование/shutdown — всё в базовом классе.
 - **swap = 0 на TUXEDO** (на Kali был). На 8 ГБ без swap выше риск OOM-kill голосового
   конвейера под нагрузкой. Рекомендация — включить zram-swap (`sudo apt install zram-tools`).
   Жёсткий `MemoryMax` в юнитах намеренно НЕ ставим (лимит → OOM убил бы пульт).
+- **CPU governor — ГЛАВНЫЙ рычаг задержки на N100 (Этап 25).** intel_pstate под powersave/EPP=power
+  поднимает частоту лениво на коротких всплесках — а ASR-декод и первый чанк Piper это и есть короткие
+  всплески → задержка отклика кратно растёт. Фикс: `tools/perf_mode.sh` (performance + EPP=performance
+  + platform_profile) ставится системным юнитом `jarvis-perf.service` (root: `sudo systemctl enable
+  --now jarvis-perf`; user-юнит governor писать не может). `--off` возвращает энергосбережение.
+  `doctor.check_hardware` WARN'ит при governor ≠ performance. Числа потоков синтеза (`voice.synth_threads`)
+  и VAD-паузу (`vad_min_silence` 0.5) подбирать ЗАМЕРОМ (`system.perf_debug=true` → «PERF …»), НЕ по
+  памяти — performance-governor меняет баланс. `tools/perf_mode.sh` идемпотентен и не падает на
+  отсутствии `/sys`-файлов (EPP/platform_profile есть не везде).
 - `commands.yaml`: команды с `ждать_вывод: true` (сейчас `network_status`) пишут
   `cmd_<тег>_<время>.log` в `logs/` и НЕ ротируются — периодически чистить при активном use.
 - OS-агент дожинает fire-and-forget процессы (`_reap`), иначе короткие команды (wpctl/
@@ -769,7 +795,8 @@ MQTT/логирование/shutdown — всё в базовом классе.
   — на крошечной int8-zipformer накладные расходы потоков перевешивают параллелизм. `stt_num_threads=1`
   держим (и для VAD, и для распознавателя). Эмбеддер НЕ греем заранее (ленивость = экономия ~165МБ RAM
   на 8ГБ; первый промах +23мс — редко и приемлемо). Цепочка распознавания уже тугая; рычаг
-  ВОСПРИНИМАЕМОЙ задержки — VAD `vad_min_silence` 0.8с (закреплён, настраиваем; PTT его обходит).
+  ВОСПРИНИМАЕМОЙ задержки — VAD `vad_min_silence` (0.5с после Этапа 25; настраивается; PTT обходит) +
+  CPU governor (performance — Этап 25, главный множитель ASR/Piper на N100).
 - **Флаг `wake` в jarvis/input (Этап 15) — все подписчики ОБЯЗАНЫ его учитывать.** STT теперь публикует
   и фразы БЕЗ wake-word (`wake:false` + вся фраза) для продолжений. Подписчики `jarvis/input`: **core**
   (wake=false → только продолжение активной ветки), **scheduler** (wake=false вне диалога → ИГНОР, иначе

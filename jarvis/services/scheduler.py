@@ -58,6 +58,11 @@ class SchedulerModule(JarvisModule):
         self.subscribe(contracts.TOPIC_INPUT, self._on_input)
         self._thread = threading.Thread(target=self._tick_loop, daemon=True, name="scheduler-tick")
         self._thread.start()
+        # Префетч погоды в фоне (Этап 25): к утру кэш тёплый → утреннее срабатывание не ждёт
+        # сеть (HTTP до таймаута) в момент пробуждения. Сбой/нет сети — фраза без погоды, как и было.
+        if config.ALARM_WEATHER_ENABLED:
+            threading.Thread(target=self._prefetch_weather, daemon=True,
+                             name="scheduler-weather").start()
         try:
             n = len(alarms.read_schedule().get("будильники", []))
         except Exception:
@@ -1002,6 +1007,14 @@ class SchedulerModule(JarvisModule):
         w = weather.morning_weather()
         self._weather_cache = (today, w)
         return w
+
+    def _prefetch_weather(self):
+        """Прогреть кэш погоды заранее (фоновый поток при старте), чтобы утреннее срабатывание
+        не платило сетевой задержкой в момент пробуждения. Любой сбой — тихо (кэш не наполнится)."""
+        try:
+            self._get_weather()
+        except Exception:
+            self.log.debug("Префетч погоды не удался — утром возьму синхронно", exc_info=True)
 
     def _fire_morning(self, now):
         время = say_clock(now.hour, now.minute)
