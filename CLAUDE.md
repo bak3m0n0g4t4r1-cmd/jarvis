@@ -140,7 +140,8 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 │   ├── live.py               # живая панель `jarvis live` (rich.live: эфир/сервисы/расписание/перерыв)
 │   ├── lamp.py               # лампы: цвет/HSV-hex, реакции, гейт яркости голосом, адресация по имени, сэмплинг огибающей (хелперы)
 │   ├── voice_volume.py       # базовая громкость голосом (проценты/доли) + override (volume_state.json)
-│   ├── weather.py            # погода Open-Meteo (геокодинг кириллицей + кэш, best-effort, таймаут)
+│   ├── weather.py            # погода Open-Meteo (геокодинг кириллицей + кэш, best-effort, таймаут); current_weather/weather_for_date (forecast↔archive)
+│   ├── weather_query.py      # запрос погоды голосом: гейт «погод» + парсер дат (прошлое/будущее) + город + ответ-паки
 │   ├── cli.py, doctor.py, downloader.py, ui.py, services_map.py
 │   └── services/             # stt.py, core.py, os_agent.py, tts.py, activity_monitor.py, scheduler.py, lamp.py, phone.py — наследники JarvisModule, main()
 ├── systemd/                  # --user юниты, Restart=always, MemoryAccounting=true, ExecStart=абс. путь venv
@@ -155,7 +156,7 @@ python-dotenv (удалены). `httpx`/`protobuf` остаются только
 `jarvis/tts/control` {"action":"stop"} QoS1 (перебивание речи: STT→TTS, мгновенный обрыв озвучки).
 
 **Настройки** = ОДИН файл `settings.yaml` в корне (секции voice/adaptive_audio/hearing/
-recognition/startup/system/models/break_reminders/местоположение/alarms/timers/worldtime/coin/reminders/chains/notifications/silence/restart/environments/live/lamp/phone/voice_volume/pronunciation/theme, русские комментарии к каждому параметру). Код читает ТОЛЬКО через
+recognition/startup/system/models/break_reminders/местоположение/alarms/timers/worldtime/weather/coin/reminders/chains/notifications/silence/restart/environments/live/lamp/phone/voice_volume/pronunciation/theme, русские комментарии к каждому параметру). Код читает ТОЛЬКО через
 `config.py` (единая загрузка: приоритет env `JARVIS_*` → `settings.yaml` → дефолт; отсутствие
 файла/параметра → дефолт, не падает). Менять параметр = править `settings.yaml`, Python не трогать.
 VAD-пороги (0.3/0.8) и анти-эхо в файле помечены ⚠ «настроено опытным путём».
@@ -475,6 +476,23 @@ MQTT/логирование/shutdown — всё в базовом классе.
   лампы гаснут плавно через существующий `envelope cancel` (returncode≠0). Секция `barge_in` в
   settings. doctor `check_barge_in`. Сервисов 8 (без новых; `pip install -e .` НЕ нужен).
   **ПРЕДУСЛОВИЕ:** `jarvis start`.
+- **Этап 24 (глобальный пересмотр фраз + погодный модуль «какая погода») — ✅ КОД ГОТОВ (живая
+  проверка за пользователем; погода проверена вживую — сеть отвечает).** (1) ФРАЗЫ: пройдены паки
+  во ВСЕХ секциях settings.yaml и подтверждения в commands.yaml — усилен фирменный стиль J.A.R.V.I.S.
+  (сухая ирония дозированно, «сэр», забота под иронией, без «в лоб»), убраны шаблонные «Готово, сэр.»
+  и пресные вариации, добавлены вариации в скупые паки. Менялись ТОЛЬКО тексты — ключи `phrases.pick`,
+  плейсхолдеры, гейты, механизм фраз НЕ тронуты (поведение то же). (2) НОВЫЙ погодный модуль
+  `jarvis/weather_query.py` (по образцу worldtime): «Джарвис, какая погода» → погода СЕЙЧАС по региону
+  (Open-Meteo `current`); с маркером дня — дневной прогноз («погода сегодня/завтра/на субботу/13
+  числа/через 3 дня»); прошлое («погода вчера/5 июня») — в прошедшем времени; другой город («погода в
+  Париже», геокодинг с падежами из `worldtime`). Окно: forecast-эндпоинт [−92…+16] дней; глубже в
+  прошлое — archive (ERA5, с 1940). Вне окна/нет данных/нет сети/город не найден → элегантный отказ
+  (паки `too_far_future/too_far_past/no_network/not_found_city`). Гейт `is_weather_query` — строгий
+  якорь «погод» (точная основа, БЕЗ difflib → нечёткое отсеивается, не сработает вместо погоды иное).
+  `weather.py` расширен: `current_weather`, `weather_for_date` (выбор forecast↔archive). Врезка в
+  core `_local_info_answer` (ПЕРЕД датой/временем). Секция `weather` в settings.yaml + config
+  `WEATHER_*`. doctor `check_weather` (гейт/парсер дат прошлое/будущее). `jarvis doctor --quick`
+  зелёный (✗0). Сервисов 8 (без новых; `pip install -e .` НЕ нужен). **ПРЕДУСЛОВИЕ:** `jarvis start`.
 - **Возможное будущее (необязательно):** музыка-доводка / лайк (нужен ydotool) — отд. ТЗ.
   HUD — киношный визуал поверх готового пульта (веб-стек в прозрачном окне на Wayland, чисто
   визуальный). Только после устойчивой работы.
@@ -549,6 +567,20 @@ MQTT/логирование/shutdown — всё в базовом классе.
 - **Произношение чисел (`speech.py`):** время/дата/проценты в info-ответах — словами («четырнадцать
   часов тридцать минут», «седьмое июня…», «сорок пять процентов»), иначе Piper читал криво. Все
   числа в озвучке идут через `speech.py`; падежи в `core.py` подобраны под него (винит./именит.).
+- **Погодный модуль (`weather_query.py`, Этап 24): свой парсер дат, НЕ reminders.** `reminders.parse_date`
+  кидает прошедшую дату в БУДУЩЕЕ (напоминание на «11-е» = следующий месяц) — для погоды НЕЛЬЗЯ: «погода
+  на 11», когда сегодня 12-е, это ВЧЕРА. Поэтому `parse_weather_date` — отдельный (словари дней/месяцев
+  переиспазованы из reminders, но направление прошлое/будущее своё: «N числа» = этот месяц без прыжка,
+  «N месяца» = этот год без прыжка, есть «вчера/позавчера/N назад/N лет назад»). Окно данных: forecast-
+  эндпоинт `api.open-meteo.com/v1/forecast` покрывает `past_days≤92` и `forecast_days≤16`; ГЛУБЖЕ в
+  прошлое — `archive-api.open-meteo.com/v1/archive` (ERA5, с 1940, лаг ~5 дней, без `precipitation_
+  probability`). Выбор endpoint — в `weather.weather_for_date` по знаку delta. Гейт `is_weather_query` —
+  СТРОГИЙ якорь «погод» (точная основа, БЕЗ difflib): нечёткая фраза без «погод» сюда не зайдёт (не
+  сработает вместо погоды что-то ещё); один гейт + один обработчик с ветвлением по дате/городу — подкоманды
+  не путаются. Город — `_detect_city` по «в/во <город>» с чёрным списком временных/бытовых слов (дни недели,
+  «на улице» не город) + геокодинг `worldtime._candidates` (падежи). Сетевой вызов в core синхронно (как
+  worldtime) — приемлемо; нет сети/вне окна/город не найден → паки-отказы (не падение). Температуры —
+  `speech.say_temperature` (именит. падеж, как в утреннем будильнике — консистентно).
 - **Адаптивная громкость (`audio_env.py`):** меряем РЕАЛЬНЫЕ RMS сигнала, НЕ позиции регуляторов.
   Уровень воспроизведения — `pw-cat --record --target <ID>` monitor-source (по ИМЕНИ ЗАВИСАЕТ —
   только по ID, находить через `pactl list short sources`). Внешний шум = mic − k·monitor (вычесть

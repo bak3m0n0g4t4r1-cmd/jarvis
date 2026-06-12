@@ -1809,6 +1809,46 @@ def check_alarms() -> list[CheckResult]:
     return results
 
 
+def check_weather() -> list[CheckResult]:
+    """Погодный модуль (Этап 24): гейт «погод» строгий, парсер дат прошлое/будущее, паки на месте.
+
+    Гейт и парсер — офлайн (поломка → FAIL). Сетевой ответ не дёргаем (как и в check_alarms)."""
+    results = []
+    try:
+        from datetime import date
+
+        from jarvis import weather_query as wq
+    except Exception as exc:
+        return [CheckResult(FAIL, "погода: импорт", reason=str(exc),
+                            fix="см. jarvis/weather_query.py")]
+    try:
+        t = date(2026, 6, 12)  # пятница — эталон для проверки направлений
+        gate_ok = (wq.is_weather_query("какая погода")
+                   and not wq.is_weather_query("включи свет"))
+        now_none = wq.parse_weather_date("какая погода", t) is None          # «сейчас»
+        today = wq.parse_weather_date("погода сегодня", t) == t
+        tomorrow = wq.parse_weather_date("погода завтра", t) == date(2026, 6, 13)
+        # «на 11 числа», когда сегодня 12-е → ВЧЕРА (прошлое не прыгает в будущее).
+        past_day = wq.parse_weather_date("погода на 11 числа", t) == date(2026, 6, 11)
+        yest = wq.parse_weather_date("погода вчера", t) == date(2026, 6, 11)
+        city = wq._detect_city("погода в париже") == "париже"
+        packs_ok = all(config.WEATHER_NOW and config.WEATHER_DAY_FUTURE
+                       and config.WEATHER_NO_NETWORK for _ in (0,))
+        if gate_ok and now_none and today and tomorrow and past_day and yest and city and packs_ok:
+            results.append(CheckResult(
+                OK, "погода: гейт «погод» строгий, даты (сегодня/завтра/прошлое/город) — верны"))
+        else:
+            results.append(CheckResult(
+                FAIL, "погода: гейт/парсер дат",
+                reason=f"gate={gate_ok} none={now_none} today={today} tomorrow={tomorrow} "
+                       f"past={past_day} yest={yest} city={city} packs={packs_ok}",
+                fix="см. jarvis/weather_query.py (is_weather_query/parse_weather_date)"))
+    except Exception as exc:
+        results.append(CheckResult(FAIL, "погода: логика", reason=str(exc),
+                                   fix="см. jarvis/weather_query.py"))
+    return results
+
+
 # --------------------------------------------------------------------------- #
 # Оркестрация
 # --------------------------------------------------------------------------- #
@@ -1856,6 +1896,7 @@ def run(quick: bool = False) -> bool:
     _safe(reporter, check_embedder)
     _safe(reporter, check_matcher)
     _safe(reporter, check_alarms)
+    _safe(reporter, check_weather)
     _safe(reporter, check_chains)
     if not quick:
         reporter.note("синтез тестового сэмпла Piper…")

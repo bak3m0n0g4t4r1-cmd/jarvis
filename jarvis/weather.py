@@ -148,3 +148,88 @@ def morning_weather(region: str | None = None, timeout: float | None = None):
     except Exception:
         _log.debug("Получение погоды не удалось", exc_info=True)
         return None
+
+
+# === Расширение Этапа 24: текущая погода и погода на конкретную дату ================
+# Источник тот же Open-Meteo, БЕЗ ключа. Будущее/недавнее прошлое — forecast (current/daily,
+# past_days≤92, forecast_days≤16). Глубокое прошлое — archive (ERA5, с 1940, лаг ~5 дней).
+# Любой сбой/нет сети → None (модуль погоды отвечает в характере, не падает).
+
+_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+
+def current_weather(lat: float, lon: float, timeout: float | None = None):
+    """Погода СЕЙЧАС → {'температура','ощущается','характер','день'} или None.
+
+    `день` = True днём / False ночью (Open-Meteo is_day) — для фраз «солнечно/ясная ночь»."""
+    if timeout is None:
+        timeout = config.ALARM_WEATHER_TIMEOUT
+    data = _get_json(_FORECAST_URL, {
+        "latitude": lat, "longitude": lon,
+        "current": "temperature_2m,apparent_temperature,weather_code,is_day",
+        "timezone": "auto",
+    }, timeout)
+    try:
+        cur = (data or {}).get("current") or {}
+        return {
+            "температура": round(float(cur["temperature_2m"])),
+            "ощущается": round(float(cur["apparent_temperature"])),
+            "характер": _wmo_text(cur["weather_code"]),
+            "день": bool(cur.get("is_day", 1)),
+        }
+    except Exception:
+        _log.debug("Разбор текущей погоды не удался", exc_info=True)
+        return None
+
+
+def weather_for_date(lat: float, lon: float, target, timeout: float | None = None):
+    """Дневная погода на дату `target` (datetime.date) → {'темп_макс','темп_мин','характер',
+    'осадки'} или None. Сама выбирает endpoint: недавние даты [−92..+16] дней — forecast;
+    глубокое прошлое — archive. `осадки` — вероятность дождя в % (forecast) либо None (archive)."""
+    if timeout is None:
+        timeout = config.ALARM_WEATHER_TIMEOUT
+    try:
+        from datetime import date as _date
+        today = _date.today()
+        delta = (target - today).days
+        iso = target.isoformat()
+        if -92 <= delta <= 16:
+            # Окно forecast-эндпоинта (прогноз + недавняя история).
+            url = _FORECAST_URL
+            params = {
+                "latitude": lat, "longitude": lon,
+                "daily": ("temperature_2m_max,temperature_2m_min,weather_code,"
+                          "precipitation_probability_max"),
+                "timezone": "auto", "start_date": iso, "end_date": iso,
+            }
+        else:
+            # Глубокое прошлое — реанализ-архив ERA5.
+            url = _ARCHIVE_URL
+            params = {
+                "latitude": lat, "longitude": lon,
+                "daily": "temperature_2m_max,temperature_2m_min,weather_code",
+                "timezone": "auto", "start_date": iso, "end_date": iso,
+            }
+        data = _get_json(url, params, timeout)
+        daily = (data or {}).get("daily") or {}
+        tmax = daily.get("temperature_2m_max") or []
+        tmin = daily.get("temperature_2m_min") or []
+        codes = daily.get("weather_code") or []
+        if not tmax or tmax[0] is None or not tmin or tmin[0] is None:
+            return None
+        prob = daily.get("precipitation_probability_max") or []
+        осадки = None
+        if prob and prob[0] is not None:
+            try:
+                осадки = int(round(float(prob[0])))
+            except (TypeError, ValueError):
+                осадки = None
+        return {
+            "темп_макс": round(float(tmax[0])),
+            "темп_мин": round(float(tmin[0])),
+            "характер": _wmo_text(codes[0] if codes else None),
+            "осадки": осадки,
+        }
+    except Exception:
+        _log.debug("Разбор погоды на дату не удался", exc_info=True)
+        return None

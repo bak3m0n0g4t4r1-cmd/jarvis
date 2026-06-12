@@ -21,7 +21,7 @@ from pathlib import Path
 
 import yaml
 
-from jarvis import chains, config, contracts, phrases, silence, system, voice_volume, worldtime
+from jarvis import chains, config, contracts, phrases, silence, system, voice_volume, weather_query, worldtime
 from jarvis import lamp as lamp_helpers
 from jarvis.breaks import is_stop_phrase
 from jarvis.bus import JarvisModule
@@ -450,6 +450,12 @@ class CoreModule(JarvisModule):
         coin = self._coin_answer(low)
         if coin is not None:
             return coin
+        # Погода («какая погода», «погода завтра», «погода в Париже») — ПЕРЕД датой/временем
+        # (фраза может содержать «сегодня/завтра»). Якорь «погод» строгий: иначе сюда не зайдём.
+        if weather_query.is_weather_query(text):
+            w = weather_query.answer(text)
+            if w:
+                return w
         # Мировое время («сколько времени в <город>») — ПЕРЕД локальным (оно тоже ловит «сколько
         # времени», но без города это локальное время). detect_city → None, если города нет.
         city = worldtime.detect_city(text)
