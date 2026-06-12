@@ -47,6 +47,26 @@ def _num_word(tok):
     return _ONES.get(tok) or _TENS.get(tok)
 
 
+def _relative_delta(s):
+    """«через N минут/часов» → timedelta или None («через минуту/час» = 1).
+
+    Только минуты/часы: «через N дней/недель/месяцев» — дело parse_date (уровень даты).
+    Нужна, чтобы «напомни через 30 минут» не прочлось как 30:00→06:00 (parse_time берёт
+    первое число за ЧАС). «полтора/полторы» здесь НЕ ловим (дробное), вернём None."""
+    m = re.search(r"через\s+(\w+)\s+(минут\w*|час\w*)", s)
+    if m:
+        n = _num_word(m.group(1)) or (int(m.group(1)) if m.group(1).isdigit() else None)
+        unit = m.group(2)
+    else:
+        m1 = re.search(r"через\s+(минуту|час)\b", s)
+        if not m1:
+            return None
+        n, unit = 1, m1.group(1)
+    if not n:
+        return None
+    return timedelta(minutes=n) if unit.startswith("минут") else timedelta(hours=n)
+
+
 def _month_in(s):
     """Найти номер месяца по основе слова в строке, иначе None."""
     for stem, num in _MON.items():
@@ -181,6 +201,13 @@ def parse_when(text, today=None):
     чтобы «15 июня» (день) не принялось за время 15:00."""
     try:
         s = _norm(text)
+        # «через N минут/часов» = относительный момент now+Δ. Ловим ДО parse_time, иначе
+        # «через 30 минут» прочлось бы как 30:00→06:00. Кладём в модель (дата, время) — дальше
+        # scheduler._compute_fire соберёт точный datetime (с переходом через полночь).
+        delta = _relative_delta(s)
+        if delta is not None:
+            fire = datetime.now() + delta
+            return fire.date(), (fire.hour, fire.minute), True
         d = parse_date(s, today)
         t = None
         if _TIME_MARK.search(s):
