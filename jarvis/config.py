@@ -49,6 +49,34 @@ except Exception as _exc:  # битый YAML — НЕ падаем, предуп
     _SETTINGS = {}
 
 
+def _deep_merge(base: dict, over: dict) -> dict:
+    """Рекурсивно слить `over` в `base` НА МЕСТЕ: dict-над-dict идёт вглубь (вложенные секции
+    дополняются, а не затираются целиком), остальное — замена. Возвращает base."""
+    for key, val in (over or {}).items():
+        if isinstance(val, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], val)
+        else:
+            base[key] = val
+    return base
+
+
+# Локальный оверрайд settings.local.yaml (в .gitignore): машинные правки и СЕКРЕТЫ (ключи ламп
+# и т.п.) — поверх settings.yaml, не попадая в git. Глубокий мёрдж: можно переопределить только
+# lamp.lamps, не дублируя весь файл. Нет файла → штатно (никаких изменений). Битый → предупреждаем.
+SETTINGS_LOCAL_FILE = _resolve(os.getenv("JARVIS_SETTINGS_LOCAL",
+                                         str(BASE_DIR / "settings.local.yaml")))
+try:
+    with open(SETTINGS_LOCAL_FILE, encoding="utf-8") as _lf:
+        _local = yaml.safe_load(_lf) or {}
+    if isinstance(_local, dict) and _local:
+        _deep_merge(_SETTINGS, _local)
+except FileNotFoundError:
+    pass
+except Exception as _exc:  # битый локальный YAML — игнорируем оверрайд, не роняем сервис
+    print(f"[config] ВНИМАНИЕ: не удалось разобрать {SETTINGS_LOCAL_FILE}: {_exc} — "
+          "игнорирую локальный оверрайд", file=sys.stderr)
+
+
 def _cast(value, default):
     """Привести значение к типу дефолта (bool/int/float/list/str)."""
     if isinstance(default, bool):
@@ -61,7 +89,9 @@ def _cast(value, default):
         return float(value)
     if isinstance(default, list):
         if isinstance(value, list):
-            return [str(v) for v in value]
+            # Элементы-словари/списки НЕ приводим к строке (иначе вложенные структуры из YAML
+            # схлопнулись бы в строки — класс бага Этапа 17); строки/числа — как раньше, в строку.
+            return [v if isinstance(v, (dict, list)) else str(v) for v in value]
         return [s.strip() for s in str(value).split(",") if s.strip()]
     if isinstance(default, dict):
         # Словарь (напр. именованные среды) — возвращаем как есть; не из dict → дефолт.
