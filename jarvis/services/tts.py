@@ -51,6 +51,19 @@ class _EnvelopeStream:
         type(self)._seq += 1    # новый стрим = новая фраза
         self._id = type(self)._seq
 
+    def mark_start(self, write_ts: float) -> None:
+        """Якорь старта ЗВУКА по метке, снятой ПЕРЕД первым write в pw-cat. write первого
+        (длинного) предложения блокируется на наполнение пайпа ядра (~64КБ ≈ 1.5с) — раньше
+        t0 ставился в feed() ПОСЛЕ write и съезжал на величину блокировки, ломая упреждение
+        ламп. write_ts — time.time() (epoch, НЕ perf_counter: лампы сэмплируют по time.time())
+        прямо перед proc.stdin.write первого реального звука (чайм/чанк). Идемпотентен."""
+        if self._t0 is not None:
+            return
+        self._t0 = write_ts + float(config.LAMP_ANIM_START_OFFSET_MS) / 1000.0
+        if config.PERF_DEBUG:
+            self._m.log.info("PERF tts: якорь анимации t0=%.4f (старт_задержка %.0fмс от write)",
+                             self._t0, float(config.LAMP_ANIM_START_OFFSET_MS))
+
     def feed(self, pcm: bytes) -> None:
         """Учесть чанк, только что УСПЕШНО записанный в pw-cat, и опубликовать батч уровней."""
         try:
@@ -421,9 +434,11 @@ class TtsModule(JarvisModule):
                     data = _chime_pcm(rate)
                     if gain > 1.0:
                         data = AudioEnv.apply_gain(data, gain)  # чайм не тонет в шуме (как фраза)
+                    ts = time.time()  # якорь анимации ДО write (write блокируется на пайпе)
                     proc.stdin.write(data)
                     _mark_first()  # чайм — первый РЕАЛЬНЫЙ звук (раньше PERF-метка его не видела)
                     if env_stream is not None:
+                        env_stream.mark_start(ts)  # якорь по метке перед write чайма
                         env_stream.feed(data)
                 except Exception:
                     self.log.debug("Не удалось проиграть чайм", exc_info=True)
@@ -432,9 +447,11 @@ class TtsModule(JarvisModule):
                 if gain > 1.0:
                     pcm = AudioEnv.apply_gain(pcm, gain)
                 try:
+                    ts = time.time()  # якорь анимации ДО write первого чанка (если чайма не было)
                     proc.stdin.write(pcm)  # стримим по мере синтеза
                     _mark_first()
                     if env_stream is not None:
+                        env_stream.mark_start(ts)  # no-op, если t0 уже поставлен чаймом
                         env_stream.feed(pcm)
                 except BrokenPipeError:
                     break

@@ -1130,14 +1130,15 @@ def _anim(key, default):
 
 
 LAMP_ANIM_ENABLED = _anim("вкл", True)              # false → прежнее ровное свечение speaking
-LAMP_ANIM_FPS_MAX = _anim("fps_max", 6.0)           # потолок кадров/с на лампу (реальный темп задаёт RTT ACK)
+LAMP_ANIM_FPS_MAX = _anim("fps_max", 8.0)           # потолок кадров/с на лампу (реальный темп задаёт RTT ACK)
 LAMP_ANIM_ATTACK_MS = _anim("атака_мс", 60.0)       # подъём яркости к пику
 LAMP_ANIM_RELEASE_MS = _anim("спад_мс", 250.0)      # мягкий спад («дыхание»)
-LAMP_ANIM_BRIGHT_MIN = _anim("яркость_мин", 25)     # пол яркости в паузах речи (%)
-LAMP_ANIM_BRIGHT_MAX = _anim("яркость_макс", 90)    # потолок на пиках (%)
+LAMP_ANIM_BRIGHT_MIN = _anim("яркость_мин", 65)     # пол яркости в паузах речи (%)
+LAMP_ANIM_BRIGHT_MAX = _anim("яркость_макс", 100)   # потолок на пиках (%) — полная на громких слогах
 LAMP_ANIM_GAMMA = _anim("гамма", 0.6)               # кривая уровень→яркость (<1 — тихое заметнее)
 LAMP_ANIM_HUE_DRIFT = _anim("дрейф_оттенка", 8.0)   # ± градусов HSV в такт уровню (0 = выкл)
 LAMP_ANIM_START_OFFSET_MS = _anim("старт_задержка_мс", 50.0)  # компенсация латентности pw-cat
+LAMP_ANIM_LOOKAHEAD_MS = _anim("опережение_мс", 90.0)  # упреждение конвейера лампы: сэмпл огибающей на N мс вперёд (float!)
 LAMP_ANIM_MAX_SECONDS = _anim("макс_сек", 30.0)     # страховка от «застрявшей» анимации
 LAMP_ANIM_WINDOW_MS = _anim("окно_мс", 50.0)        # окно RMS огибающей в TTS (мс)
 

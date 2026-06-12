@@ -290,7 +290,7 @@ def cmd_live(args) -> int:
     return live.run()
 
 
-def _lamp_run_action(name: str, creds: dict, action: str, tinytuya) -> bool:
+def _lamp_run_action(name: str, creds: dict, action: str, tinytuya, args=None) -> bool:
     """Одно действие CLI над одной лампой (по кредам из lamp.lamps). True — успех.
 
     Управление — БОЕВЫМ DPS-путём сервиса (DP20/21/22/23/24), НЕ set_colour tinytuya:
@@ -342,6 +342,8 @@ def _lamp_run_action(name: str, creds: dict, action: str, tinytuya) -> bool:
                  23: helpers.pct_to_dp(40)}, nowait=False)
         elif action == "rtt":
             _lamp_bench_rtt(name, bulb, helpers)
+        elif action == "sync":
+            _lamp_calibrate_sync(name, bulb, helpers, args)
         return True
     except Exception as exc:
         print(f"✗ «{name}»: ошибка связи: {exc}")
@@ -392,12 +394,126 @@ def _lamp_bench_rtt(name: str, bulb, helpers) -> None:
     print(f"→ рекомендация: lamp.animation.fps_max ≈ {fps} (0.8 × 1000/p50)")
 
 
+def _lamp_calibrate_sync(name: str, bulb, helpers, args) -> None:
+    """Калибровка синхронности «свет↔звук»: метроном из щелчков (pw-cat) + вспышка лампы с
+    регулируемым УПРЕЖДЕНИЕМ. Пользователь глазом/ухом ловит совпадение вспышки со щелчком —
+    найденное упреждение и есть `lamp.animation.опережение_мс`.
+
+    Привязка звука — как в сервисе: щелчок аудио-позиции p слышен в (метка перед write) +
+    старт_задержка_мс + p (буфер pw-cat). Вспышку шлём на `опережение` раньше звука. Если
+    оценка старт_задержка_мс верна, совпадение наступает ровно при опережение = задержка
+    конвейера лампы → найденный offset переносится в опережение_мс БЕЗ пересчёта."""
+    import threading
+    import time
+
+    import numpy as np
+
+    rate = 22050
+    warmup = 0.5                         # прогрев pw-cat тишиной — стабильная латентность вывода
+    period = max(0.6, float(getattr(args, "period", None) or 1.2))
+    sweep = bool(getattr(args, "sweep", False))
+    l_audio = float(config.LAMP_ANIM_START_OFFSET_MS) / 1000.0   # оценка латентности pw-cat (= t0)
+    # Перебор или фикс упреждения (мс). Дефолт фикс — текущее опережение из настроек.
+    if sweep:
+        seq_ms = list(range(0, 221, 20))                         # 0…220мс шагом 20
+    else:
+        base = getattr(args, "offset", None)
+        base = float(config.LAMP_ANIM_LOOKAHEAD_MS) if base is None else float(base)
+        seq_ms = [base] * int(getattr(args, "beats", None) or 8)
+    beats = len(seq_ms)
+
+    def _click() -> np.ndarray:
+        n = int(rate * 0.03)             # резкий щелчок 30мс, 1500Гц, с микро-fade от трещин
+        t = np.arange(n) / rate
+        w = np.sin(2 * np.pi * 1500.0 * t)
+        fade = max(1, int(rate * 0.004))
+        env = np.ones(n)
+        env[:fade] = np.linspace(0, 1, fade)
+        env[-fade:] = np.linspace(1, 0, fade)
+        return w * env * 0.8
+
+    click = _click()
+    tail = np.zeros(max(1, int(rate * period) - len(click)))     # тишина до конца такта
+    beat = np.concatenate([click, tail])
+    buf = np.concatenate([np.zeros(int(rate * warmup))] + [beat] * beats)
+    pcm = np.clip(buf * 32767, -32768, 32767).astype(np.int16).tobytes()
+
+    flash = helpers.rgb_to_v2hex(40, 90, 255, 100)               # яркая вспышка (голубая, V=100%)
+    dark = helpers.rgb_to_v2hex(40, 90, 255, 2)                  # почти тёмный фон между тактами
+    print(f"→ «{name}» калибровка синхронности: {beats} тактов по {period:.1f}с"
+          + (" (СВИП упреждения 0…220мс)" if sweep else f", упреждение {seq_ms[0]:.0f}мс"))
+    print("  Смотри/слушай: вспышка лампы должна совпасть со щелчком. Свет опаздывает →")
+    print("  увеличь опережение_мс; свет убегает вперёд → уменьши. Ctrl+C — стоп.")
+    bulb.set_multiple_values({20: True, 21: "colour", 24: dark}, nowait=False)
+
+    cmd = ["pw-cat", "-p", "--raw", "--rate", str(rate), "--channels", "1", "--format", "s16",
+           "--volume", "0.8", "--latency", f"{config.TTS_LATENCY_MS}ms", "-"]
+    if config.TTS_SINK:
+        cmd += ["--target", config.TTS_SINK]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    holder: dict = {}
+
+    def _writer():
+        holder["t0"] = time.time()       # метка ПЕРЕД первым write — якорь аудиопотока
+        try:
+            proc.stdin.write(pcm)
+            proc.stdin.close()
+        except Exception:
+            pass
+
+    th = threading.Thread(target=_writer, daemon=True, name="sync-writer")
+    th.start()
+    while "t0" not in holder:
+        time.sleep(0.001)
+    t0 = holder["t0"]
+    try:
+        for k in range(beats):
+            off = seq_ms[k] / 1000.0
+            t_sound = t0 + warmup + k * period + l_audio          # когда щелчок слышен
+            t_flash = t_sound - off                               # вспышку — на упреждение раньше
+            dt = t_flash - time.time()
+            if dt > 0:
+                time.sleep(dt)
+            if sweep:
+                print(f"  такт {k + 1}/{beats}: упреждение {seq_ms[k]:.0f}мс")
+            bulb.set_multiple_values({24: flash}, nowait=False)   # вспышка
+            time.sleep(0.12)
+            bulb.set_multiple_values({24: dark}, nowait=False)    # гашение
+    except KeyboardInterrupt:
+        print("\n  прервано.")
+    finally:
+        try:
+            th.join(timeout=max(2.0, period))
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        # Вернуть лампу в фон (тёплый из настроек) — не оставлять тёмной/синей.
+        bg = config.LAMP_BACKGROUND or {}
+        bg_rgb = helpers.resolve_color(bg.get("цвет"), config.LAMP_COLORS) or (255, 170, 87)
+        bulb.set_multiple_values(
+            {20: True, 21: "colour",
+             24: helpers.rgb_to_v2hex(*bg_rgb, helpers.clamp_pct(bg.get("яркость"), 100))},
+            nowait=False)
+    if sweep:
+        print("→ запомни такт, где вспышка совпала со щелчком, и поставь его упреждение в "
+              "lamp.animation.опережение_мс.")
+    else:
+        print(f"→ если совпало — оставь lamp.animation.опережение_мс = {seq_ms[0]:.0f}; "
+              "иначе подбери (--offset МС) или прогони --sweep.")
+
+
 def cmd_lamp(args) -> int:
-    """Прямое управление лампами для проверки кредов (БЕЗ сервисов/голоса): on|off|status|test|rtt.
+    """Прямое управление лампами для проверки кредов (БЕЗ сервисов/голоса): on|off|status|test|rtt|sync.
 
     --lamp ИМЯ — одна лампа из settings.yaml (lamp.lamps); без флага — все по очереди.
     Помогает убедиться, что device_id/local_key/ip/версия верны; rtt — замер задержки ACK
-    (по нему выбирается потолок кадров анимации fps_max)."""
+    (по нему выбирается потолок кадров анимации fps_max); sync — калибровка синхронности
+    анимации со звуком (метроном + вспышки с регулируемым упреждением → опережение_мс)."""
     action = getattr(args, "action", "status")
     devices = dict(config.LAMP_DEVICES)
     want = (getattr(args, "lamp", None) or "").strip()
@@ -426,7 +542,7 @@ def cmd_lamp(args) -> int:
     rc = 0
     for name, creds in devices.items():
         try:
-            if not _lamp_run_action(name, creds, action, tinytuya):
+            if not _lamp_run_action(name, creds, action, tinytuya, args):
                 rc = 1
         except Exception as exc:
             print(f"✗ «{name}»: неожиданный сбой: {exc}")
@@ -470,12 +586,22 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="статус сервисов").set_defaults(func=cmd_status)
     sub.add_parser("restart", help="перезапустить все сервисы Джарвиса + объявить статус").set_defaults(func=cmd_restart)
     sub.add_parser("live", help="живая панель состояния (до Ctrl+C)").set_defaults(func=cmd_live)
-    p_lamp = sub.add_parser("lamp", help="проверка/управление умными лампами (on|off|status|test|rtt)")
+    p_lamp = sub.add_parser("lamp",
+                            help="проверка/управление умными лампами (on|off|status|test|rtt|sync)")
     p_lamp.add_argument("action", nargs="?", default="status",
-                        choices=["on", "off", "status", "test", "rtt"],
-                        help="действие (по умолчанию status; rtt — замер задержки для fps анимации)")
+                        choices=["on", "off", "status", "test", "rtt", "sync"],
+                        help="действие (по умолчанию status; rtt — замер задержки ACK; "
+                             "sync — калибровка синхронности анимации со звуком)")
     p_lamp.add_argument("--lamp", metavar="ИМЯ", default="",
                         help="одна лампа из lamp.lamps (по умолчанию — все по очереди)")
+    p_lamp.add_argument("--offset", type=float, default=None, metavar="МС",
+                        help="sync: упреждение света над звуком, мс (дефолт — текущее опережение_мс)")
+    p_lamp.add_argument("--sweep", action="store_true",
+                        help="sync: автоперебор упреждения 0…220мс по тактам (ловить совпадение)")
+    p_lamp.add_argument("--beats", type=int, default=8, metavar="N",
+                        help="sync: число тактов метронома (по умолчанию 8)")
+    p_lamp.add_argument("--period", type=float, default=1.2, metavar="С",
+                        help="sync: период метронома в секундах (по умолчанию 1.2)")
     p_lamp.set_defaults(func=cmd_lamp)
 
     return parser

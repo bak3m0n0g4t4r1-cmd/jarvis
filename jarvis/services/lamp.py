@@ -344,7 +344,16 @@ class LampUnit:
         # Интервал кадров отсчитываем от СТАРТА отправки: ожидание ACK — часть кадра, иначе
         # фактический темп был бы (1/fps + RTT), а не fps_max (поймано тестом пейсинга).
         self._last_frame_at = time.time()
-        self._dps(data)
+        if first and config.PERF_DEBUG:
+            # Объективная калибровка: рассинхрон первого кадра от t0 (−lead = упредили,
+            # +N = опоздали) и фактический ACK. По ним выставляется опережение_мс.
+            skew = (self._last_frame_at - (engine._t0 or self._last_frame_at)) * 1000.0
+            self._dps(data)
+            rtt = (time.time() - self._last_frame_at) * 1000.0
+            self.log.info("PERF lamp «%s»: первый кадр, рассинхрон от t0 %+.0fмс, ACK %.0fмс",
+                          self.name, skew, rtt)
+        else:
+            self._dps(data)
         self._last_frame = (bright, hue)
 
     # ------------------------------------------------------------------ #
@@ -575,10 +584,11 @@ class AnimationEngine:
         """Сколько воркеру ждать до следующего кадра (потолок fps_max; до старта звука — пауза)."""
         try:
             now = time.time()
+            lead = max(0.0, float(config.LAMP_ANIM_LOOKAHEAD_MS) / 1000.0)
             with self._lock:
                 if self._seq is None:
                     return 0.5
-                pre = self._t0 - now
+                pre = (self._t0 - lead) - now   # первый кадр уходит на lead раньше t0
             if pre > 0:
                 return min(max(pre, _FRAME_MIN_WAIT), 0.5)
             fps = max(1.0, float(config.LAMP_ANIM_FPS_MAX))
@@ -608,10 +618,17 @@ class AnimationEngine:
                     unit.name, {"level": 0.0, "t": 0.0, "first": False, "done": False})
                 if st["done"]:
                     return None
-                if now < self._t0 - 0.05:
-                    return None   # звук ещё не начался — старт строго вместе с речью
+                # Упреждение конвейера лампы: свет появляется через ~ACK (+ лаг атаки) ПОСЛЕ
+                # команды, поэтому сэмплируем огибающую на lead ВПЕРЁД — тогда свет совпадёт со
+                # звуком. Данные «будущего» уже в self._levels (батч на всю фразу пришёл заранее).
+                # sample_t КЛАМПИМ потолком end: иначе на последних lead мс sample_envelope
+                # вернул бы 0 (now+lead > end) и хвост фразы погас бы раньше голоса.
+                lead = max(0.0, float(config.LAMP_ANIM_LOOKAHEAD_MS) / 1000.0)
+                if now + lead < self._t0 - 0.05:
+                    return None   # звук ещё не начался даже с учётом упреждения
                 end = self._effective_end_locked()
-                raw = helpers.sample_envelope(self._levels, self._t0, self._win, now, end=end)
+                sample_t = min(now + lead, end)
+                raw = helpers.sample_envelope(self._levels, self._t0, self._win, sample_t, end=end)
                 prev, tprev = st["level"], st["t"]
                 dt = (now - tprev) if tprev > 0 else 0.0
                 tau_ms = float(config.LAMP_ANIM_ATTACK_MS if raw > prev
