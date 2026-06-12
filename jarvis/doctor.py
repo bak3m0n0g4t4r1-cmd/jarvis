@@ -6,8 +6,8 @@
 решение: что произошло → почему (по типу/коду ошибки) → точная команда/правка.
 
 Режим по умолчанию — ПОЛНАЯ глубокая проверка (загрузка моделей движком, эмбеддер
-команд, синтез Piper, стабильность MQTT, здоровье юнитов, сквозная цепочка). Флаг
-`--quick` пропускает долгие тесты (синтез Piper, сквозная цепочка).
+команд, синтез голоса, стабильность MQTT, здоровье юнитов, сквозная цепочка). Флаг
+`--quick` пропускает долгие тесты (синтез голоса, сквозная цепочка).
 Флаг `--deep` оставлен как no-op алиас (дефолт и так полный).
 
 Сам doctor не падает: каждая проверка обёрнута в try-except И прогоняется через
@@ -83,7 +83,7 @@ def check_imports() -> list[CheckResult]:
     """Все зависимости реально импортируются (import, а не «пакет установлен»)."""
     modules = [
         "paho.mqtt.client", "yaml", "numpy", "sounddevice",
-        "sherpa_onnx", "piper", "onnxruntime", "tokenizers",
+        "sherpa_onnx", "onnxruntime", "tokenizers",
     ]
     results = []
     for mod in modules:
@@ -94,8 +94,43 @@ def check_imports() -> list[CheckResult]:
             results.append(CheckResult(
                 FAIL, f"import {mod}",
                 reason=f"модуль не импортируется: {exc}",
-                fix="pip install -e .  (а sherpa-onnx/piper-tts — сверьте версии для вашей платформы)",
+                fix="pip install -e .  (а sherpa-onnx — сверьте версию для вашей платформы)",
             ))
+    # Piper — опциональный аварийный фоллбэк-голос (extra [piper]); основной голос Silero из
+    # кэша работает без него, поэтому отсутствие = WARN, не FAIL.
+    try:
+        importlib.import_module("piper")
+        results.append(CheckResult(OK, "import piper (фоллбэк-голос)"))
+    except Exception:
+        results.append(CheckResult(
+            WARN, "import piper",
+            reason="не установлен — аварийный фоллбэк-голос недоступен (основной Silero из кэша работает).",
+            fix="pip install -e '.[piper]'  (нужен лишь если torch/Silero недоступны)",
+        ))
+    # Слой 2 матчера: sklearn/joblib нужны для ОБУЧЕНИЯ классификатора. Без них матчер
+    # деградирует на косинус-kNN — это рабочий fallback, поэтому WARN, а не FAIL.
+    for mod in ("sklearn", "joblib"):
+        try:
+            importlib.import_module(mod)
+            results.append(CheckResult(OK, f"import {mod} (классификатор Слоя 2)"))
+        except Exception as exc:
+            results.append(CheckResult(
+                WARN, f"import {mod}",
+                reason=f"не импортируется: {exc} — Слой 2 деградирует на косинус-kNN (рабочий fallback).",
+                fix="pip install -e .  (для ML-классификатора Слоя 2: scikit-learn, joblib)",
+            ))
+    # torch нужен ТОЛЬКО для синтеза голоса Silero (сборка кэша + редкий свободный текст).
+    # В рантайме горячий путь идёт из WAV-кэша БЕЗ torch — поэтому отсутствие = WARN, не FAIL.
+    try:
+        importlib.import_module("torch")
+        results.append(CheckResult(OK, "import torch (синтез Silero)"))
+    except Exception:
+        results.append(CheckResult(
+            WARN, "import torch",
+            reason="не установлен — синтез Silero недоступен (рантайм играет из кэша, но пополнить "
+                   "кэш и озвучить свободный текст не сможет).",
+            fix="pip install -e '.[silero]' --extra-index-url https://download.pytorch.org/whl/cpu",
+        ))
     return results
 
 
@@ -238,11 +273,15 @@ def check_config_paths() -> list[CheckResult]:
         "zipformer joiner": Path(config.ZIPFORMER_JOINER),
         "zipformer tokens": Path(config.ZIPFORMER_TOKENS),
         "zipformer bpe": Path(config.ZIPFORMER_BPE),
-        "Piper-голос": Path(config.PIPER_MODEL),
-        "Piper-config": Path(config.PIPER_CONFIG),
         "эмбеддер (модель)": Path(config.EMBEDDER_MODEL),
         "эмбеддер (токенизатор)": Path(config.EMBEDDER_TOKENIZER),
     }
+    # Модель активного движка голоса обязательна; Piper (фоллбэк) проверяется отдельно (WARN).
+    if config.TTS_ENGINE == "piper":
+        paths["Piper-голос"] = Path(config.PIPER_MODEL)
+        paths["Piper-config"] = Path(config.PIPER_CONFIG)
+    else:
+        paths["Silero-голос"] = Path(config.SILERO_MODEL)
     results = []
     for label, path in paths.items():
         if not path.is_absolute():
@@ -469,6 +508,31 @@ def check_hardware() -> list[CheckResult]:
     except Exception as exc:
         results.append(CheckResult(WARN, "Диск",
                                    reason=f"не удалось определить место: {exc}."))
+    # --- Режим CPU (governor): powersave замедляет ASR/Piper → задержку отклика (Этап 25) ---
+    try:
+        import glob
+
+        govs = []
+        for gf in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor")):
+            try:
+                with open(gf, encoding="utf-8") as f:
+                    govs.append(f.read().strip())
+            except Exception:
+                pass
+        if not govs:
+            results.append(CheckResult(OK, "Режим CPU: governor недоступен (нет cpufreq) — пропускаю"))
+        elif all(g == "performance" for g in govs):
+            results.append(CheckResult(OK, "Режим CPU: performance (отклик максимально быстрый)"))
+        else:
+            uniq = ", ".join(sorted(set(govs)))
+            results.append(CheckResult(
+                WARN, "Режим CPU",
+                reason=f"governor = {uniq} — на N100 это замедляет распознавание и синтез речи.",
+                fix="включите режим производительности: sudo systemctl enable --now jarvis-perf "
+                    "(или sudo tools/perf_mode.sh)",
+            ))
+    except Exception as exc:
+        results.append(CheckResult(WARN, "Режим CPU", reason=f"не удалось прочитать governor: {exc}."))
     return results
 
 
@@ -550,9 +614,21 @@ def check_embedder() -> CheckResult:
             reason=f"векторы неосмысленны: похожие {similar:.3f} ≤ разные {different:.3f}.",
             fix="сверьте модель эмбеддера и пулинг (mean) в jarvis/matcher.py",
         )
+    # Какая модель активна: int8 (квантованная, ×4 меньше RAM) или fp32. Информативно.
+    import os
+    kind = "INT8" if config.EMBEDDER_MODEL == config.EMBEDDER_MODEL_INT8 else "fp32"
+    try:
+        mb = os.path.getsize(config.EMBEDDER_MODEL) / 1e6
+        size = f", {mb:.0f} МБ"
+    except OSError:
+        size = ""
+    hint = ""
+    if kind == "fp32" and config.EMBEDDER_PREFER_INT8 and not os.path.exists(config.EMBEDDER_MODEL_INT8):
+        hint = " — для ×4 экономии RAM: jarvis models --quantize"
     return CheckResult(
         OK,
-        f"Эмбеддер команд грузится и осмыслен (похожие {similar:.3f} > разные {different:.3f})")
+        f"Эмбеддер команд: {kind}{size}, осмыслен "
+        f"(похожие {similar:.3f} > разные {different:.3f}){hint}")
 
 
 def check_matcher() -> CheckResult:
@@ -603,6 +679,108 @@ def check_matcher() -> CheckResult:
         )
     return CheckResult(
         OK, f"Матчер: {len(real)} команд распознаются по синонимам (правила)")
+
+
+# Антонимы — ГЛАВНЫЙ риск распознавания: вкл/выкл и громче/тише обязаны идти в РАЗНЫЕ теги.
+# Их разводит слой ПРАВИЛ (эмбеддинги/классификатор полярность не кодируют). Регрессия здесь =
+# Джарвис выполняет противоположное действие, поэтому проверяем явной парной санити (без сети).
+_ANTONYM_PAIRS = [
+    ("включи свет", "выключи свет"),
+    ("громче", "тише"),
+    ("включи вайфай", "выключи вайфай"),
+    ("включи блютуз", "выключи блютуз"),
+]
+
+
+def check_antonyms() -> CheckResult:
+    """Антонимы разводятся слоем правил в разные теги (не выполнить противоположное)."""
+    import yaml
+
+    from jarvis import matcher as matcher_mod
+
+    try:
+        with open(config.COMMANDS_FILE, encoding="utf-8") as f:
+            commands = yaml.safe_load(f) or {}
+    except Exception as exc:
+        return CheckResult(WARN, "Антонимы (правила)",
+                           reason=f"не прочитать {config.COMMANDS_FILE}: {exc}.",
+                           fix="проверьте синтаксис commands.yaml")
+    # Только правила: полярность — забота слоя правил, эмбеддер не трогаем.
+    m = matcher_mod.Matcher(commands, embedder=_DisabledEmbedder())
+    bad = []
+    for a, b in _ANTONYM_PAIRS:
+        ra, rb = m.match(a), m.match(b)
+        ta = ra.tag if ra else None
+        tb = rb.tag if rb else None
+        # Пара валидна, только если ОБА распознаны и в РАЗНЫЕ теги.
+        if ta is None or tb is None or ta == tb:
+            bad.append(f"«{a}»→{ta} / «{b}»→{tb}")
+    if bad:
+        return CheckResult(
+            FAIL, "Антонимы (правила)",
+            reason=f"пары НЕ разведены: {'; '.join(bad)} — риск противоположного действия.",
+            fix="дайте антонимам РАЗНЫЕ точные синонимы в commands.yaml (см. CLAUDE.md, правило 3)",
+        )
+    return CheckResult(OK, f"Антонимы разведены правилами ({len(_ANTONYM_PAIRS)} пар: вкл/выкл, громче/тише)")
+
+
+def check_classifier() -> CheckResult:
+    """Слой 2 (классификатор) реально обучается/грузится из кеша и верно классифицирует примеры.
+
+    Проверяем работоспособность, а не наличие файла: матчер строит классификатор (из кеша
+    matcher_clf.npz или обучением), затем мы прогоняем выборку `примеры` ФОРСОМ через Слой 2
+    (минуя правила) и считаем долю верных. Классификатор выключен/sklearn нет → WARN (косинус
+    работает). Низкая точность → WARN (стоит перетюнить C/порог). Битый кеш ловит сам матчер.
+    """
+    import yaml
+
+    from jarvis import matcher as matcher_mod
+
+    if not config.MATCHER_CLF_ENABLED:
+        return CheckResult(WARN, "Классификатор Слоя 2",
+                           reason="отключён (recognition.clf_enabled=false) — работает косинус-kNN.",
+                           fix="включите clf_enabled в settings.yaml для ML-классификатора")
+    try:
+        with open(config.COMMANDS_FILE, encoding="utf-8") as f:
+            commands = yaml.safe_load(f) or {}
+    except Exception as exc:
+        return CheckResult(WARN, "Классификатор Слоя 2",
+                           reason=f"не прочитать {config.COMMANDS_FILE}: {exc}.",
+                           fix="проверьте синтаксис commands.yaml")
+    m = matcher_mod.Matcher(commands)  # реальный эмбеддер: классификатору нужны вектора
+    if not m._ensure_classifier():
+        return CheckResult(
+            WARN, "Классификатор Слоя 2",
+            reason="не обучился и не загрузился из кеша — Слой 2 работает на косинусе.",
+            fix="pip install -e . (scikit-learn/joblib); проверьте эмбеддер; "
+                "удалите models/rubert-tiny2-onnx/matcher_clf.npz для переобучения",
+        )
+    real = {t: s for t, s in commands.items()
+            if t not in matcher_mod._RESERVED_KEYS and isinstance(s, dict)}
+    correct = total = 0
+    for tag, spec in real.items():
+        for ex in (spec or {}).get("примеры") or []:
+            total += 1
+            r = m._match_semantic(matcher_mod.normalize(ex))
+            if r is not None and r.tag == tag:
+                correct += 1
+    if total == 0:
+        return CheckResult(WARN, "Классификатор Слоя 2",
+                           reason="нет поля «примеры» для оценки.",
+                           fix="добавьте «примеры» командам в commands.yaml")
+    acc = correct / total
+    n_classes = int(m._clf_classes.shape[0]) if m._clf_classes is not None else 0
+    # Порог тревоги мягкий: ниже 0.80 in-sample — повод перетюнить C/clf_threshold.
+    if acc < 0.80:
+        return CheckResult(
+            WARN, "Классификатор Слоя 2",
+            reason=f"низкая точность на примерах: {correct}/{total} = {acc*100:.0f}% (порог "
+                   f"clf={config.MATCHER_CLF_THRESHOLD}).",
+            fix="перетюньте recognition.clf_c/clf_threshold (tools/bench_matcher.py)",
+        )
+    return CheckResult(
+        OK, f"Классификатор Слоя 2: {n_classes} классов, примеры {correct}/{total} "
+            f"= {acc*100:.0f}% (порог clf={config.MATCHER_CLF_THRESHOLD}/{config.MATCHER_CLF_MARGIN})")
 
 
 def check_audio() -> list[CheckResult]:
@@ -770,45 +948,125 @@ def check_sherpa_models() -> list[CheckResult]:
     return results
 
 
-def check_piper_voice() -> CheckResult:
-    """Голос Piper загружается движком (синтез сэмпла — в --deep)."""
-    # ВНИМАНИЕ: API piper-tts менялся между версиями — сверить на целевой машине.
-    try:
-        from piper import PiperVoice
-        PiperVoice.load(config.PIPER_MODEL, config_path=config.PIPER_CONFIG)
-        return CheckResult(OK, "Голос Piper загружается движком")
-    except Exception as exc:
-        return CheckResult(
-            FAIL, "Голос Piper загружается движком",
-            reason=f"движок не смог загрузить голос: {exc}",
-            fix="jarvis models --download  (или сверьте JARVIS_PIPER_MODEL/_CONFIG)",
-        )
+def check_ffmpeg() -> CheckResult:
+    """ffmpeg доступен — нужен для офлайн «JARVIS-DSP» (обработка голоса под дворецкого)."""
+    import shutil
+    if shutil.which("ffmpeg"):
+        return CheckResult(OK, "ffmpeg доступен (JARVIS-DSP)")
+    return CheckResult(FAIL, "ffmpeg доступен",
+                       reason="не найден — обработка голоса и сборка кэша невозможны.",
+                       fix="sudo apt install ffmpeg")
+
+
+def check_tts_voice() -> CheckResult:
+    """Модель активного голоса на месте (быстро, без torch). Реальный синтез — в --deep."""
+    if config.TTS_ENGINE == "piper":
+        p = Path(config.PIPER_MODEL)
+        return (CheckResult(OK, "Голос Piper: модель на месте") if p.exists()
+                else CheckResult(FAIL, "Голос Piper", reason=f"нет файла: {p}",
+                                 fix="jarvis models --download"))
+    p = Path(config.SILERO_MODEL)
+    if not p.exists():
+        return CheckResult(FAIL, "Голос Silero (eugene)", reason=f"нет файла: {p}",
+                           fix="jarvis models --download silero_eugene")
+    size_mb = p.stat().st_size / 1e6
+    if size_mb < 5:
+        return CheckResult(WARN, "Голос Silero (eugene)",
+                           reason=f"подозрительно мал ({size_mb:.1f} МБ) — возможно, битая загрузка.",
+                           fix="jarvis models --download silero_eugene")
+    return CheckResult(OK, f"Голос Silero (eugene): модель на месте ({size_mb:.0f} МБ)")
 
 
 def check_sample_rate() -> CheckResult:
-    """Согласованность частот: STT 16 кГц vs частота голоса Piper («бурундук»)."""
-    import json
-
-    try:
-        with open(config.PIPER_CONFIG, encoding="utf-8") as f:
-            voice_sr = int(json.load(f).get("audio", {}).get("sample_rate", 0))
-    except Exception as exc:
-        return CheckResult(
-            WARN, "Согласованность частот дискретизации",
-            reason=f"не удалось прочитать sample_rate из {config.PIPER_CONFIG}: {exc}.",
-            fix="скачайте корректный config голоса: jarvis models --download",
-        )
+    """Согласованность частот: STT 16 кГц vs частота синтеза/воспроизведения голоса."""
     stt_sr = config.SAMPLE_RATE
-    # TTS воспроизводит на частоте голоса (см. tts.py), поэтому разные частоты —
-    # норма; важно лишь, что воспроизведение не прибито к 16 кГц.
-    if voice_sr <= 0:
+    if config.TTS_ENGINE == "piper":
+        import json
+        try:
+            with open(config.PIPER_CONFIG, encoding="utf-8") as f:
+                voice_sr = int(json.load(f).get("audio", {}).get("sample_rate", 0))
+        except Exception as exc:
+            return CheckResult(WARN, "Согласованность частот дискретизации",
+                               reason=f"не удалось прочитать sample_rate Piper: {exc}.")
+        name = "голос Piper"
+    else:
+        voice_sr = int(config.SILERO_SAMPLE_RATE)
+        name = "голос Silero"
+    if voice_sr not in (8000, 16000, 22050, 24000, 44100, 48000):
         return CheckResult(WARN, "Согласованность частот дискретизации",
-                           reason="в config голоса нет audio.sample_rate.",
-                           fix="скачайте корректный config голоса")
-    return CheckResult(
-        OK, f"Частоты: STT {stt_sr} Гц, голос Piper {voice_sr} Гц "
-            f"(воспроизведение — на частоте голоса)"
-    )
+                           reason=f"необычная частота {name}: {voice_sr} Гц.",
+                           fix="settings.yaml → voice.silero_sample_rate: 24000")
+    # Воспроизведение идёт на частоте клипа (см. tts.py _play_pcm) — разные частоты норма.
+    return CheckResult(OK, f"Частоты: STT {stt_sr} Гц, {name} {voice_sr} Гц "
+                           f"(воспроизведение — на частоте клипа)")
+
+
+def _stress_problems(text: str) -> list[str]:
+    """Список проблем разметки `+`-ударений в строке: `+` обязан стоять ПЕРЕД гласной.
+
+    Ловит: `+` в конце слова, перед согласной/пробелом, двойной `++`. Silero иначе
+    произнесёт фразу криво. Пусто → разметка корректна."""
+    vowels = "аеёиоуыэюяАЕЁИОУЫЭЮЯ"
+    problems = []
+    for i, ch in enumerate(text):
+        if ch != "+":
+            continue
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if not nxt or nxt not in vowels:
+            ctx = text[max(0, i - 6):i + 2]
+            problems.append(f"…{ctx}… (после «+» не гласная)")
+    return problems
+
+
+def check_stress_marks() -> CheckResult:
+    """Валидатор `+`-ударений во ВСЕХ произносимых фразах: на гласной, без битых меток.
+
+    Ловит регрессию разметки (как check_antonyms — для направлений). Источник фраз —
+    тот же перечислитель, что и для кэша; плюс ручной словарь voice.stress."""
+    try:
+        from jarvis import tts_prerender
+        texts = list(tts_prerender.iter_static_phrases())
+        texts += list((config.STRESS_TABLE or {}).values())
+        bad = []
+        for t in texts:
+            if "+" in t:
+                for p in _stress_problems(t):
+                    bad.append(f"{t!r}: {p}")
+        if bad:
+            sample = "; ".join(bad[:3])
+            return CheckResult(FAIL, "Ударения `+` корректны",
+                               reason=f"битых меток: {len(bad)}. Напр.: {sample}",
+                               fix="`+` ставится строго ПЕРЕД ударной гласной (за+мок, не зам+ок→зам+ок)")
+        n = sum(1 for t in texts if "+" in t)
+        return CheckResult(OK, f"Ударения `+` корректны ({n} фраз с разметкой)")
+    except Exception as exc:
+        return CheckResult(WARN, "Ударения `+` корректны", reason=f"не удалось проверить: {exc}")
+
+
+def check_tts_cache() -> CheckResult:
+    """Покрытие WAV-кэша голоса: статика должна быть готова (иначе первая реплика ждёт синтез)."""
+    try:
+        from jarvis import tts_cache, tts_dsp, tts_engine, tts_prerender
+        engine = tts_engine.make_engine(config.TTS_ENGINE)
+        dsp_sig = tts_dsp.dsp_signature(config.DSP_PARAMS, engine.voice_id)
+        cache = tts_cache.TtsCache(config.TTS_CACHE_DIR, engine.voice_id, dsp_sig)
+        cs = cache.stats()
+        statics = tts_prerender.iter_static_phrases()
+        have = sum(1 for p in statics
+                   if cache.has(tts_prerender._final_text(p)))
+        detail = f"кэш {cs['count']} клипов / {cs['bytes']/1e6:.0f} МБ; статика {have}/{len(statics)}"
+        if cs["count"] == 0:
+            return CheckResult(WARN, "Кэш голоса",
+                               reason=f"пуст ({detail}) — реплики будут синтезироваться на лету.",
+                               fix="jarvis tts build")
+        if have < len(statics):
+            return CheckResult(WARN, "Кэш голоса",
+                               reason=f"{detail} — часть фраз ещё не отрендерена.",
+                               fix="jarvis tts build")
+        return CheckResult(OK, f"Кэш голоса: {detail}")
+    except Exception as exc:
+        return CheckResult(WARN, "Кэш голоса", reason=f"не удалось проверить: {exc}",
+                           fix="jarvis tts stats")
 
 
 # --------------------------------------------------------------------------- #
@@ -1062,27 +1320,26 @@ def check_heartbeat() -> list[CheckResult]:
 # --------------------------------------------------------------------------- #
 # Слой 2/3 (--deep): реально долгие живые тесты
 # --------------------------------------------------------------------------- #
-def check_piper_synthesis() -> CheckResult:
-    """Голос Piper реально синтезирует тестовый сэмпл (не пустой звук).
+def check_tts_synthesis() -> CheckResult:
+    """Активный движок реально синтезирует сэмпл + проходит JARVIS-DSP (--deep, грузит torch).
 
-    piper-tts 1.4.x: synthesize(text) возвращает итератор AudioChunk.
-    У каждого чанка — audio_int16_bytes (bytes), sample_rate, sample_channels.
-    """
+    Тяжёлый: для Silero грузит torch (~2.5с) — поэтому только в полном прогоне, не в --quick."""
     try:
-        from piper import PiperVoice
-        voice = PiperVoice.load(config.PIPER_MODEL, config_path=config.PIPER_CONFIG)
-        pcm = bytearray()
-        for chunk in voice.synthesize("Проверка связи, сэр."):
-            pcm += chunk.audio_int16_bytes
-        if len(pcm) > 0:
-            return CheckResult(OK, f"Piper синтезирует звук ({len(pcm)} байт PCM)")
-        return CheckResult(FAIL, "Piper синтезирует звук",
-                           reason="синтез вернул пустой буфер.",
-                           fix="сверьте корректность голоса и конфига Piper")
+        from jarvis import tts_dsp, tts_engine
+        engine = tts_engine.make_engine(config.TTS_ENGINE)
+        engine.warmup()
+        pcm = engine.synth("Проверка связи, сэр.")
+        if not pcm:
+            return CheckResult(FAIL, "Синтез голоса", reason="движок вернул пустой буфер.",
+                               fix="jarvis models --download silero_eugene; сверьте модель")
+        wet = tts_dsp.apply_dsp(pcm, engine.sample_rate, config.DSP_PARAMS, engine.sample_rate)
+        engine.unload()
+        return CheckResult(OK, f"Синтез + JARVIS-DSP работают "
+                               f"({len(pcm)}→{len(wet)} байт @ {engine.sample_rate} Гц)")
     except Exception as exc:
-        return CheckResult(FAIL, "Piper синтезирует звук",
-                           reason=f"сбой синтеза: {exc}",
-                           fix="jarvis models --download; сверьте API piper-tts")
+        return CheckResult(FAIL, "Синтез голоса", reason=f"сбой: {exc}",
+                           fix="pip install -e '.[silero]'; jarvis models --download silero_eugene; "
+                               "проверьте ffmpeg")
 
 
 def live_chain_test() -> bool:
@@ -1809,12 +2066,52 @@ def check_alarms() -> list[CheckResult]:
     return results
 
 
+def check_weather() -> list[CheckResult]:
+    """Погодный модуль (Этап 24): гейт «погод» строгий, парсер дат прошлое/будущее, паки на месте.
+
+    Гейт и парсер — офлайн (поломка → FAIL). Сетевой ответ не дёргаем (как и в check_alarms)."""
+    results = []
+    try:
+        from datetime import date
+
+        from jarvis import weather_query as wq
+    except Exception as exc:
+        return [CheckResult(FAIL, "погода: импорт", reason=str(exc),
+                            fix="см. jarvis/weather_query.py")]
+    try:
+        t = date(2026, 6, 12)  # пятница — эталон для проверки направлений
+        gate_ok = (wq.is_weather_query("какая погода")
+                   and not wq.is_weather_query("включи свет"))
+        now_none = wq.parse_weather_date("какая погода", t) is None          # «сейчас»
+        today = wq.parse_weather_date("погода сегодня", t) == t
+        tomorrow = wq.parse_weather_date("погода завтра", t) == date(2026, 6, 13)
+        # «на 11 числа», когда сегодня 12-е → ВЧЕРА (прошлое не прыгает в будущее).
+        past_day = wq.parse_weather_date("погода на 11 числа", t) == date(2026, 6, 11)
+        yest = wq.parse_weather_date("погода вчера", t) == date(2026, 6, 11)
+        city = wq._detect_city("погода в париже") == "париже"
+        packs_ok = all(config.WEATHER_NOW and config.WEATHER_DAY_FUTURE
+                       and config.WEATHER_NO_NETWORK for _ in (0,))
+        if gate_ok and now_none and today and tomorrow and past_day and yest and city and packs_ok:
+            results.append(CheckResult(
+                OK, "погода: гейт «погод» строгий, даты (сегодня/завтра/прошлое/город) — верны"))
+        else:
+            results.append(CheckResult(
+                FAIL, "погода: гейт/парсер дат",
+                reason=f"gate={gate_ok} none={now_none} today={today} tomorrow={tomorrow} "
+                       f"past={past_day} yest={yest} city={city} packs={packs_ok}",
+                fix="см. jarvis/weather_query.py (is_weather_query/parse_weather_date)"))
+    except Exception as exc:
+        results.append(CheckResult(FAIL, "погода: логика", reason=str(exc),
+                                   fix="см. jarvis/weather_query.py"))
+    return results
+
+
 # --------------------------------------------------------------------------- #
 # Оркестрация
 # --------------------------------------------------------------------------- #
 def run(quick: bool = False) -> bool:
     """Полная глубокая диагностика (дефолт). quick=True пропускает долгие тесты
-    (синтез Piper, сквозная цепочка — секунды). Каждая проверка идёт через _safe:
+    (синтез голоса, сквозная цепочка — секунды). Каждая проверка идёт через _safe:
     её падение не роняет весь доктор.
     """
     reporter = Reporter()
@@ -1825,6 +2122,7 @@ def run(quick: bool = False) -> bool:
     _safe(reporter, check_library_versions)
     _safe(reporter, check_settings)
     _safe(reporter, check_config_paths)
+    _safe(reporter, check_ffmpeg)
     _safe(reporter, check_env_file)
     _safe(reporter, check_commands_yaml)
     _safe(reporter, check_entry_points)
@@ -1850,16 +2148,22 @@ def run(quick: bool = False) -> bool:
     reporter.section("Слой 4. Модели и распознавание")
     reporter.note("загружаю модели движком…")
     _safe(reporter, check_sherpa_models)
-    _safe(reporter, check_piper_voice)
+    _safe(reporter, check_tts_voice)
     _safe(reporter, check_sample_rate)
+    _safe(reporter, check_stress_marks)
+    _safe(reporter, check_tts_cache)
     reporter.note("проверяю эмбеддер команд (rubert-tiny2)…")
     _safe(reporter, check_embedder)
     _safe(reporter, check_matcher)
+    _safe(reporter, check_antonyms)
+    reporter.note("проверяю классификатор Слоя 2 (обучение/кеш)…")
+    _safe(reporter, check_classifier)
     _safe(reporter, check_alarms)
+    _safe(reporter, check_weather)
     _safe(reporter, check_chains)
     if not quick:
-        reporter.note("синтез тестового сэмпла Piper…")
-        _safe(reporter, check_piper_synthesis)
+        reporter.note("синтез тестового сэмпла (Silero + JARVIS-DSP)…")
+        _safe(reporter, check_tts_synthesis)
 
     reporter.section("Слой 5. Сервисы Джарвиса")
     _safe(reporter, check_services)

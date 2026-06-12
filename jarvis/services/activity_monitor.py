@@ -40,7 +40,7 @@ from pathlib import Path
 
 from jarvis import config, contracts, phrases, speech
 from jarvis.breaks import is_stop_phrase
-from jarvis.bus import JarvisModule
+from jarvis.bus import JarvisModule, run_service
 
 # Биты битовой маски `B: EV=` в /proc/bus/input/devices: бит N взведён, если устройство
 # поддерживает тип события N. EV_KEY=тип 1 (бит 0x02), EV_REL=тип 2 (бит 0x04),
@@ -666,7 +666,7 @@ class ActivityMonitorModule(JarvisModule):
 
 
 def main():
-    ActivityMonitorModule().run()
+    run_service(ActivityMonitorModule, "jarvis-activity-monitor")
 
 
 if __name__ == "__main__":

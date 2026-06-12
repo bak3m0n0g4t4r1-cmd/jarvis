@@ -21,10 +21,10 @@ from pathlib import Path
 
 import yaml
 
-from jarvis import chains, config, contracts, phrases, silence, system, voice_volume, worldtime
+from jarvis import chains, config, contracts, phrases, silence, system, voice_volume, weather_query, worldtime
 from jarvis import lamp as lamp_helpers
 from jarvis.breaks import is_stop_phrase
-from jarvis.bus import JarvisModule
+from jarvis.bus import JarvisModule, run_service
 from jarvis.matcher import NOT_RECOGNIZED, Matcher
 from jarvis.reminders import is_dialog_pending, is_scheduler_command
 from jarvis.sysinfo import read_battery, read_system_load, read_volume
@@ -199,8 +199,10 @@ class CoreModule(JarvisModule):
                 if self._try_combo(text, user_level):
                     return
 
-                # 3) Одиночная команда матчером.
-                match = self._matcher.match(text)
+                # 3) Одиночная команда матчером. Активную ветку передаём МЯГКИМ контекстом
+                #    (не фильтром): при ничьей Слоя 2 предпочесть команду текущей ветки (ТЗ-5).
+                branch_tags = self._branches.get(self._active_branch) if self._active_branch else None
+                match = self._matcher.match(text, branch_tags=branch_tags)
                 if match is not None:
                     self.log.info("Команда распознана: %s (%s, %.3f) — %s",
                                   match.tag, match.layer, match.score, text)
@@ -381,7 +383,7 @@ class CoreModule(JarvisModule):
             except Exception:
                 self.log_exc(logging.ERROR, "Не удалось запустить перезагрузку (%s)", launcher[0])
                 break
-        self._say("Сэр, перезапуститься не удалось.", user_level)
+        self._say("Сэр, перезапуст+иться не удал+ось.", user_level)
 
     def _do_environment(self, text: str, user_level) -> None:
         """Открыть рабочую среду: разобрать (именованная/из речи) → новый вирт. стол + приложения.
@@ -450,6 +452,12 @@ class CoreModule(JarvisModule):
         coin = self._coin_answer(low)
         if coin is not None:
             return coin
+        # Погода («какая погода», «погода завтра», «погода в Париже») — ПЕРЕД датой/временем
+        # (фраза может содержать «сегодня/завтра»). Якорь «погод» строгий: иначе сюда не зайдём.
+        if weather_query.is_weather_query(text):
+            w = weather_query.answer(text)
+            if w:
+                return w
         # Мировое время («сколько времени в <город>») — ПЕРЕД локальным (оно тоже ловит «сколько
         # времени», но без города это локальное время). detect_city → None, если города нет.
         city = worldtime.detect_city(text)
@@ -526,7 +534,7 @@ class CoreModule(JarvisModule):
 
 
 def main():
-    CoreModule().run()
+    run_service(CoreModule, "jarvis-core")
 
 
 if __name__ == "__main__":

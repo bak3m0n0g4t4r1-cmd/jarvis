@@ -144,7 +144,7 @@ ECHO_SIMILARITY_THRESHOLD = _get("hearing", "echo_similarity_threshold", 0.6,
 MIN_SEGMENT_SAMPLES = _get("hearing", "min_segment_samples", 8000, "JARVIS_MIN_SEGMENT_SAMPLES")
 # VAD-пороги — НАСТРОЕНЫ ОПЫТНЫМ ПУТЁМ. Менять осторожно: влияет на распознавание речи.
 VAD_THRESHOLD = _get("hearing", "vad_threshold", 0.3, "JARVIS_VAD_THRESHOLD")
-VAD_MIN_SILENCE = _get("hearing", "vad_min_silence", 0.8, "JARVIS_VAD_MIN_SILENCE")
+VAD_MIN_SILENCE = _get("hearing", "vad_min_silence", 0.5, "JARVIS_VAD_MIN_SILENCE")
 VAD_MIN_SPEECH = _get("hearing", "vad_min_speech", 0.25, "JARVIS_VAD_MIN_SPEECH")
 VAD_BUFFER_SECONDS = _get("hearing", "vad_buffer_seconds", 10, "JARVIS_VAD_BUFFER_SECONDS")
 STT_NUM_THREADS = _get("hearing", "stt_num_threads", 1, "JARVIS_STT_NUM_THREADS")
@@ -241,15 +241,40 @@ ASR_TYPE, ASR_PATHS = _asr_spec()
 # === Распознавание команд: матчер (секция recognition) ===
 EMBEDDER_DIR = Path(_get_path("models", "embedder_dir", str(MODELS_DIR / "rubert-tiny2-onnx"),
                          "JARVIS_EMBEDDER_DIR"))
-EMBEDDER_MODEL = _get_path("models", "embedder_model", str(EMBEDDER_DIR / "model_optimized.onnx"),
+# fp32-модель эмбеддера (исходник для квантования и страховка-fallback).
+EMBEDDER_MODEL_FP32 = _get_path("models", "embedder_model", str(EMBEDDER_DIR / "model_optimized.onnx"),
                       "JARVIS_EMBEDDER_MODEL")
+# INT8-модель (×4 меньше RAM, быстрее на N100): генерируется `jarvis models --quantize`.
+EMBEDDER_MODEL_INT8 = _get_path("models", "embedder_model_int8", str(EMBEDDER_DIR / "model_int8.onnx"),
+                      "JARVIS_EMBEDDER_MODEL_INT8")
+# Предпочитать INT8, если файл существует (иначе тихий fallback на fp32). false → всегда fp32.
+EMBEDDER_PREFER_INT8 = _get("recognition", "prefer_int8", True, "JARVIS_EMBEDDER_PREFER_INT8")
+# Активная модель эмбеддера: int8 при наличии и согласии, иначе fp32. Смена пути авто-инвалидирует
+# кеши матчера (их ключ включает stat файла модели) — пересчёт эмбеддингов/весов произойдёт сам.
+EMBEDDER_MODEL = (EMBEDDER_MODEL_INT8
+                  if EMBEDDER_PREFER_INT8 and os.path.exists(EMBEDDER_MODEL_INT8)
+                  else EMBEDDER_MODEL_FP32)
 EMBEDDER_TOKENIZER = _get_path("models", "embedder_tokenizer", str(EMBEDDER_DIR / "tokenizer.json"),
                           "JARVIS_EMBEDDER_TOKENIZER")
 MATCHER_CACHE = _get_path("models", "matcher_cache", str(EMBEDDER_DIR / "cmd_emb_cache.npz"),
                      "JARVIS_MATCHER_CACHE")
+# Кеш «мозга»: экспортированные веса линейного классификатора Слоя 2 (numpy, без sklearn в рантайме).
+MATCHER_CLF_CACHE = _get_path("models", "matcher_clf_cache", str(EMBEDDER_DIR / "matcher_clf.npz"),
+                     "JARVIS_MATCHER_CLF_CACHE")
 # Порог слоя ПРАВИЛ (difflib 0–1): ниже — фраза не считается совпавшей с синонимом.
 MATCHER_FUZZY_THRESHOLD = _get("recognition", "fuzzy_threshold", 0.7, "JARVIS_MATCHER_FUZZY_THRESHOLD")
-# Порог слоя ЭМБЕДДИНГОВ (косинус 0–1): ниже — поиск не уверен → переспрос.
+# Слой 2 (семантика): включить ML-классификатор. false → старый косинус-kNN (тоже работает).
+MATCHER_CLF_ENABLED = _get("recognition", "clf_enabled", True, "JARVIS_MATCHER_CLF_ENABLED")
+# Сила L2-регуляризации классификатора (sklearn C: больше — слабее регуляризация). Подобрано
+# бенчем (tools/bench_matcher.py): на L2-нормированных 312-векторах C=1 недообучает (proba≈0.06),
+# C=10 даёт уверенный in-sample (proba med≈0.57) при низком OOS (≤0.12). Тюнить осторожно.
+MATCHER_CLF_C = _get("recognition", "clf_c", 10.0, "JARVIS_MATCHER_CLF_C")
+# Порог классификатора (predict_proba 0–1): ниже — Слой 2 не уверен → переспрос. 0.30 принимает
+# ~94% верных in-sample и отклоняет посторонние (их top1 ≤0.25). Софтмакс по 92 классам — потому низкий.
+MATCHER_CLF_THRESHOLD = _get("recognition", "clf_threshold", 0.30, "JARVIS_MATCHER_CLF_THRESHOLD")
+# Мин. отрыв вероятности лучшего от второго: меньше — кандидаты почти равны → переспрос (антонимы).
+MATCHER_CLF_MARGIN = _get("recognition", "clf_margin", 0.10, "JARVIS_MATCHER_CLF_MARGIN")
+# Порог слоя ЭМБЕДДИНГОВ (косинус 0–1): ниже — поиск не уверен → переспрос. Для косинус-fallback.
 MATCHER_EMB_THRESHOLD = _get("recognition", "emb_threshold", 0.6, "JARVIS_MATCHER_EMB_THRESHOLD")
 # Мин. отрыв лучшего кандидата от второго (косинус): меньше — кандидаты почти равны → переспрос.
 MATCHER_EMB_MARGIN = _get("recognition", "emb_margin", 0.04, "JARVIS_MATCHER_EMB_MARGIN")
@@ -282,6 +307,39 @@ VOICE_LENGTH_SCALE = _get("voice", "length_scale", 1.12, "JARVIS_VOICE_LENGTH_SC
 # Высота тона (1.0 норма, <1 ниже): подмена частоты pw-cat + компенсация темпа (независимо от
 # length_scale). Не формант-сохраняющий — разумный диапазон 0.88–1.0 (лёгкое понижение тона).
 VOICE_PITCH = _get("voice", "pitch", 0.95, "JARVIS_VOICE_PITCH")
+# Число потоков синтеза Piper (onnxruntime, Этап 25). 0 — НЕ трогать (онрантайм-дефолт, обычно по
+# числу ядер). На N100 первый чанк упирается в CPU — подберите оптимум замером (PERF tts: первый звук)
+# вместе с performance-governor. >0 выставляет OMP/ORT-потоки процесса TTS ДО загрузки голоса.
+VOICE_SYNTH_THREADS = _get("voice", "synth_threads", 0, "JARVIS_VOICE_SYNTH_THREADS")
+
+# === Движок TTS: Silero (eugene) с кэшем WAV; Piper — фоллбэк (секция voice) ===
+# Голос Silero (PyTorch) тяжёл для горячего пути, поэтому ВСЕ фразы заранее рендерятся в
+# WAV-кэш (jarvis tts build) с офлайн «JARVIS-DSP», а в рантайме играется готовый WAV —
+# без torch и без задержки. torch грузится лениво ТОЛЬКО на промахе кэша (свободный текст).
+TTS_ENGINE = str(_get("voice", "engine", "silero", "JARVIS_TTS_ENGINE")).strip().lower()
+# Модель Silero (torch.package .pt). Качается `jarvis models --download silero_eugene`.
+SILERO_MODEL = _get_path("models", "silero_model", str(MODELS_DIR / "silero" / "v4_ru.pt"),
+                    "JARVIS_SILERO_MODEL")
+SILERO_SPEAKER = str(_get("voice", "silero_speaker", "eugene", "JARVIS_SILERO_SPEAKER")).strip()
+# Частота синтеза Silero (8000/24000/48000). 24000 — баланс качество/CPU/размер кэша на N100.
+SILERO_SAMPLE_RATE = _get("voice", "silero_sample_rate", 24000, "JARVIS_SILERO_SAMPLE_RATE")
+# Секунд простоя движка до выгрузки torch из памяти (вернуть RAM при swap=0). 0 — не выгружать.
+SILERO_UNLOAD_AFTER = _get("voice", "silero_unload_after", 120.0, "JARVIS_SILERO_UNLOAD_AFTER")
+# Каталог WAV-кэша (переживает перезапуски; абсолютный от BASE_DIR). В .gitignore.
+TTS_CACHE_DIR = _get_path("models", "tts_cache_dir", str(BASE_DIR / "cache" / "tts"),
+                    "JARVIS_TTS_CACHE_DIR")
+# Размер чанка при стриминге готового WAV в pw-cat (мс): мельче — плавнее огибающая ламп,
+# чуть больше системных вызовов. 60 мс — хороший баланс на N100.
+TTS_PLAY_CHUNK_MS = _get("voice", "play_chunk_ms", 60, "JARVIS_TTS_PLAY_CHUNK_MS")
+# Параметры JARVIS-DSP (секция voice.dsp). Пусто → дефолтный «сбалансированный» пресет из
+# tts_dsp.DEFAULT_PARAMS. Подбирается ползунками в tools/voice_studio.py.
+DSP_PARAMS = _get("voice", "dsp", {}, None)
+# Ручной словарь ударений {слово: слово_с_+} (секция voice.stress). В отличие от Piper,
+# Silero УЧИТЫВАЕТ `+` перед ударной гласной — здесь правим омографы/редкие слова.
+STRESS_TABLE = _get("voice", "stress", {}, None)
+# Авто-ударения для СВОБОДНОГО текста (silero-stress/ruaccent), лениво как torch. Дефолт off:
+# Silero сам ставит ударения (put_accent), статика уже размечена `+` на этапе build.
+AUTO_STRESS = _get("voice", "auto_stress", False, "JARVIS_AUTO_STRESS")
 
 # === Адаптивная громкость: реальные уровни сигнала RMS (секция adaptive_audio) ===
 ADAPTIVE_VOLUME = _get("adaptive_audio", "enabled", True, "JARVIS_ADAPTIVE_VOLUME")
@@ -746,6 +804,53 @@ WORLDTIME_NOT_FOUND = _wt_pack("not_found", [
     "Сэр, не нашёл город {город}.",
     "Затрудняюсь определить, где это, сэр.",
     "Не удалось распознать город, сэр.",
+])
+
+# === Погода по запросу (секция weather) — «какая погода» + дата/город (Этап 24) ===
+# Открытый Open-Meteo, БЕЗ ключа (как утренний будильник). forecast: до +16 дней и до 92 дней
+# назад; глубже в прошлое — archive (с 1940). Регион — секция «местоположение». Плейсхолдеры:
+# {температура} {ощущается} {характер} {темп_макс} {темп_мин} {осадки} {дата} {город}.
+WEATHER_FORECAST_MAX_DAYS = _get("weather", "forecast_max_days", 16, "JARVIS_WEATHER_MAX_DAYS")
+
+def _weather_pack(key, default):
+    return _get("weather", key, default, None)
+
+WEATHER_NOW = _weather_pack("now", [
+    "Сэр, сейчас {город} {характер}, {температура}. Ощущается как {ощущается}.",
+    "За окном {характер}, {температура}, сэр. По ощущениям — {ощущается}.",
+    "Сейчас {характер}, {температура}, сэр. Ощущается как {ощущается} — одевайтесь сообразно.",
+])
+WEATHER_DAY_TODAY = _weather_pack("day_today", [
+    "Сегодня {город} ожидается {характер}, от {темп_мин} до {темп_макс}, сэр. {осадки}",
+    "На сегодня, сэр: {характер}, днём до {темп_макс}, ночью около {темп_мин}. {осадки}",
+    "Сегодня {характер}, сэр — от {темп_мин} до {темп_макс}. {осадки}",
+])
+WEATHER_DAY_FUTURE = _weather_pack("day_future", [
+    "{дата} {город} ожидается {характер}, от {темп_мин} до {темп_макс}, сэр. {осадки}",
+    "По прогнозу на {дата}, сэр: {характер}, от {темп_мин} до {темп_макс}. {осадки}",
+    "{дата} обещают {характер}, сэр — днём до {темп_макс}, ночью около {темп_мин}. {осадки}",
+])
+WEATHER_DAY_PAST = _weather_pack("day_past", [
+    "{дата} {город} было {характер}, от {темп_мин} до {темп_макс}, сэр.",
+    "Если память мне не изменяет, сэр, {дата} стояло {характер}, от {темп_мин} до {темп_макс}.",
+    "{дата}, сэр, было {характер} — от {темп_мин} до {темп_макс}.",
+])
+WEATHER_TOO_FAR_FUTURE = _weather_pack("too_far_future", [
+    "Так далеко вперёд, сэр, прогноз уже из области гадания — дальше двух недель я не загляну.",
+    "Боюсь, сэр, настолько далёкий прогноз ненадёжен. Спросите ближе к делу.",
+])
+WEATHER_TOO_FAR_PAST = _weather_pack("too_far_past", [
+    "За эту дату, сэр, данных у меня нет — архив так глубоко не достаёт.",
+    "Боюсь, сэр, до этого дня погодные летописи не дотягиваются.",
+])
+WEATHER_NO_NETWORK = _weather_pack("no_network", [
+    "Сэр, до метеосводки сейчас не дотянуться — похоже, сеть недоступна.",
+    "Не удаётся получить погоду, сэр. Подозреваю, дело в соединении.",
+    "Прогноз сейчас вне досягаемости, сэр — проверьте сеть.",
+])
+WEATHER_NOT_FOUND_CITY = _weather_pack("not_found_city", [
+    "Сэр, такого города я не нашёл — уточните название?",
+    "Затрудняюсь определить, где это, сэр. Повторите город?",
 ])
 
 # === Монетка (секция coin) ===

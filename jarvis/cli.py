@@ -1,10 +1,12 @@
 """CLI «Джарвиса»: установка-обёртка, глубокая диагностика и управление.
 
-Подкоманды:
-  jarvis doctor [--quick]  — полная проверка здоровья (см. jarvis/doctor.py)
-  jarvis models --download — загрузка моделей по models.yaml
-  jarvis test              — сквозной тест живой шины (say → execute → input)
-  jarvis start|stop|status — обёртка над systemctl --user по юнитам Джарвиса
+Подкоманды (сгруппированы в фирменной справке — `jarvis` или `jarvis help`):
+  Запуск:      start · stop · restart · live
+  Диагностика: doctor [--quick] · status · test
+  Устройства:  lamp (on|off|status|test|rtt|sync) · models (--download | --quantize)
+
+Без аргументов (или `jarvis help`) показывает опрятную справку; `jarvis <команда> -h`
+раскрывает детали конкретной команды.
 
 Сам CLI становится доступен только ПОСЛЕ `pip install -e .`, поэтому первичную
 установку делает bootstrap.sh, а CLI берёт на себя всё остальное.
@@ -14,8 +16,33 @@ import subprocess
 import sys
 from pathlib import Path
 
-from jarvis import config
+from jarvis import config, ui
 from jarvis.services_map import SERVICES
+
+
+# --- Фирменная справка ------------------------------------------------------ #
+# Единый источник описаний команд: и для сгруппированной справки (jarvis / jarvis
+# help), и для argparse-help= (см. build_parser). Так справка и -h не разъезжаются.
+COMMAND_GROUPS = [
+    ("Запуск", [
+        ("start", "поднять/перезапустить сервисы"),
+        ("stop", "остановить и отключить сервисы"),
+        ("restart", "перезапустить все сервисы + объявить статус"),
+        ("live", "живая панель состояния (до Ctrl+C)"),
+    ]),
+    ("Диагностика", [
+        ("doctor", "полная проверка здоровья системы"),
+        ("status", "статус сервисов"),
+        ("test", "сквозной тест живой шины"),
+    ]),
+    ("Устройства и модели", [
+        ("lamp", "проверка/управление лампами (on|off|status|test|rtt|sync)"),
+        ("models", "загрузка моделей"),
+        ("tts", "кэш голоса: сборка/статистика (build|stats)"),
+        ("say", "произнести фразу голосом Джарвиса (проверка)"),
+    ]),
+]
+_HELP = {name: desc for _group, _cmds in COMMAND_GROUPS for name, desc in _cmds}
 
 
 # --- Генерация и установка systemd --user-юнитов ---------------------------- #
@@ -98,8 +125,8 @@ def _systemctl(*args: str) -> int:
     try:
         return subprocess.call(["systemctl", "--user", *args])
     except FileNotFoundError:
-        print("✗ systemctl не найден. Управление сервисами доступно только под "
-              "systemd-сессией пользователя.")
+        ui.fail("systemctl не найден. Управление сервисами доступно только под "
+                "systemd-сессией пользователя.")
         return 1
 
 
@@ -112,15 +139,88 @@ def cmd_doctor(args) -> int:
 
 
 def cmd_models(args) -> int:
+    # Квантование эмбеддера команд в INT8 (×4 меньше RAM на N100). Разовая операция.
+    # tools/ не входит в установленный пакет — грузим по пути (надёжно при любом CWD).
+    if getattr(args, "quantize", False):
+        import importlib.util
+
+        from jarvis import config
+        path = config.BASE_DIR / "tools" / "quantize_embedder.py"
+        spec = importlib.util.spec_from_file_location("quantize_embedder", str(path))
+        if spec is None or spec.loader is None:
+            print(f"Не найден инструмент квантования: {path}")
+            return 1
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.main()
+
     from jarvis import downloader
 
     if not args.download:
         print("Укажите действие, например: jarvis models --download "
-              "(или --download <имя> для опционального кандидата ASR)")
+              "(или --download <имя> для опционального кандидата ASR; --quantize — INT8-эмбеддер)")
         return 2
     if args.download is True:   # без имени — все базовые (опциональные пропускаются)
         return 0 if downloader.download_all() else 1
     return 0 if downloader.download_named(str(args.download)) else 1
+
+
+def cmd_tts(args) -> int:
+    """Кэш голоса: build — пред-рендер фраз (Silero + JARVIS-DSP), stats — покрытие/чистка."""
+    from jarvis import tts_prerender
+
+    if getattr(args, "action", "stats") == "build":
+        res = tts_prerender.build(only=getattr(args, "only", None),
+                                  force=getattr(args, "force", False),
+                                  limit=getattr(args, "limit", None))
+        return 0 if res.get("errors", 0) == 0 else 1
+    tts_prerender.stats(prune=getattr(args, "prune", False))
+    return 0
+
+
+def cmd_say(args) -> int:
+    """Произнести фразу голосом Джарвиса офлайн (без сервисов): хит кэша или ленивый синтез.
+
+    Удобно для проверки голоса/DSP/ударений и для прогрева конкретной фразы в кэш."""
+    text = " ".join(args.text).strip()
+    if not text:
+        ui.fail('Укажите фразу: jarvis say "Системы в норме, сэр."')
+        return 2
+    from jarvis import speech, tts_cache, tts_dsp, tts_engine
+
+    final = speech.apply_stress(
+        speech.apply_pronunciation(text, config.PRONUNCIATION), config.STRESS_TABLE)
+    engine = tts_engine.SileroEngine()
+    dsp_sig = tts_dsp.dsp_signature(config.DSP_PARAMS, engine.voice_id)
+    cache = tts_cache.TtsCache(config.TTS_CACHE_DIR, engine.voice_id, dsp_sig)
+    clip = cache.get(final)
+    if clip is not None:
+        ui.ok("Из кэша (мгновенно).")
+        pcm, rate = clip.pcm, clip.rate
+    else:
+        ui.info("Нет в кэше — синтезирую (Silero + JARVIS-DSP)…")
+        engine.warmup()
+        pcm = engine.synth(final)
+        if not pcm:
+            ui.fail("Синтез не дал звука.")
+            return 1
+        rate = engine.sample_rate
+        try:
+            pcm = tts_dsp.apply_dsp(pcm, rate, config.DSP_PARAMS, rate)
+        except Exception as exc:
+            ui.warn(f"DSP пропущен: {exc}")
+        cache.put(final, pcm, rate)
+        engine.unload()
+    cmd = ["pw-cat", "-p", "--raw", "--rate", str(rate), "--channels", "1", "--format", "s16",
+           "--volume", "0.9", "-"]
+    if config.TTS_SINK:
+        cmd += ["--target", config.TTS_SINK]
+    try:
+        subprocess.run(cmd, input=pcm)
+    except FileNotFoundError:
+        ui.fail("pw-cat не найден (PipeWire).")
+        return 1
+    return 0
 
 
 def cmd_test(args) -> int:
@@ -189,12 +289,12 @@ def _announce_startup(ok: bool) -> None:
         client.loop_stop()
         client.disconnect()
     status = "успех" if ok else "проблема"
-    print(f"✓ Старт объявлен ({status}): {text}")
+    ui.ok(f"Старт объявлен ({status}): {text}")
 
 
 def cmd_start(args) -> int:
     units_dir = _install_units()
-    print(f"✓ Юниты обновлены: {units_dir}")
+    ui.ok(f"Юниты обновлены: {units_dir}")
     _systemctl("daemon-reload")
     rc = 0
     for svc in SERVICES:
@@ -253,7 +353,7 @@ def _announce_restart(ok: bool) -> None:
     finally:
         client.loop_stop()
         client.disconnect()
-    print(f"✓ Перезагрузка объявлена ({'успех' if ok else 'проблема'}): {text}")
+    ui.ok(f"Перезагрузка объявлена ({'успех' if ok else 'проблема'}): {text}")
 
 
 def cmd_restart(args) -> int:
@@ -308,7 +408,7 @@ def _lamp_run_action(name: str, creds: dict, action: str, tinytuya, args=None) -
         except Exception:
             pass
     if not ip:
-        print(f"✗ «{name}»: IP не задан и не найден автопоиском (укажите ip в lamp.lamps).")
+        ui.fail(f"«{name}»: IP не задан и не найден автопоиском (укажите ip в lamp.lamps).")
         return False
     try:
         bulb = tinytuya.BulbDevice(creds["device_id"], address=ip,
@@ -320,10 +420,10 @@ def _lamp_run_action(name: str, creds: dict, action: str, tinytuya, args=None) -
         bulb.set_socketPersistent(True)  # как у сервиса (для rtt — честный замер без реконнектов)
         st = bulb.status()
         if not isinstance(st, dict) or "Error" in st or "Err" in st:
-            print(f"✗ «{name}»: лампа не отвечает: {st}")
+            ui.fail(f"«{name}»: лампа не отвечает: {st}")
             print("  Частая причина — неверная ВЕРСИЯ протокола (lamp.lamps → version).")
             return False
-        print(f"✓ «{name}» на связи: {ip} (протокол {creds.get('version', 3.5)}). dps={st.get('dps')}")
+        ui.ok(f"«{name}» на связи: {ip} (протокол {creds.get('version', 3.5)}). dps={st.get('dps')}")
         if action == "on":
             bulb.set_value(20, True, nowait=False)
             print("→ включена")
@@ -346,7 +446,7 @@ def _lamp_run_action(name: str, creds: dict, action: str, tinytuya, args=None) -
             _lamp_calibrate_sync(name, bulb, helpers, args)
         return True
     except Exception as exc:
-        print(f"✗ «{name}»: ошибка связи: {exc}")
+        ui.fail(f"«{name}»: ошибка связи: {exc}")
         print("  Проверьте ip/local_key и ВЕРСИЮ протокола в settings.yaml (lamp.lamps).")
         return False
 
@@ -519,25 +619,25 @@ def cmd_lamp(args) -> int:
     want = (getattr(args, "lamp", None) or "").strip()
     if want:
         if want not in devices:
-            print(f"✗ Лампа «{want}» не найдена в settings.yaml (есть: {', '.join(devices) or 'ни одной'}).")
+            ui.fail(f"Лампа «{want}» не найдена в settings.yaml (есть: {', '.join(devices) or 'ни одной'}).")
             return 1
         devices = {want: devices[want]}
     if not devices:
-        print("✗ Лампы не заданы (settings.yaml → lamp.lamps).")
+        ui.fail("Лампы не заданы (settings.yaml → lamp.lamps).")
         return 1
     # Tuya держит ОДИН локальный сокет: параллельное подключение CLI может сбить
     # персистентный сокет сервиса (реакции «зависнут» до его реконнекта).
     try:
         if subprocess.run(["systemctl", "--user", "is-active", "--quiet", "jarvis-lamp.service"],
                           timeout=5).returncode == 0:
-            print("⚠ Сервис jarvis-lamp активен: параллельное подключение может сбить его сокет "
-                  "(лампа Tuya держит одно соединение). Сервис восстановится сам через реконнект.")
+            ui.warn("Сервис jarvis-lamp активен: параллельное подключение может сбить его сокет "
+                    "(лампа Tuya держит одно соединение). Сервис восстановится сам через реконнект.")
     except Exception:
         pass
     try:
         import tinytuya
     except Exception:
-        print("✗ tinytuya не установлен. Выполните `pip install -e .`.")
+        ui.fail("tinytuya не установлен. Выполните `pip install -e .`.")
         return 1
     rc = 0
     for name, creds in devices.items():
@@ -545,7 +645,7 @@ def cmd_lamp(args) -> int:
             if not _lamp_run_action(name, creds, action, tinytuya, args):
                 rc = 1
         except Exception as exc:
-            print(f"✗ «{name}»: неожиданный сбой: {exc}")
+            ui.fail(f"«{name}»: неожиданный сбой: {exc}")
             rc = 1
     return rc
 
@@ -554,17 +654,47 @@ def cmd_status(args) -> int:
     return _systemctl("--no-pager", "status", *[svc.unit for svc in SERVICES])
 
 
+def cmd_help(args=None) -> int:
+    """Фирменная справка: команды сгруппированы и снабжены коротким описанием.
+
+    Печатается на `jarvis` без аргументов, `jarvis help`, `jarvis -h`/`--help`.
+    Палитра — из ui.py (мягкий cyan на заголовках групп), уважает NO_COLOR/не-tty."""
+    width = max(len(name) for name in _HELP)
+    print()
+    print("  " + ui.paint("Джарвис", ui.BOLD) + " — голосовой пульт")
+    for group, cmds in COMMAND_GROUPS:
+        print()
+        print("  " + ui.paint(group, ui.CYAN))
+        for name, desc in cmds:
+            print(f"    {name.ljust(width)}  {desc}")
+    print()
+    print("  " + ui.paint("Подробнее:", ui.DIM) + " jarvis <команда> -h")
+    print()
+    return 0
+
+
+class _FriendlyParser(argparse.ArgumentParser):
+    """argparse, но без сухого usage-краша: подсказывает `jarvis help`."""
+
+    def error(self, message: str):
+        ui.fail(message)
+        ui.info("Список команд: jarvis help")
+        sys.exit(2)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _FriendlyParser(
         prog="jarvis",
         description="Управление и диагностика голосового ассистента «Джарвис».",
+        add_help=False,  # верхнеуровневый -h/--help перехватываем в main() → cmd_help
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    # Команды не обязательны: пустой вызов показывает фирменную справку (main).
+    sub = parser.add_subparsers(dest="command", required=False)
 
-    p_doctor = sub.add_parser("doctor", help="полная проверка здоровья системы")
+    p_doctor = sub.add_parser("doctor", help=_HELP["doctor"])
     p_doctor.add_argument(
         "--quick", action="store_true",
-        help="быстро: пропустить долгие тесты (синтез Piper, сквозная цепочка)",
+        help="быстро: пропустить долгие тесты (синтез голоса, сквозная цепочка)",
     )
     p_doctor.add_argument(
         "--deep", action="store_true",
@@ -572,22 +702,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_doctor.set_defaults(func=cmd_doctor)
 
-    p_models = sub.add_parser("models", help="управление моделями")
+    p_models = sub.add_parser("models", help=_HELP["models"])
     p_models.add_argument("--download", nargs="?", const=True, metavar="ИМЯ",
                           help="скачать базовые модели; с ИМЕНЕМ — одну из models.yaml "
                                "(вкл. опциональные кандидаты ASR)")
+    p_models.add_argument("--quantize", action="store_true",
+                          help="квантовать эмбеддер команд в INT8 (×4 меньше RAM на N100)")
     p_models.set_defaults(func=cmd_models)
 
-    p_test = sub.add_parser("test", help="сквозной тест живой шины")
+    p_test = sub.add_parser("test", help=_HELP["test"])
     p_test.set_defaults(func=cmd_test)
 
-    sub.add_parser("start", help="установить юниты и запустить сервисы").set_defaults(func=cmd_start)
-    sub.add_parser("stop", help="остановить и отключить сервисы").set_defaults(func=cmd_stop)
-    sub.add_parser("status", help="статус сервисов").set_defaults(func=cmd_status)
-    sub.add_parser("restart", help="перезапустить все сервисы Джарвиса + объявить статус").set_defaults(func=cmd_restart)
-    sub.add_parser("live", help="живая панель состояния (до Ctrl+C)").set_defaults(func=cmd_live)
-    p_lamp = sub.add_parser("lamp",
-                            help="проверка/управление умными лампами (on|off|status|test|rtt|sync)")
+    p_tts = sub.add_parser("tts", help=_HELP["tts"])
+    p_tts.add_argument("action", nargs="?", default="stats", choices=["build", "stats"],
+                       help="build — пред-рендер фраз в кэш; stats — покрытие/объём (по умолчанию)")
+    p_tts.add_argument("--only", choices=["static", "dynamic"], default=None,
+                       help="build: только статика (литералы) или только динамика (числа/время)")
+    p_tts.add_argument("--force", action="store_true",
+                       help="build: пересоздать даже уже закэшированные фразы")
+    p_tts.add_argument("--limit", type=int, default=None, metavar="N",
+                       help="build: потолок числа синтезов за прогон (частичная сборка/проверка)")
+    p_tts.add_argument("--prune", action="store_true",
+                       help="stats: удалить кэш других сигнатур голос/DSP (осиротевший)")
+    p_tts.set_defaults(func=cmd_tts)
+
+    p_say = sub.add_parser("say", help=_HELP["say"])
+    p_say.add_argument("text", nargs="+", help="фраза для озвучивания (в кавычках)")
+    p_say.set_defaults(func=cmd_say)
+
+    sub.add_parser("start", help=_HELP["start"]).set_defaults(func=cmd_start)
+    sub.add_parser("stop", help=_HELP["stop"]).set_defaults(func=cmd_stop)
+    sub.add_parser("status", help=_HELP["status"]).set_defaults(func=cmd_status)
+    sub.add_parser("restart", help=_HELP["restart"]).set_defaults(func=cmd_restart)
+    sub.add_parser("live", help=_HELP["live"]).set_defaults(func=cmd_live)
+    sub.add_parser("help", help="показать эту справку").set_defaults(func=cmd_help)
+    p_lamp = sub.add_parser("lamp", help=_HELP["lamp"])
     p_lamp.add_argument("action", nargs="?", default="status",
                         choices=["on", "off", "status", "test", "rtt", "sync"],
                         help="действие (по умолчанию status; rtt — замер задержки ACK; "
@@ -608,8 +757,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    argv = sys.argv[1:]
+    # Пустой вызов и верхнеуровневый запрос справки → фирменная сгруппированная справка
+    # (а не сухой usage argparse). `jarvis <команда> -h` сюда не попадает — там argv[0]
+    # это команда, и -h обрабатывает её собственный субпарсер.
+    if not argv or argv[0] in ("help", "-h", "--help"):
+        sys.exit(cmd_help())
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    # Подстраховка: команды нет (например, передали только флаг) — показываем справку.
+    if not getattr(args, "func", None):
+        sys.exit(cmd_help())
     sys.exit(args.func(args))
 
 

@@ -1,11 +1,17 @@
-"""«Голос» Джарвиса: синтез Piper + воспроизведение через PipeWire с адаптивной громкостью.
+"""«Голос» Джарвиса: голос Silero (eugene) из WAV-кэша + вывод через PipeWire с адаптивной громкостью.
 
 Слушает jarvis/say, проигрывает фразы по одной (worker-поток). На время речи — state=speaking.
+
+ГОЛОС — Silero (спикер eugene), но в рантайме движок НЕ грузится: все фразы заранее
+отрендерены в WAV-кэш (jarvis tts build) с офлайн «JARVIS-DSP», и горячий путь лишь читает
+готовый WAV из кэша → мгновенно и без torch. Свободный текст (надиктовка), которого нет в
+кэше, рендерится ЛЕНИВО на промахе (torch грузится в фоне и выгружается по простою).
 
 ВОСПРОИЗВЕДЕНИЕ — через PipeWire (`pw-cat`), НЕ sounddevice (PortAudio видит только HDMI →
 была немота). АДАПТИВНАЯ ГРОМКОСТЬ (audio_env): меряем реальные уровни сигнала (микрофон +
 monitor воспроизведения), приглушаем музыку (ducking) и подстраиваем громкость голоса под
-внешний шум И громкость речи пользователя. Синтез ПОТОКОВЫЙ — играем чанки по мере готовности.
+внешний шум И громкость речи пользователя. Готовый PCM стримим в pw-cat чанками — огибающая
+ламп, ducking и перебивание (barge-in) работают так же, как при потоковом синтезе.
 """
 import logging
 import queue
@@ -16,9 +22,9 @@ import time
 
 import numpy as np
 
-from jarvis import config, contracts, phrases, silence
+from jarvis import config, contracts, phrases, silence, speech, tts_cache, tts_dsp, tts_engine
 from jarvis.audio_env import AudioEnv
-from jarvis.bus import JarvisModule
+from jarvis.bus import JarvisModule, run_service
 from jarvis.sysinfo import read_volume
 
 # Сколько фраз подряд не озвучилось, чтобы крикнуть CRITICAL (синтез/вывод недоступен).
@@ -135,7 +141,11 @@ def _chime_pcm(rate: int) -> bytes:
 
 
 class TtsModule(JarvisModule):
-    """«Голос»: озвучивает фразы из jarvis/say через Piper + PipeWire с адаптивной громкостью."""
+    """«Голос»: озвучивает jarvis/say голосом Silero из WAV-кэша + PipeWire с адаптивной громкостью."""
+
+    # Фраза-«филлер»: проигрывается из кэша во время холодного синтеза свободного текста, чтобы
+    # не молчать (на N100 синтез Silero ~реального времени). Если её нет в кэше — просто пропуск.
+    FILLER_TEXT = "Сек+унду, сэр."
 
     def __init__(self):
         super().__init__("jarvis-tts")
@@ -143,9 +153,15 @@ class TtsModule(JarvisModule):
         # Уровень — от STT для адаптации; нижний предел — будильник/таймер (обход «тихо→тихо»);
         # чайм — короткий сигнал перед фразой (таймер); критично — озвучить даже в режиме тишины.
         self._queue: "queue.Queue[tuple[str, float | None, float | None, bool, bool]]" = queue.Queue()
-        self._voice = None
-        self._voice_tried = False
-        self._voice_lock = threading.Lock()
+        # Движок синтеза нужен ТОЛЬКО на промахе кэша (свободный текст). primary создаётся сразу
+        # (без torch — лишь объект), модель грузится лениво в _loaded_engine. fallback — Piper.
+        self._primary = tts_engine.make_engine(config.TTS_ENGINE)
+        self._fallback = None
+        self._engine_lock = threading.Lock()
+        self._engine_idle_deadline = None  # monotonic-дедлайн выгрузки torch (None — нет работы)
+        # WAV-кэш под текущий тембр (голос + сигнатура DSP) — версионируется путём.
+        dsp_sig = tts_dsp.dsp_signature(config.DSP_PARAMS, self._primary.voice_id)
+        self._cache = tts_cache.TtsCache(config.TTS_CACHE_DIR, self._primary.voice_id, dsp_sig)
         self._worker = None
         self._play_proc: subprocess.Popen | None = None
         self._env = AudioEnv()  # замер обстановки + ducking + расчёт громкости
@@ -156,7 +172,7 @@ class TtsModule(JarvisModule):
         self._audio_check_at = 0.0
         self._audio_refreshing = False  # guard: один фоновый wpctl-замер за раз
         # Перебивание речи (barge-in): взводится из on_control (STT попросил оборвать). Текущий
-        # синтез прерывается, очередь чистится. Намеренный обрыв ≠ сбой озвучки (см. _synth_and_play).
+        # вывод прерывается, очередь чистится. Намеренный обрыв ≠ сбой озвучки (см. _play_pcm).
         self._interrupt = threading.Event()
 
     def on_start(self):
@@ -169,29 +185,97 @@ class TtsModule(JarvisModule):
             self._env.start()
         except Exception:
             self.log_exc(logging.WARNING, "Не удалось запустить замер обстановки — громкость фиксированная")
-        # Прогрев Piper в фоне при старте: первая фраза не ждёт ~3с загрузки (ценой ~106 МБ RAM).
-        if config.TTS_PRELOAD:
-            threading.Thread(target=self._ensure_voice, daemon=True, name="piper-preload").start()
+        # Прогрев движка при старте имеет смысл ТОЛЬКО для Piper (лёгкий onnxruntime). Для Silero
+        # горячий путь идёт из кэша без torch — грузить модель на старте незачем (RAM при swap=0).
+        if config.TTS_PRELOAD and config.TTS_ENGINE == "piper":
+            threading.Thread(target=self._loaded_engine, daemon=True, name="tts-preload").start()
+        # Выгрузка движка по простою: вернуть RAM после редкого синтеза свободного текста.
+        if config.SILERO_UNLOAD_AFTER and config.SILERO_UNLOAD_AFTER > 0:
+            threading.Thread(target=self._engine_reaper, daemon=True, name="tts-engine-reaper").start()
         # Прогрев кэша проверки звука: первая фраза не платит синхронный wpctl (~17мс).
         self._refresh_audio_state()
 
-    def _ensure_voice(self):
-        """Загрузить голос Piper один раз (потокобезопасно). Используется и прогревом, и _speak."""
-        if self._voice is not None or self._voice_tried:
-            return
-        with self._voice_lock:
-            if self._voice is not None or self._voice_tried:
-                return
-            self._voice_tried = True
-            try:
-                from piper import PiperVoice
+    def _loaded_engine(self):
+        """Загруженный движок синтеза для ПРОМАХА кэша: (engine, is_primary) или None.
 
-                self._voice = PiperVoice.load(config.PIPER_MODEL, config_path=config.PIPER_CONFIG)
-                self.log.info("Голос Piper загружен: %s", config.PIPER_MODEL)
+        primary (Silero) грузит torch лениво ЗДЕСЬ. Если не вышло (нет torch/OOM при swap=0) —
+        пробуем лёгкий Piper-фоллбэк (другой тембр, его НЕ кэшируем). Потокобезопасно; повторный
+        вызов на уже загруженной модели дёшев (warmup идемпотентен)."""
+        with self._engine_lock:
+            try:
+                self._primary.warmup()
+                return (self._primary, True)
             except Exception:
-                self.log_exc(logging.ERROR,
-                             "Не удалось загрузить голос Piper — озвучка будет недоступна")
-                self._voice = None
+                self.log_exc(logging.WARNING,
+                             "Не удалось загрузить основной голос (Silero) — пробую Piper-фоллбэк")
+            try:
+                if self._fallback is None:
+                    self._fallback = tts_engine.PiperEngine()
+                self._fallback.warmup()
+                return (self._fallback, False)
+            except Exception:
+                self.log_exc(logging.ERROR, "Синтез недоступен — ни Silero, ни Piper не загрузились")
+                return None
+
+    def _engine_reaper(self):
+        """Выгрузить движок (torch) после простоя — вернуть RAM (swap=0). Демон до остановки."""
+        while not self._stop_event.wait(15.0):
+            deadline = self._engine_idle_deadline
+            if deadline is not None and time.monotonic() > deadline:
+                with self._engine_lock:
+                    try:
+                        self._primary.unload()
+                        self.log.info("Голос выгружен из памяти после простоя (вернул RAM)")
+                    except Exception:
+                        self.log.debug("Не удалось выгрузить движок", exc_info=True)
+                    self._engine_idle_deadline = None
+
+    def _render_miss(self, final_text: str) -> "tts_cache.CachedClip | None":
+        """Синтезировать фразу, которой нет в кэше (свободный текст), и закэшировать.
+
+        Silero (primary) → применяем JARVIS-DSP и кладём в кэш. Piper-фоллбэк → играем «как есть»
+        (другой тембр) и НЕ кэшируем, чтобы не смешивать голоса. На N100 это секунды — вызывающий
+        перед этим проигрывает филлер из кэша, чтобы не молчать."""
+        loaded = self._loaded_engine()
+        if loaded is None:
+            return None
+        engine, is_primary = loaded
+        # Авто-ударения (опц.) применяем к тексту синтеза, но НЕ к ключу кэша (final_text) —
+        # ключ остаётся детерминированным, статика не расходится с рантаймом.
+        synth_text = speech.auto_stress(final_text) if config.AUTO_STRESS else final_text
+        try:
+            pcm = engine.synth(synth_text)
+        except Exception:
+            self.log_exc(logging.WARNING, f"Синтез не удался: {final_text[:60]!r}")
+            return None
+        if not pcm:
+            return None
+        rate = int(engine.sample_rate)
+        if is_primary:
+            try:
+                pcm = tts_dsp.apply_dsp(pcm, rate, config.DSP_PARAMS, rate)
+            except Exception:
+                self.log.warning("JARVIS-DSP не применился — играю «сухой» голос", exc_info=True)
+            try:
+                self._cache.put(final_text, pcm, rate)
+            except Exception:
+                self.log.debug("Не удалось записать клип в кэш", exc_info=True)
+        # Завести таймер выгрузки движка (простой → освободить RAM).
+        if config.SILERO_UNLOAD_AFTER and config.SILERO_UNLOAD_AFTER > 0:
+            self._engine_idle_deadline = time.monotonic() + float(config.SILERO_UNLOAD_AFTER)
+        return tts_cache.CachedClip(pcm, rate)
+
+    def _maybe_filler(self, volume: float, gain: float) -> None:
+        """Проиграть короткий филлер из кэша (если есть) — заполнить паузу холодного синтеза."""
+        try:
+            ft = speech.apply_stress(
+                speech.apply_pronunciation(self.FILLER_TEXT, config.PRONUNCIATION),
+                config.STRESS_TABLE)
+            clip = self._cache.get(ft)
+            if clip is not None and not self._interrupt.is_set():
+                self._play_pcm(clip.pcm, clip.rate, volume, gain, chime=False)
+        except Exception:
+            self.log.debug("Филлер не проигрался — пропускаю", exc_info=True)
 
     def on_say(self, payload: dict):
         text = (payload.get("text") or "").strip()
@@ -298,20 +382,14 @@ class TtsModule(JarvisModule):
             pref = phrases.pick("notif.audio_fail", config.AUDIO_FAIL_PREFIX)
             self._notify_speech(text, f"{pref} {reason}".strip())
             return True
-        self._ensure_voice()
-        if self._voice is None:
-            self.log.warning("Голос Piper не загружен — не могу озвучить фразу: %r", text[:60])
-            self._notify_speech(text, phrases.pick("notif.audio_fail", config.AUDIO_FAIL_PREFIX)
-                                + " синтез речи не загрузился.")
-            return False
         ducked = False
         duck_thread = None
         try:
             self.set_state(contracts.STATE_SPEAKING)
             self._env.set_speaking(True)
             # Ducking музыки ноута, если она реально звучит выше порога. Рампа (~150мс pactl+паузы)
-            # идёт ПАРАЛЛЕЛЬНО синтезу Piper (~170мс): музыка приглушается, пока готовится первый
-            # чанк, а не ПЕРЕД ним. restore — строго после конца рампы (join в finally).
+            # идёт ПАРАЛЛЕЛЬНО подготовкой звука: на хите из кэша воспроизведение почти мгновенно,
+            # на миссе — пока идёт синтез. restore — строго после конца рампы (join в finally).
             if self._env.should_duck():
                 duck_thread = threading.Thread(target=self._env.duck, daemon=True, name="tts-duck")
                 duck_thread.start()
@@ -324,7 +402,20 @@ class TtsModule(JarvisModule):
             if config.PERF_DEBUG:
                 self.log.info("PERF tts: проверки до синтеза %.1fмс (ducking=%s)",
                               (time.perf_counter() - t_start) * 1000, ducked)
-            self._synth_and_play(text, volume, gain, chime)
+            # Итоговый текст синтеза = словарь произношения + `+`-ударения (то же, чем ключуется
+            # кэш). ХИТ → играем готовый WAV мгновенно, без torch. МИСС (свободный текст) →
+            # филлер из кэша, затем ленивый синтез Silero + DSP + запись в кэш.
+            final_text = speech.apply_stress(
+                speech.apply_pronunciation(text, config.PRONUNCIATION), config.STRESS_TABLE)
+            clip = self._cache.get(final_text)
+            if clip is None:
+                self._maybe_filler(volume, gain)      # не молчим, пока идёт холодный синтез
+                if self._interrupt.is_set():          # успели перебить — синтез не нужен
+                    return True
+                clip = self._render_miss(final_text)
+            if clip is None:
+                raise RuntimeError("синтез не дал звука")
+            self._play_pcm(clip.pcm, clip.rate, volume, gain, chime)
             return True
         except Exception as exc:
             self.log.warning(
@@ -415,29 +506,16 @@ class TtsModule(JarvisModule):
         except Exception:
             return ("fail", "не удалось проверить звук.")
 
-    def _synth_and_play(self, text: str, volume: float, gain: float, chime: bool = False) -> None:
-        """ПОТОКОВЫЙ синтез+воспроизведение: чанки Piper пишем в stdin pw-cat по мере готовности
-        (время до первого звука ↓). Громкость — pw-cat --volume; усиление >1 — gain PCM.
+    def _play_pcm(self, pcm: bytes, rate: int, volume: float, gain: float,
+                  chime: bool = False) -> None:
+        """Воспроизвести готовый s16 mono PCM (из кэша или свежесинтезированный) через pw-cat.
 
-        Скорость и тон НЕЗАВИСИМЫ: темп задаёт length_scale Piper, тон — подмена частоты pw-cat
-        (--rate = частота_модели·pitch). length_scale домножаем на pitch, чтобы компенсировать
-        растяжение времени от ресэмплинга → net-темп = length_scale, net-тон = pitch. Pitch не
-        формант-сохраняющий: для МАЛОГО сдвига звучит чисто, без доп. зависимостей и заметного CPU
-        (pw-cat и так ресэмплит к частоте устройства)."""
-        from piper import SynthesisConfig
-
-        from jarvis import speech
-        # Словарь произношения/ударений (ТЗ-10): правим проблемные слова ПЕРЕД синтезом.
-        text = speech.apply_pronunciation(text, config.PRONUNCIATION)
-        # Защита от мусора в settings.yaml: вне разумных границ → клиппинг (битое значение не должно
-        # давать немоту/нулевую частоту). length_scale и pitch — положительные множители.
-        pitch = min(2.0, max(0.5, float(config.VOICE_PITCH)))
-        length = min(2.0, max(0.5, float(config.VOICE_LENGTH_SCALE)))
-        model_rate = int(self._voice.config.sample_rate)
-        # Подмена частоты воспроизведения сдвигает тон (ниже при pitch<1) и растягивает время в
-        # 1/pitch раз; length_scale·pitch компенсирует растяжение → темп зависит ТОЛЬКО от length.
-        rate = max(8000, round(model_rate * pitch))
-        syn = SynthesisConfig(length_scale=length * pitch)
+        PCM стримим в stdin pw-cat ЧАНКАМИ (~play_chunk_ms): первый звук стартует сразу, лампы
+        пульсируют в такт (огибающая кормится по факту записи), перебивание (barge-in) обрывает
+        запись мгновенно. Тон/темп/тембр УЖЕ запечены в WAV офлайн-обработкой (JARVIS-DSP),
+        поэтому pw-cat играет на родной частоте клипа без подмены частоты. Громкость — pw-cat
+        --volume; усиление >1 — gain PCM (в сильном шуме)."""
+        rate = max(8000, int(rate))
         cmd = ["pw-cat", "-p", "--raw", "--rate", str(rate), "--channels", "1", "--format", "s16",
                "--volume", f"{max(0.0, volume):.3f}", "--latency", f"{config.TTS_LATENCY_MS}ms", "-"]
         if config.TTS_SINK:
@@ -456,13 +534,16 @@ class TtsModule(JarvisModule):
         # в pw-cat (чайм + чанки), финал — в finally. Выключена → ноль накладных расходов.
         env_stream = _EnvelopeStream(self, rate, volume) if config.LAMP_ANIM_ENABLED else None
         first_write = None
+        # Чанк потока в pw-cat: ~play_chunk_ms звука (2 байта/сэмпл, mono). Мельче — плавнее
+        # огибающая ламп; крупнее — меньше системных вызовов. Кратно сэмплу (чётно).
+        chunk_bytes = 2 * max(1, int(rate * max(10, int(config.TTS_PLAY_CHUNK_MS)) / 1000))
 
         def _mark_first():
             nonlocal first_write
             if first_write is None:
                 first_write = time.perf_counter()
                 if config.PERF_DEBUG:
-                    self.log.info("PERF tts: первый звук через %.0fмс от старта синтеза",
+                    self.log.info("PERF tts: первый звук через %.0fмс от старта вывода",
                                   (first_write - t_synth) * 1000)
         try:
             if chime:  # короткий сигнал перед фразой (таймер) — тем же потоком pw-cat
@@ -478,19 +559,19 @@ class TtsModule(JarvisModule):
                         env_stream.feed(data)
                 except Exception:
                     self.log.debug("Не удалось проиграть чайм", exc_info=True)
-            for chunk in self._voice.synthesize(text, syn_config=syn):
+            for off in range(0, len(pcm), chunk_bytes):
                 if self._interrupt.is_set():
-                    break  # barge-in: пользователь заговорил — прекращаем синтез немедленно
-                pcm = chunk.audio_int16_bytes
+                    break  # barge-in: пользователь заговорил — прекращаем вывод немедленно
+                chunk = pcm[off:off + chunk_bytes]
                 if gain > 1.0:
-                    pcm = AudioEnv.apply_gain(pcm, gain)
+                    chunk = AudioEnv.apply_gain(chunk, gain)
                 try:
-                    ts = time.time()  # якорь анимации ДО write первого чанка (если чайма не было)
-                    proc.stdin.write(pcm)  # стримим по мере синтеза
+                    ts = time.time()  # якорь анимации ДО write чанка (write блокируется на пайпе)
+                    proc.stdin.write(chunk)  # стримим готовый PCM по чанкам
                     _mark_first()
                     if env_stream is not None:
-                        env_stream.mark_start(ts)  # no-op, если t0 уже поставлен чаймом
-                        env_stream.feed(pcm)
+                        env_stream.mark_start(ts)  # no-op, если t0 уже поставлен чаймом/чанком
+                        env_stream.feed(chunk)
                 except BrokenPipeError:
                     break
             try:
@@ -570,7 +651,7 @@ class TtsModule(JarvisModule):
 
 
 def main():
-    TtsModule().run()
+    run_service(TtsModule, "jarvis-tts")
 
 
 if __name__ == "__main__":

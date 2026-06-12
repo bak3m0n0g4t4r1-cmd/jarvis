@@ -17,7 +17,7 @@ from pathlib import Path
 import yaml
 
 from jarvis import config, contracts, notify, phrases, services_map
-from jarvis.bus import JarvisModule
+from jarvis.bus import JarvisModule, run_service
 
 # KWin (Wayland) виртуальные столы: создание/переключение через qdbus6 (сверено на KDE 6.5).
 _KWIN = ["qdbus6", "org.kde.KWin"]
@@ -134,7 +134,7 @@ class OsAgentModule(JarvisModule):
         spec = self._commands.get(tag)
         if not spec:
             self.log.warning("Неизвестный тег команды: %r", tag)
-            self.say(f"Сэр, мне неизвестна команда «{tag}».")
+            self.say(f"Сэр, мне неизв+естна ком+анда «{tag}».")
             return
         # Тема оформления (ТЗ-10): поле «тема» (dark|light|toggle) вместо shell-команды.
         theme = spec.get("тема")
@@ -144,7 +144,7 @@ class OsAgentModule(JarvisModule):
         args = spec.get("команда")
         if not isinstance(args, list) or not args:
             self.log.error("Некорректная команда для тега %s: %r", tag, args)
-            self.say(f"Сэр, команда «{tag}» настроена неверно.")
+            self.say(f"Сэр, ком+анда «{tag}» настр+оена нев+ерно.")
             return
         # Команда может требовать примонтированный путь (носитель: флешка/диск). Если пути
         # нет — носитель не подключён: отвечаем в характере и НЕ запускаем (без падения).
@@ -213,7 +213,7 @@ class OsAgentModule(JarvisModule):
             apps = [a for a in (payload.get("apps") or []) if a in self._commands]
             if not apps:
                 self.log.info("Среда «%s»: нет валидных приложений в %r", desktop, payload.get("apps"))
-                self.say("Сэр, в этой среде нечего открывать.")
+                self.say("Сэр, в этой сред+е н+ечего открыв+ать.")
                 return
             created = self._kwin_new_desktop(desktop)
             self.log.info("Среда «%s»: стол %s, приложения %s", desktop, created or "(текущий)", apps)
@@ -261,11 +261,11 @@ class OsAgentModule(JarvisModule):
             )
         except FileNotFoundError:
             self.log.error("Исполняемый файл не найден: %s", args[0])
-            self.say(f"Сэр, не нашёл программу для команды «{tag}».")
+            self.say(f"Сэр, не нашёл прогр+амму для ком+анды «{tag}».")
             return
         except Exception:
             self.log.exception("Не удалось запустить %s", tag)
-            self.say(f"Сэр, не удалось выполнить «{tag}».")
+            self.say(f"Сэр, не удал+ось в+ыполнить «{tag}».")
             return
 
         if wait_output:
@@ -306,15 +306,15 @@ class OsAgentModule(JarvisModule):
             )
             log_path.write_text(output, encoding="utf-8")
             if proc.returncode == 0:
-                self.say(f"Сэр, команда «{tag}» выполнена. Лог сохранён.")
+                self.say(f"Сэр, ком+анда «{tag}» в+ыполнена. Лог сохран+ён.")
             else:
                 self.say(
-                    f"Сэр, команда «{tag}» завершилась с ошибкой "
-                    f"(код {proc.returncode}). Лог сохранён."
+                    f"Сэр, ком+анда «{tag}» заверш+илась с ош+ибкой "
+                    f"(код {proc.returncode}). Лог сохран+ён."
                 )
         except Exception:
             self.log.exception("Ошибка ожидания команды %s", tag)
-            self.say(f"Сэр, при выполнении «{tag}» произошёл сбой.")
+            self.say(f"Сэр, при выполн+ении «{tag}» произош+ёл сбой.")
 
     def on_stop(self):
         """Погасить слушатель уведомлений (gdbus monitor) при остановке сервиса."""
@@ -322,7 +322,7 @@ class OsAgentModule(JarvisModule):
 
 
 def main():
-    OsAgentModule().run()
+    run_service(OsAgentModule, "jarvis-os-agent")
 
 
 if __name__ == "__main__":

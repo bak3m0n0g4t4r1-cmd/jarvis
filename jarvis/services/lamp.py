@@ -27,7 +27,7 @@ from datetime import datetime
 
 from jarvis import config, contracts, phrases
 from jarvis import lamp as helpers
-from jarvis.bus import JarvisModule
+from jarvis.bus import JarvisModule, run_service
 
 _RESTORE_DELAY = 0.8   # debounce: пауза перед возвратом в фон после конца речи (фолбэк-режим)
 _DEFAULT_RGB = (255, 170, 87)
@@ -1010,7 +1010,7 @@ class LampModule(JarvisModule):
 
 
 def main():
-    LampModule().run()
+    run_service(LampModule, "jarvis-lamp")
 
 
 if __name__ == "__main__":

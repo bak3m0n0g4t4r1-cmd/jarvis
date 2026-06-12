@@ -24,6 +24,14 @@ _SYMBOL = {OK: "✓", FAIL: "✗", WARN: "⚠"}
 _COLOR = {OK: "\033[32m", FAIL: "\033[31m", WARN: "\033[33m"}
 _RESET = "\033[0m"
 _BOLD = "\033[1m"
+# Дополнительные тона для CLI-вывода (та же сдержанная гамма): мягкий cyan для
+# заголовков и приглушённый dim для второстепенных подсказок.
+CYAN = "\033[36m"
+DIM = "\033[2m"
+BOLD = _BOLD
+GREEN = _COLOR[OK]
+RED = _COLOR[FAIL]
+YELLOW = _COLOR[WARN]
 
 
 def _use_color() -> bool:
@@ -34,6 +42,34 @@ def _use_color() -> bool:
         return sys.stdout.isatty()
     except Exception:
         return False
+
+
+# --------------------------------------------------------------------------- #
+# Переиспользуемый слой цвета и единые строки-статусы для всего CLI
+# --------------------------------------------------------------------------- #
+def paint(text: str, code: str) -> str:
+    """Покрасить текст ANSI-кодом, уважая терминал/NO_COLOR (иначе чистый текст)."""
+    return f"{code}{text}{_RESET}" if _use_color() else text
+
+
+def ok(msg: str) -> None:
+    """Печать успешной строки: зелёная галочка."""
+    print(paint(f"✓ {msg}", _COLOR[OK]))
+
+
+def fail(msg: str) -> None:
+    """Печать ошибки: красный крест."""
+    print(paint(f"✗ {msg}", _COLOR[FAIL]))
+
+
+def warn(msg: str) -> None:
+    """Печать предупреждения: жёлтый знак."""
+    print(paint(f"⚠ {msg}", _COLOR[WARN]))
+
+
+def info(msg: str) -> None:
+    """Нейтральная строка-примечание (без цвета, приглушённый маркер)."""
+    print(f"… {msg}")
 
 
 @dataclass

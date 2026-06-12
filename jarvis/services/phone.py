@@ -16,7 +16,7 @@ import time
 
 from jarvis import config, contracts, notify, phrases
 from jarvis.audio_env import AudioEnv
-from jarvis.bus import JarvisModule
+from jarvis.bus import JarvisModule, run_service
 
 _STATE_FILE = "phone_state.json"
 
@@ -199,7 +199,7 @@ class PhoneModule(JarvisModule):
 
 
 def main():
-    PhoneModule().run()
+    run_service(PhoneModule, "jarvis-phone")
 
 
 if __name__ == "__main__":

@@ -36,7 +36,7 @@ SERVICES = [
     ),
     ServiceDef(
         "tts", "jarvis-tts.service", "jarvis-tts",
-        "jarvis.services.tts", "TtsModule", "«Голос» — Piper TTS",
+        "jarvis.services.tts", "TtsModule", "«Голос» — Silero TTS (кэш WAV)",
         needs_audio=True,
     ),
     ServiceDef(

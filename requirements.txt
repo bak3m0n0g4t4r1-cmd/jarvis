@@ -11,3 +11,8 @@ onnxruntime>=1.16
 tokenizers>=0.15
 sherpa-onnx>=1.10
 piper-tts>=1.2
+# Слой 2 матчера: обучение линейного классификатора (инференс — чистый numpy, sklearn не грузится).
+scikit-learn>=1.3
+joblib>=1.3
+# Только для разовой генерации INT8-эмбеддера (jarvis models --quantize), не нужны в рантайме:
+#   pip install onnx sympy

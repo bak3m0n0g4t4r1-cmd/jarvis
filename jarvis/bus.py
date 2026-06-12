@@ -408,3 +408,59 @@ class JarvisModule:
         # Фатальный сбой (request_restart) → ненулевой код, чтобы systemd поднял заново.
         if self._exit_code:
             sys.exit(self._exit_code)
+
+
+# --------------------------------------------------------------------------- #
+# Единая точка входа сервиса
+# --------------------------------------------------------------------------- #
+def run_service(module_cls, name: str) -> None:
+    """Запустить сервис под верхнеуровневой страховкой.
+
+    Гарантия: НИ ОДНО исключение не вылетает из процесса «голым» трейсбеком. Сбой в
+    конструкторе модуля или в раннем коде run() (до его внутренних try) ловится здесь,
+    пишется ОДНОЙ внятной строкой в лог сервиса (logs/<name>.log) и в stderr, после чего
+    процесс выходит кодом 1 — systemd (Restart=always) поднимет его заново.
+
+    KeyboardInterrupt и SystemExit пробрасываем как есть: это штатное завершение
+    (Ctrl+C / request_restart через sys.exit), а не сбой.
+    """
+    try:
+        module_cls().run()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        _log_fatal(name)
+        sys.exit(1)
+
+
+def _log_fatal(name: str) -> None:
+    """Записать фатальный сбой сервиса в его лог-файл и stderr (best-effort).
+
+    Логгер сервиса мог не успеть получить файловый обработчик (сбой в __init__ до
+    _setup_logging) — тогда навешиваем его здесь, чтобы причина точно осела в логе.
+    """
+    log = logging.getLogger(name)
+    try:
+        if not any(isinstance(h, RotatingFileHandler) for h in log.handlers):
+            config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(
+                config.LOGS_DIR / f"{name}.log",
+                maxBytes=config.LOG_MAX_BYTES,
+                backupCount=config.LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            handler.setFormatter(
+                logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+            )
+            log.addHandler(handler)
+            log.setLevel(logging.INFO)
+    except Exception:
+        pass
+    try:
+        log.critical("Фатальный сбой сервиса — выход с кодом 1, systemd перезапустит",
+                     exc_info=True)
+    except Exception:
+        # Последний рубеж: даже логирование упало — печатаем в stderr напрямую.
+        import traceback
+        print(f"[{name}] фатальный сбой сервиса:", file=sys.stderr)
+        traceback.print_exc()

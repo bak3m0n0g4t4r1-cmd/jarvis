@@ -1,5 +1,5 @@
 [Unit]
-Description=Джарвис — «Голос» (TTS: Piper)
+Description=Джарвис — «Голос» (TTS: Silero, кэш WAV)
 # Аудио-сервис: нужен пользовательский PipeWire
 Wants=pipewire.service
 After=pipewire.service network.target

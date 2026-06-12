@@ -6,6 +6,9 @@ models/*
 logs/*
 !logs/.gitkeep
 
+# WAV-кэш синтезированной речи (Silero + JARVIS-DSP) — большой, пересобирается `jarvis tts build`
+cache/
+
 # Секреты: ключ Gemini и прочие локальные настройки (шаблон — .env.example)
 .env
 .env.local

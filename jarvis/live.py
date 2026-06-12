@@ -1,14 +1,26 @@
-"""Живая панель состояния Джарвиса (`jarvis live`) — TUI на rich.live до Ctrl+C.
+"""Живая панель состояния Джарвиса (`jarvis live`) — событийный TUI на rich.live до Ctrl+C.
 
-Показывает в реальном времени: эфир (распознанные фразы + состояние), сервисы (юниты + MQTT),
-расписание на 3 дня (будильники/таймеры/секундомеры/напоминания/задачи), перерыв (детектор
-активности), режим (тишина/громкость). Лёгкость: rich.live ~1–2 fps, статус юнитов кэшируется.
+Архитектура (без задержек):
+  • MQTT-поток пишет эфир (фразы/состояние/реплику) и БУДИТ рендер мгновенно — фраза
+    появляется ровно тогда, когда пришла, а не на следующем тике таймера.
+  • Фоновый поток-поллер делает ВЕСЬ дорогой I/O (systemctl ×8, wpctl-громкость, чтение
+    JSON расписания/перерыва/телефона) и складывает результат в кэш — рендер сам не
+    блокируется ни на одном системном вызове.
+  • Рендер форматирует только кэш + ЖИВОЕ текущее время: часы (ЧЧ:ММ:СС) и счётчики
+    (обратный отсчёт таймеров, «работает N») считаются от сырых данных на каждом кадре,
+    поэтому секунды тикают чётко.
+  • Отрисовка по требованию (auto_refresh=False): кадр рисуется только когда что-то
+    изменилось — по событию MQTT или на границе очередной секунды (для часов). Без
+    лишних перерисовок и мерцания.
 
-Чистый выход: rich.Live(screen=True) использует альтернативный буфер терминала и ВОССТАНАВЛИВАЕТ
-его при выходе (Ctrl+C → терминал цел, без «битого» вывода); MQTT-клиент закрывается в finally.
+Палитра спокойная: серые рамки, тусклые cyan-заголовки, цвет — только на данных.
+
+Чистый выход: rich.Live(screen=True) держит альтернативный буфер терминала и восстанавливает
+его при Ctrl+C; MQTT-клиент и поллер закрываются в finally.
 """
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -20,68 +32,112 @@ from jarvis.services_map import SERVICES
 
 _log = logging.getLogger("jarvis-live")
 _ACTIVITY_STATE = "activity_state.json"
+_PHONE_STATE = "phone_state.json"
+
+# Спокойная палитра: серые рамки, тусклые cyan-заголовки, цвет — только на данных.
+_BORDER = "grey37"
+_TITLE = "cyan"
+_STATE_COLOR = {"listening": "green", "thinking": "yellow", "speaking": "cyan"}
+
+# Короткие имена юнитов для сетки «Сервисы» (без префикса jarvis-, компактно).
+_SHORT_NAME = {
+    "jarvis-stt": "stt", "jarvis-core": "core", "jarvis-tts": "tts",
+    "jarvis-os-agent": "os-agent", "jarvis-activity-monitor": "activity",
+    "jarvis-scheduler": "sched", "jarvis-lamp": "lamp", "jarvis-phone": "phone",
+}
 
 
 class _State:
-    """Потокобезопасное общее состояние панели (пишет MQTT-поток, читает рендер)."""
+    """Потокобезопасное общее состояние панели.
+
+    Пишут два потока: MQTT-колбэк (эфир) и поллер (кэш системных данных). Читает рендер
+    через snapshot(). Любая запись будит рендер (_wake), чтобы кадр обновился без задержки.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self.phrases = deque(maxlen=6)   # (время, текст, wake)
+        self._wake = threading.Event()
+        # Эфир (пишет MQTT-поток).
+        self.phrases = deque(maxlen=8)   # (время, текст, wake)
         self.state = "—"                 # последнее jarvis/state
         self.last_say = ""               # последняя реплика Джарвиса
         self.mqtt_ok = False
-        self._status = []                # [(name, active)]
-        self._status_at = 0.0
+        # Кэш системных данных (пишет поллер) — сырьё, человекочитаемое считает рендер.
+        self._services = []              # [(unit, active)]
+        self._silent = False
+        self._vol = "?"
+        self._sched = {}                 # сырой dict расписания
+        self._break = None               # сырой dict перерыва или None
+        self._phone = None               # сырой dict телефона или None
 
+    # -- сторона MQTT (эфир) -- #
     def add_phrase(self, text, wake):
         with self._lock:
             self.phrases.appendleft((datetime.now().strftime("%H:%M:%S"), text, wake))
+        self._wake.set()
 
     def set_state(self, s):
         with self._lock:
             self.state = s
+        self._wake.set()
 
     def set_say(self, s):
         with self._lock:
             self.last_say = s
+        self._wake.set()
 
+    def set_mqtt(self, ok):
+        with self._lock:
+            self.mqtt_ok = ok
+        self._wake.set()
+
+    # -- сторона поллера (кэш) -- #
+    def set_poll(self, services, silent, vol, sched, brk, phone):
+        with self._lock:
+            self._services = services
+            self._silent = silent
+            self._vol = vol
+            self._sched = sched
+            self._break = brk
+            self._phone = phone
+        self._wake.set()
+
+    # -- сторона рендера -- #
     def snapshot(self):
         with self._lock:
-            return list(self.phrases), self.state, self.last_say, self.mqtt_ok
+            return {
+                "phrases": list(self.phrases),
+                "state": self.state,
+                "last_say": self.last_say,
+                "mqtt_ok": self.mqtt_ok,
+                "services": list(self._services),
+                "silent": self._silent,
+                "vol": self._vol,
+                "sched": self._sched,
+                "break": self._break,
+                "phone": self._phone,
+            }
 
-    def services(self):
-        """Статус юнитов с кэшем LIVE_STATUS_TTL (не дёргать systemctl каждый кадр)."""
-        now = time.monotonic()
-        if self._status and (now - self._status_at) < config.LIVE_STATUS_TTL:
-            return self._status
-        out = []
-        for svc in SERVICES:
-            active = False
-            try:
-                r = subprocess.run(["systemctl", "--user", "is-active", svc.unit],
-                                   capture_output=True, text=True, timeout=2)
-                active = r.stdout.strip() == "active"
-            except Exception:
-                active = False
-            out.append((svc.unit.removesuffix(".service"), active))
-        self._status, self._status_at = out, now
-        return out
+    def wait(self, timeout: float) -> bool:
+        """Дождаться события или таймаута; сбросить флаг. True — разбудило событие."""
+        woke = self._wake.wait(timeout)
+        self._wake.clear()
+        return woke
 
 
 # --------------------------------------------------------------------------- #
-# MQTT-подписка на эфир/состояние
+# MQTT-подписка на эфир/состояние (мгновенно будит рендер)
 # --------------------------------------------------------------------------- #
 def _connect_mqtt(state: _State):
     import paho.mqtt.client as mqtt
 
     def on_connect(client, userdata, flags, reason_code, properties=None):
-        state.mqtt_ok = True
+        state.set_mqtt(True)
         for topic in (contracts.TOPIC_INPUT, contracts.TOPIC_STATE, contracts.TOPIC_SAY):
             client.subscribe(topic)
 
     def on_disconnect(client, userdata, *a):
-        state.mqtt_ok = False
+        state.set_mqtt(False)
 
     def on_message(client, userdata, msg):
         try:
@@ -99,7 +155,10 @@ def _connect_mqtt(state: _State):
             if text:
                 state.set_say(text)
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="jarvis-live")
+    # client_id с PID: два параллельных (или зависший + новый) `jarvis live` не выбивают
+    # друг друга с брокера по совпадению id — как это делают сервисы в bus.py.
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                         client_id=f"jarvis-live-{os.getpid()}")
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
     client.on_message = on_message
@@ -109,7 +168,85 @@ def _connect_mqtt(state: _State):
 
 
 # --------------------------------------------------------------------------- #
-# Форматирование
+# Фоновый поллер: весь дорогой I/O — вне потока рендера
+# --------------------------------------------------------------------------- #
+def _safe(fn, default):
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+def _poll_services():
+    """Статус всех юнитов через `systemctl --user is-active`. Любой сбой юнита → неактивен."""
+    out = []
+    for svc in SERVICES:
+        active = False
+        try:
+            r = subprocess.run(["systemctl", "--user", "is-active", svc.unit],
+                               capture_output=True, text=True, timeout=2)
+            active = r.stdout.strip() == "active"
+        except Exception:
+            active = False
+        out.append((svc.unit.removesuffix(".service"), active))
+    return out
+
+
+def _poll_volume():
+    """Громкость строкой (через wpctl). Выключен → «выкл», сбой → «?»."""
+    from jarvis.sysinfo import read_volume
+
+    try:
+        v = read_volume()
+        if v.get("выключен"):
+            return "выкл"
+        if "ошибка" in v:
+            return "?"
+        return f"{v.get('громкость_процент')}%"
+    except Exception:
+        return "?"
+
+
+def _read_state_json(name):
+    """Прочитать logs/<name>.json (его пишет сервис). Нет файла/сбой → None."""
+    path = os.path.join(str(config.LOGS_DIR), name)
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _poll_loop(state: _State, stop: threading.Event):
+    """Фоновое обновление кэша. systemctl дёргаем редко (LIVE_STATUS_TTL), остальное —
+    каждый цикл (локальные чтения дёшевы). Никогда не падает: всё под _safe/try."""
+    from jarvis import alarms, silence
+
+    services, services_at = [], 0.0
+    interval = max(0.5, float(getattr(config, "LIVE_REFRESH_SECONDS", 1.0)))
+    while not stop.is_set():
+        try:
+            now_m = time.monotonic()
+            if not services or (now_m - services_at) >= float(config.LIVE_STATUS_TTL):
+                services = _poll_services()
+                services_at = now_m
+            state.set_poll(
+                services,
+                _safe(silence.is_silent, False),
+                _poll_volume(),
+                _safe(alarms.read_schedule, {}),
+                _read_state_json(_ACTIVITY_STATE),
+                _read_state_json(_PHONE_STATE),
+            )
+        except Exception:
+            _log.debug("Сбой поллера live", exc_info=True)
+        stop.wait(interval)
+
+
+# --------------------------------------------------------------------------- #
+# Форматирование (чистые функции: сырьё + текущее время → строки)
 # --------------------------------------------------------------------------- #
 def _fmt_duration(seconds: float) -> str:
     seconds = int(max(0, seconds))
@@ -129,15 +266,10 @@ def _parse_iso(value):
         return None
 
 
-def _schedule_lines(now: datetime, horizon_hours: int):
-    """Строки расписания на ближайшие N часов (что задано: будильники/таймеры/…). Всё в try-except."""
-    from jarvis import alarms
-
+def _schedule_lines(sched: dict, now: datetime, horizon_hours: int):
+    """Строки расписания из уже прочитанного dict + живое время (счётчики тикают каждый кадр)."""
+    sched = sched or {}
     lines = []
-    try:
-        sched = alarms.read_schedule()
-    except Exception:
-        return ["  (не удалось прочитать расписание)"]
     try:
         for a in sched.get("будильники", []):
             if not a.get("активен", True):
@@ -181,27 +313,19 @@ def _schedule_lines(now: datetime, horizon_hours: int):
     return lines or ["  (пусто на ближайшие 3 дня)"]
 
 
-def _phone_lines():
-    """Состояние телефона из logs/phone_state.json (его пишет сервис phone). Нет файла → офлайн."""
-    import os
-
-    path = os.path.join(str(config.LOGS_DIR), "phone_state.json")
-    try:
-        if not os.path.exists(path):
-            return ["  (телефон не подключён)"]
-        with open(path, encoding="utf-8") as f:
-            st = json.load(f)
-    except Exception:
-        return ["  (состояние недоступно)"]
+def _phone_lines(phone):
+    """Строки телефона из уже прочитанного dict (его пишет сервис phone). None → не подключён."""
+    if not phone:
+        return ["  (телефон не подключён)"]
     lines = []
     try:
-        status = st.get("status", "offline")
+        status = phone.get("status", "offline")
         lines.append(f"  статус: {'🟢 на связи' if status == 'online' else '⚪ офлайн'}")
-        bat = st.get("battery")
+        bat = phone.get("battery")
         if isinstance(bat, (int, float)):
-            chrg = " (заряжается)" if st.get("charging") else ""
+            chrg = " (заряжается)" if phone.get("charging") else ""
             lines.append(f"  заряд: {bat}%{chrg}")
-        pres = st.get("presence")
+        pres = phone.get("presence")
         if pres:
             lines.append(f"  присутствие: {'дома' if pres == 'home' else 'нет дома'}")
     except Exception:
@@ -209,35 +333,47 @@ def _phone_lines():
     return lines or ["  (нет данных)"]
 
 
-def _break_lines(now: datetime):
-    """Состояние детектора перерывов из logs/activity_state.json (его пишет activity_monitor)."""
-    import os
-
-    path = os.path.join(str(config.LOGS_DIR), _ACTIVITY_STATE)
-    try:
-        if not os.path.exists(path):
-            return ["  (детектор перерывов не активен)"]
-        with open(path, encoding="utf-8") as f:
-            st = json.load(f)
-    except Exception:
-        return ["  (состояние недоступно)"]
+def _break_lines(brk, now: datetime):
+    """Строки детектора перерывов из dict + живое время. None → детектор не активен."""
+    if not brk:
+        return ["  (детектор перерывов не активен)"]
     lines = []
     try:
-        if st.get("on_break"):
+        if brk.get("on_break"):
             lines.append("  🟢 идёт перерыв")
-        ws = st.get("working_seconds")
+        ws = brk.get("working_seconds")
         if isinstance(ws, (int, float)):
             lines.append(f"  работает: {_fmt_duration(ws)}")
-        us = st.get("until_offer_seconds")
+        us = brk.get("until_offer_seconds")
         if isinstance(us, (int, float)):
             lines.append(f"  напомнит о перерыве через: {_fmt_duration(us)}" if us > 0
                          else "  напоминание о перерыве — скоро")
-        updated = _parse_iso(st.get("updated_at"))
+        updated = _parse_iso(brk.get("updated_at"))
         if updated and (now - updated).total_seconds() > 120:
             lines.append("  (данные устарели — монитор не обновляет)")
     except Exception:
         pass
     return lines or ["  (нет данных)"]
+
+
+def _mode_label(silent: bool, vol: str):
+    """Метка режима и её цвет: тишина — жёлтым, голос — зелёным."""
+    if silent:
+        return "ТИШИНА", "yellow"
+    return f"голос · {vol}", "green"
+
+
+def _air_title(cur_state: str, silent: bool, vol: str):
+    """Заголовок «Эфира»: состояние и режим — цвет на данных, рамка остаётся серой."""
+    from rich.text import Text
+
+    state_color = _STATE_COLOR.get(cur_state, "white")
+    mode, mode_color = _mode_label(silent, vol)
+    return Text.assemble(
+        ("Эфир", _TITLE),
+        ("  ·  ", "dim"), (cur_state, state_color),
+        ("  ·  ", "dim"), (mode, mode_color),
+    )
 
 
 def _render(state: _State):
@@ -246,85 +382,97 @@ def _render(state: _State):
     from rich.table import Table
     from rich.text import Text
 
-    from jarvis import silence
-    from jarvis.sysinfo import read_volume
-
     now = datetime.now()
-    phrases, cur_state, last_say, mqtt_ok = state.snapshot()
+    snap = state.snapshot()
+    cur_state = snap["state"]
 
-    # Эфир.
+    # 1. Эфир — состояние/режим в заголовке, живые часы в углу, тело: реплика + фразы.
     air = Table.grid(padding=(0, 1))
     air.add_column()
-    _state_color = {"listening": "green", "thinking": "yellow", "speaking": "cyan"}.get(cur_state, "white")
-    air.add_row(Text(f"состояние: {cur_state}", style=_state_color))
-    if last_say:
-        air.add_row(Text(f"последняя реплика: {last_say[:70]}", style="dim"))
-    air.add_row(Text("слышу:", style="bold"))
-    if phrases:
-        for ts, text, wake in phrases:
-            tag = "" if wake else " ·без обращения"
+    if snap["last_say"]:
+        air.add_row(Text(f"реплика: «{snap['last_say'][:70]}»", style="cyan dim"))
+    air.add_row(Text("слышу:", style="dim"))
+    if snap["phrases"]:
+        for ts, text, wake in snap["phrases"]:
+            tag = "" if wake else "  ·без обращения"
             air.add_row(Text(f"  {ts}  {text}{tag}", style="white" if wake else "dim"))
     else:
         air.add_row(Text("  (тишина в эфире)", style="dim"))
 
-    # Сервисы.
+    # 2. Сервисы — сетка по 4 в ряд + MQTT. Зелёный/красный несёт сам статус.
     svc = Table.grid(padding=(0, 2))
-    svc.add_column(); svc.add_column()
-    for name, active in state.services():
-        svc.add_row(Text("●", style="green" if active else "red"),
-                    Text(name, style="white" if active else "red"))
-    svc.add_row(Text("●", style="green" if mqtt_ok else "red"),
-                Text("MQTT", style="white" if mqtt_ok else "red"))
+    for _ in range(4):
+        svc.add_column()
+    cells = []
+    for unit, active in snap["services"]:
+        name = _SHORT_NAME.get(unit, unit)
+        color = "green" if active else "red"
+        cells.append(Text.assemble(("● ", color), (name, "white" if active else "red")))
+    for i in range(0, len(cells), 4):
+        svc.add_row(*cells[i:i + 4])
+    mqtt_ok = snap["mqtt_ok"]
+    svc.add_row(Text.assemble(("● ", "green" if mqtt_ok else "red"),
+                              ("MQTT", "white" if mqtt_ok else "red")))
 
-    # Расписание / перерыв / режим.
-    sched = Text("\n".join(_schedule_lines(now, config.LIVE_HORIZON_HOURS)) or "")
-    brk = Text("\n".join(_break_lines(now)))
+    # 3. Расписание · 3 дня.
+    sched = Text("\n".join(_schedule_lines(snap["sched"], now, config.LIVE_HORIZON_HOURS)))
 
-    try:
-        silent = silence.is_silent()
-    except Exception:
-        silent = False
-    try:
-        vdata = read_volume()
-        vol = "выкл" if vdata.get("выключен") else (f"{vdata.get('громкость_процент')}%"
-                                                    if "ошибка" not in vdata else "?")
-    except Exception:
-        vol = "?"
-    mode = Text.assemble(("режим: ", "bold"),
-                         ("ТИШИНА" if silent else "голос", "yellow" if silent else "green"),
-                         (f"   ·   громкость: {vol}", "white"))
+    # 4. Окружение — перерыв и телефон в одной панели, с тусклыми мини-заголовками.
+    env = Text()
+    env.append("перерыв\n", style="dim")
+    for line in _break_lines(snap["break"], now):
+        env.append(line + "\n")
+    env.append("телефон\n", style="dim")
+    phone_lines = _phone_lines(snap["phone"])
+    for i, line in enumerate(phone_lines):
+        env.append(line + ("\n" if i < len(phone_lines) - 1 else ""))
 
+    clock = Text(now.strftime("%H:%M:%S"), style="dim")
     return Group(
-        Panel(air, title="Эфир", border_style="cyan"),
-        Panel(svc, title="Сервисы", border_style="blue"),
-        Panel(sched, title="Расписание · 3 дня", border_style="magenta"),
-        Panel(brk, title="Перерыв", border_style="green"),
-        Panel(Text("\n".join(_phone_lines())), title="Телефон", border_style="yellow"),
-        Panel(mode, title="Режим", border_style="white"),
+        Panel(air, title=_air_title(cur_state, snap["silent"], snap["vol"]),
+              title_align="left", subtitle=clock, subtitle_align="right",
+              border_style=_BORDER),
+        Panel(svc, title=Text("Сервисы", style=_TITLE),
+              title_align="left", border_style=_BORDER),
+        Panel(sched, title=Text("Расписание · 3 дня", style=_TITLE),
+              title_align="left", border_style=_BORDER),
+        Panel(env, title=Text("Окружение", style=_TITLE),
+              title_align="left", border_style=_BORDER),
     )
 
 
 def run() -> int:
-    """Запустить живую панель до Ctrl+C. Возвращает 0."""
+    """Запустить живую панель до Ctrl+C. Возвращает 0.
+
+    Событийный цикл: рисуем кадр, затем ждём либо события MQTT (мгновенная фраза/состояние),
+    либо границы следующей секунды (чёткие часы и счётчики). Весь I/O — в потоке-поллере."""
     from rich.live import Live
 
     state = _State()
+    stop = threading.Event()
     client = None
     try:
         client = _connect_mqtt(state)
     except Exception as exc:
         print(f"Не удалось подключиться к MQTT: {exc}")
-    refresh = max(0.25, float(config.LIVE_REFRESH_SECONDS))
+
+    poller = threading.Thread(target=_poll_loop, args=(state, stop),
+                              daemon=True, name="live-poll")
+    poller.start()
+
     try:
-        with Live(_render(state), screen=True, refresh_per_second=4) as live:
-            while True:
-                time.sleep(refresh)
-                live.update(_render(state))
+        with Live(_render(state), screen=True, auto_refresh=False) as live:
+            while not stop.is_set():
+                live.update(_render(state), refresh=True)
+                # До границы следующей секунды — часы и счётчики идут чётко; событие MQTT
+                # будит раньше (мгновенная фраза/состояние).
+                state.wait(1.0 - (time.time() % 1.0))
     except KeyboardInterrupt:
         pass
     except Exception:
         _log.debug("Панель завершилась с ошибкой", exc_info=True)
     finally:
+        stop.set()
         if client is not None:
             try:
                 client.loop_stop()

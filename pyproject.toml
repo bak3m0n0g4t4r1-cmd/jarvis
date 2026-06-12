@@ -16,13 +16,32 @@ dependencies = [
     # onnxruntime гоняет rubert-tiny2; tokenizers грузит tokenizer.json (см. matcher.py).
     "onnxruntime>=1.16",
     "tokenizers>=0.15",
+    # Слой 2 матчера: обучение линейного классификатора (LogReg). Инференс — чистый numpy
+    # (softmax по экспортированным весам), поэтому sklearn в горячем пути НЕ импортируется;
+    # нужен лишь при переобучении после правки commands.yaml (см. matcher._train_classifier).
+    "scikit-learn>=1.3",
+    "joblib>=1.3",
     # --- engine-зависимости: версии СВЕРИТЬ на целевой машине ---
     "sherpa-onnx>=1.10",
-    "piper-tts>=1.2",
+    # piper-tts переехал в опциональный extra [piper] (аварийный фоллбэк): основной голос —
+    # Silero из WAV-кэша, Piper нужен лишь если torch недоступен. См. [project.optional-dependencies].
     # --- live-панель (jarvis live) + умная лампа Tuya (локально, без облака) ---
     "rich>=13",
     "tinytuya>=1.13",
 ]
+
+# Опциональные зависимости. Не нужны рантайму — ставить вручную при необходимости.
+[project.optional-dependencies]
+# Разовая генерация INT8-эмбеддера: jarvis models --quantize (pip install -e '.[quantize]').
+quantize = ["onnx>=1.15", "sympy>=1.12"]
+# Движок голоса Silero. torch нужен ТОЛЬКО для синтеза (сборка WAV-кэша `jarvis tts build`
+# и редкий свободный текст), НЕ для воспроизведения готовых WAV. На N100 ставить CPU-сборку:
+#   pip install -e '.[silero]' --extra-index-url https://download.pytorch.org/whl/cpu
+silero = ["torch>=2.1"]
+# Авто-ударения для свободного текста (омографы). Сверить имя пакета на PyPI при установке.
+stress = ["ruaccent"]
+# Аварийный фоллбэк-голос Piper (onnxruntime, без torch): синтез, если Silero/torch недоступны.
+piper = ["piper-tts>=1.2"]
 
 # console entry points — systemd-юниты зовут эти команды (без плясок с PYTHONPATH)
 [project.scripts]

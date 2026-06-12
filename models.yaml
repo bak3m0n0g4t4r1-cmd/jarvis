@@ -48,6 +48,14 @@
     url: "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/dmitri/medium/ru_RU-dmitri-medium.onnx.json"
     назначение: "ru_RU-dmitri-medium.onnx.json"
 
+  # --- Голос Silero (eugene): torch.package .pt. Основной движок TTS (рендерится в WAV-кэш) ---
+  # ВНИМАНИЕ: сверить вручную (models.silero.ai). ~60–70 МБ. torch нужен лишь для синтеза
+  # (сборка кэша / редкий свободный текст), не для воспроизведения готовых WAV.
+  silero_eugene:
+    url: "https://models.silero.ai/models/tts/ru/v4_ru.pt"
+    назначение: "silero/v4_ru.pt"
+    # sha256/размер не заданы намеренно — добавьте после первой проверенной загрузки.
+
   # --- Эмбеддер команд: rubert-tiny2 в ONNX (через onnxruntime, без torch) ---
   # Готовый ONNX-экспорт (PyTorch-оригинал требовал бы torch для конвертации).
   # Матчеру нужны ровно два файла: модель и токенизатор (tokenizer.json самодостаточен).

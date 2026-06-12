@@ -18,7 +18,7 @@ from datetime import datetime, time as dtime, timedelta
 from difflib import SequenceMatcher
 
 from jarvis import alarms, config, contracts, phrases, reminders, timers, weather
-from jarvis.bus import JarvisModule
+from jarvis.bus import JarvisModule, run_service
 from jarvis.speech import say_clock, say_duration, say_temperature, say_when
 
 _PLACEHOLDERS = ("{время}", "{метка}", "{погода}", "{темп_макс}", "{темп_мин}",
@@ -58,6 +58,11 @@ class SchedulerModule(JarvisModule):
         self.subscribe(contracts.TOPIC_INPUT, self._on_input)
         self._thread = threading.Thread(target=self._tick_loop, daemon=True, name="scheduler-tick")
         self._thread.start()
+        # Префетч погоды в фоне (Этап 25): к утру кэш тёплый → утреннее срабатывание не ждёт
+        # сеть (HTTP до таймаута) в момент пробуждения. Сбой/нет сети — фраза без погоды, как и было.
+        if config.ALARM_WEATHER_ENABLED:
+            threading.Thread(target=self._prefetch_weather, daemon=True,
+                             name="scheduler-weather").start()
         try:
             n = len(alarms.read_schedule().get("будильники", []))
         except Exception:
@@ -90,6 +95,17 @@ class SchedulerModule(JarvisModule):
             # WARNING, не debug: без этого файла ломается анти-двойное срабатывание
             # (после рестарта будильник/таймер может прозвонить повторно).
             self.log_exc(logging.WARNING, "Состояние планировщика не сохранено")
+
+    def _write_schedule(self, sched) -> bool:
+        """Сохранить расписание и НЕ проглотить молчаливый сбой записи.
+
+        alarms.write_schedule сам атомарен и не падает (возвращает False при сбое), но
+        тихий провал = потерянный будильник/таймер после рестарта. Поэтому здесь явный
+        WARNING — чтобы причина была видна в логе, а не исчезала бесследно."""
+        ok = alarms.write_schedule(sched)
+        if not ok:
+            self.log.warning("Расписание не сохранено — изменение может потеряться после рестарта")
+        return ok
 
     # ------------------------------------------------------------------ #
     # Озвучка
@@ -164,7 +180,7 @@ class SchedulerModule(JarvisModule):
         else:
             changed = self._cmd_regular(cmd, sched, user_level)
         if changed:
-            alarms.write_schedule(sched)
+            self._write_schedule(sched)
             self._save_state()
 
     # ---- Утренний (singleton) ---- #
@@ -345,7 +361,7 @@ class SchedulerModule(JarvisModule):
                       cmd["действие"], cmd.get("длительность"), cmd.get("метка"), text)
         sched = alarms.read_schedule()
         if self._cmd_timer(cmd, sched, user_level):
-            alarms.write_schedule(sched)
+            self._write_schedule(sched)
 
     def _cmd_timer(self, cmd, sched, user_level) -> bool:
         lst = sched["таймеры"]
@@ -459,7 +475,7 @@ class SchedulerModule(JarvisModule):
                       cmd["действие"], cmd.get("метка"), text)
         sched = alarms.read_schedule()
         if self._cmd_stopwatch(cmd, sched, user_level):
-            alarms.write_schedule(sched)
+            self._write_schedule(sched)
 
     def _cmd_stopwatch(self, cmd, sched, user_level) -> bool:
         lst = sched["секундомеры"]
@@ -596,7 +612,7 @@ class SchedulerModule(JarvisModule):
                 return
             sched["напоминания"] = [r for r in sched["напоминания"] if not r.get("активен")]
             self._reply("reminder.delete_all", config.REMINDER_DELETE_ALL, user_level)
-            alarms.write_schedule(sched)
+            self._write_schedule(sched)
             return
         if action == "cancel":
             target = self._find_reminder(sched["напоминания"], cmd.get("метка") or cmd.get("текст"))
@@ -605,7 +621,7 @@ class SchedulerModule(JarvisModule):
                 return
             sched["напоминания"].remove(target)
             self._reply("reminder.cancel", config.REMINDER_CANCEL, user_level, текст=target.get("текст"))
-            alarms.write_schedule(sched)
+            self._write_schedule(sched)
             return
         if action == "move":
             target = self._find_reminder(sched["напоминания"], cmd.get("метка") or cmd.get("текст"))
@@ -619,7 +635,7 @@ class SchedulerModule(JarvisModule):
             target["активен"] = True
             self._reply("reminder.move", config.REMINDER_MOVE, user_level,
                         текст=target.get("текст"), когда=say_when(fire, точное))
-            alarms.write_schedule(sched)
+            self._write_schedule(sched)
             return
         # action == "set"
         self._reminder_set(cmd, sched, user_level)
@@ -644,7 +660,7 @@ class SchedulerModule(JarvisModule):
     def _create_reminder(self, текст, d, t, точное, повтор, метка, sched, user_level):
         fire, точное2, mode = self._compute_fire(d, t, точное)
         sched["напоминания"].append(self._make_reminder(текст, fire, точное2, повтор, метка))
-        alarms.write_schedule(sched)
+        self._write_schedule(sched)
         if mode == "today_random":
             self._reply("reminder.set_random", config.REMINDER_SET_RANDOM, user_level, текст=текст)
         else:
@@ -796,7 +812,7 @@ class SchedulerModule(JarvisModule):
                 return
             sched["задачи"] = []
             self._reply("task.delete_all", config.TASK_DELETE_ALL, user_level)
-            alarms.write_schedule(sched)
+            self._write_schedule(sched)
             return
         if action in ("done", "delete"):
             target = self._find_task(sched["задачи"], cmd.get("метка") or cmd.get("текст"))
@@ -809,7 +825,7 @@ class SchedulerModule(JarvisModule):
             else:
                 sched["задачи"].remove(target)
                 self._reply("task.delete", config.TASK_DELETE, user_level, текст=target.get("текст"))
-            alarms.write_schedule(sched)
+            self._write_schedule(sched)
             return
         # action == "add"
         текст = (cmd.get("текст") or "").strip()
@@ -822,7 +838,7 @@ class SchedulerModule(JarvisModule):
             дедлайн = self._iso(fire)
         sched["задачи"].append(self._make_task(текст, дедлайн, cmd.get("метка")))
         self._reply("task.add", config.TASK_ADD, user_level, текст=текст)
-        alarms.write_schedule(sched)
+        self._write_schedule(sched)
 
     @staticmethod
     def _make_task(текст, дедлайн, метка):
@@ -919,7 +935,7 @@ class SchedulerModule(JarvisModule):
                     tsk["сработал"] = True
                     changed = True
             if changed:
-                alarms.write_schedule(sched)
+                self._write_schedule(sched)
             if self._fired != before_fired:
                 self._save_state()
         # Озвучка вне лока: не держим команды/файл на время сетевого запроса погоды.
@@ -1003,6 +1019,14 @@ class SchedulerModule(JarvisModule):
         self._weather_cache = (today, w)
         return w
 
+    def _prefetch_weather(self):
+        """Прогреть кэш погоды заранее (фоновый поток при старте), чтобы утреннее срабатывание
+        не платило сетевой задержкой в момент пробуждения. Любой сбой — тихо (кэш не наполнится)."""
+        try:
+            self._get_weather()
+        except Exception:
+            self.log.debug("Префетч погоды не удался — утром возьму синхронно", exc_info=True)
+
     def _fire_morning(self, now):
         время = say_clock(now.hour, now.minute)
         w = self._get_weather() if config.ALARM_WEATHER_ENABLED else None
@@ -1051,7 +1075,7 @@ class SchedulerModule(JarvisModule):
 
 
 def main():
-    SchedulerModule().run()
+    run_service(SchedulerModule, "jarvis-scheduler")
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ import sounddevice as sd
 
 from jarvis import config, contracts
 from jarvis.audio_env import AudioEnv
-from jarvis.bus import JarvisModule
+from jarvis.bus import JarvisModule, run_service
 
 # Формат события /dev/input (struct input_event): timeval(2 long) + type(H) + code(H) + value(i) = 24 байта.
 _EVENT_FMT = "llHHi"
@@ -692,7 +692,7 @@ class SttModule(JarvisModule):
 
 
 def main():
-    SttModule().run()
+    run_service(SttModule, "jarvis-stt")
 
 
 if __name__ == "__main__":
