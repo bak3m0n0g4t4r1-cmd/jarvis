@@ -625,7 +625,9 @@ class TtsModule(JarvisModule):
         """Выпить stderr pw-cat до EOF (фоновый поток): wait() не блокируется переполненным
         pipe, а текст ошибки доступен после завершения процесса."""
         try:
-            data = proc.stderr.read()
+            # Лимитируем чтение: pw-cat пишет в stderr единичные строки ошибок, а неограниченный
+            # read() при гипотетическом потоке вывода рос бы в памяти без предела.
+            data = proc.stderr.read(65536)
             if data:
                 sink.append(data)
         except Exception:

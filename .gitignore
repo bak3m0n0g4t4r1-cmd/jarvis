@@ -9,7 +9,9 @@ logs/*
 # WAV-кэш синтезированной речи (Silero + JARVIS-DSP) — большой, пересобирается `jarvis tts build`
 cache/
 
-# Секреты: ключ Gemini и прочие локальные настройки (шаблон — .env.example)
+# Секреты и машинные правки: локальный оверрайд settings.yaml (ключи ламп Tuya и т.п.)
+# — глубокий мёрдж поверх settings.yaml, в git НЕ попадает (см. jarvis/config.py).
+settings.local.yaml
 .env
 .env.local
 

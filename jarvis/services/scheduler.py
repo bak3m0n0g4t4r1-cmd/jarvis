@@ -55,6 +55,10 @@ class SchedulerModule(JarvisModule):
             self.log.info("Будильники выключены (alarms.enabled=false) — планировщик простаивает")
             return
         self._load_state()
+        # Снять «висящий» флаг диалога дозапроса от прошлого запуска: его in-memory состояние
+        # (_dialog) рестарт обнуляет, а файловый флаг (logs/dialog_state.json) переживает — без
+        # сброса core молчал бы на ввод (думая, что диалог идёт), а scheduler уже его забыл.
+        reminders.clear_dialog()
         self.subscribe(contracts.TOPIC_INPUT, self._on_input)
         self._thread = threading.Thread(target=self._tick_loop, daemon=True, name="scheduler-tick")
         self._thread.start()
@@ -292,8 +296,11 @@ class SchedulerModule(JarvisModule):
             return False
         hhmm = f"{cmd['час']:02d}:{cmd['минута']:02d}"
         время = say_clock(cmd["час"], cmd["минута"])
-        # Дубль: то же время И та же метка (одинаковый будильник) → «уже стоит».
-        dup = next((a for a in regs if a.get("время") == hhmm
+        # Дубль: то же время И та же метка среди АКТИВНЫХ → «уже стоит». Фильтр по активности
+        # критичен: разовый будильник после срабатывания остаётся в файле как активен=false —
+        # без этого фильтра он навсегда блокировал бы повторную установку на то же время.
+        dup = next((a for a in regs if a.get("активен")
+                    and a.get("время") == hhmm
                     and ((a.get("метка") or "").strip() or None) == label), None)
         if dup:
             self._reply("alarm.regular_already", config.ALARM_REGULAR_ALREADY, user_level, время=время)

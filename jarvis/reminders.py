@@ -36,15 +36,44 @@ _MON = {
     "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12, "декабря": 12,
 }
 # Реверс родительных порядковых: «пятнадцатого»→15, «двадцатого»→20, «тридцатого»→30.
-_DAY_WORD = {w: n for n, w in _ORD_GEN_ONES.items()}
+# ВАЖНО: формы из speech несут ударения `+` и «ё», а текст приходит НОРМАЛИЗОВАННЫМ (+ убран,
+# ё→е). Без очистки ключи (а) ломали бы regex (`+` = квантификатор), (б) не совпадали бы с
+# текстом по «ё». Поэтому строим карты по «чистым» формам (см. _plain_ord).
+def _plain_ord(w: str) -> str:
+    return str(w).replace("+", "").replace("ё", "е")
+
+
+_DAY_WORD = {_plain_ord(w): n for n, w in _ORD_GEN_ONES.items()}
 for _n, _w in _ORD_GEN_TENS.items():
     if _n in (20, 30):
-        _DAY_WORD[_w] = _n
+        _DAY_WORD[_plain_ord(_w)] = _n
+# Чистые формы единиц для разбора составных «двадцать/тридцать N-ого» (сравнение с текстом).
+_ONES_GEN_PLAIN = {_plain_ord(w): n for n, w in _ORD_GEN_ONES.items()}
 
 
 def _num_word(tok):
     """Слово-число (для «через N»): 1..50 или None."""
     return _ONES.get(tok) or _TENS.get(tok)
+
+
+def _relative_delta(s):
+    """«через N минут/часов» → timedelta или None («через минуту/час» = 1).
+
+    Только минуты/часы: «через N дней/недель/месяцев» — дело parse_date (уровень даты).
+    Нужна, чтобы «напомни через 30 минут» не прочлось как 30:00→06:00 (parse_time берёт
+    первое число за ЧАС). «полтора/полторы» здесь НЕ ловим (дробное), вернём None."""
+    m = re.search(r"через\s+(\w+)\s+(минут\w*|час\w*)", s)
+    if m:
+        n = _num_word(m.group(1)) or (int(m.group(1)) if m.group(1).isdigit() else None)
+        unit = m.group(2)
+    else:
+        m1 = re.search(r"через\s+(минуту|час)\b", s)
+        if not m1:
+            return None
+        n, unit = 1, m1.group(1)
+    if not n:
+        return None
+    return timedelta(minutes=n) if unit.startswith("минут") else timedelta(hours=n)
 
 
 def _month_in(s):
@@ -58,10 +87,9 @@ def _month_in(s):
 def _parse_day_word(s):
     """День месяца, заданный СЛОВОМ в родительном: «пятнадцатого»→15, «двадцать первого»→21."""
     m = re.search(r"\b(двадцать|тридцать)\s+(\w+)", s)
-    if m and m.group(2) in _ORD_GEN_ONES.values():
+    if m and m.group(2) in _ONES_GEN_PLAIN:
         tens = 20 if m.group(1) == "двадцать" else 30
-        ones = {w: n for n, w in _ORD_GEN_ONES.items()}[m.group(2)]
-        return tens + ones
+        return tens + _ONES_GEN_PLAIN[m.group(2)]
     for w, n in _DAY_WORD.items():
         if re.search(r"\b" + w + r"\b", s):
             return n
@@ -181,6 +209,13 @@ def parse_when(text, today=None):
     чтобы «15 июня» (день) не принялось за время 15:00."""
     try:
         s = _norm(text)
+        # «через N минут/часов» = относительный момент now+Δ. Ловим ДО parse_time, иначе
+        # «через 30 минут» прочлось бы как 30:00→06:00. Кладём в модель (дата, время) — дальше
+        # scheduler._compute_fire соберёт точный datetime (с переходом через полночь).
+        delta = _relative_delta(s)
+        if delta is not None:
+            fire = datetime.now() + delta
+            return fire.date(), (fire.hour, fire.minute), True
         d = parse_date(s, today)
         t = None
         if _TIME_MARK.search(s):
